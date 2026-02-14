@@ -1,0 +1,22 @@
+# Build artifacts
+*.o
+klee
+klee-noroot
+src/build_config.h
+src/main-noroot.o
+
+# Benchmark binary
+bench/syscall_overhead
+!bench/syscall_overhead.c
+
+# Test binaries
+tests/test_cli
+tests/test_radix_tree
+tests/test_mount_table
+tests/test_path_resolve
+tests/test_pid_ns
+tests/test_user_ns
+tests/test_fd_table
+
+# Editor/IDE
+.claude/
