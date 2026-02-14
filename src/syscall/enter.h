@@ -54,6 +54,9 @@ int klee_enter_close(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_kill(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_tgkill(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_tkill(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_setpgid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_getpgid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_getsid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 
 /* UID/GID */
 int klee_enter_setuid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);

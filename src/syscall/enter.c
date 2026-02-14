@@ -1013,6 +1013,86 @@ int klee_enter_tkill(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     return 0;
 }
 
+/* ==================== Process Group Enter Handlers ==================== */
+
+int klee_enter_setpgid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    if (!proc->sandbox || !proc->sandbox->unshare_pid)
+        return 0;
+
+    pid_t vpid = (pid_t)ev->args[0];
+    pid_t vpgid = (pid_t)ev->args[1];
+    bool modified = false;
+
+    if (vpid != 0) {
+        pid_t real = translate_pid(proc->sandbox->pid_map, vpid);
+        if (real <= 0)
+            return 0;
+        if (real != vpid) {
+            if (!modified) klee_regs_fetch(ic, proc);
+            klee_regs_set_arg(proc, 0, (uint64_t)real);
+            modified = true;
+        }
+    }
+
+    if (vpgid != 0) {
+        pid_t real = translate_pid(proc->sandbox->pid_map, vpgid);
+        if (real <= 0)
+            return 0;
+        if (real != vpgid) {
+            if (!modified) klee_regs_fetch(ic, proc);
+            klee_regs_set_arg(proc, 1, (uint64_t)real);
+            modified = true;
+        }
+    }
+
+    if (modified)
+        klee_regs_push(ic, proc);
+    return 0;
+}
+
+int klee_enter_getpgid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    if (!proc->sandbox || !proc->sandbox->unshare_pid)
+        return 0;
+
+    pid_t vpid = (pid_t)ev->args[0];
+    if (vpid == 0)
+        return 0;
+
+    pid_t real = translate_pid(proc->sandbox->pid_map, vpid);
+    if (real <= 0)
+        return 0;
+
+    if (real != vpid) {
+        klee_regs_fetch(ic, proc);
+        klee_regs_set_arg(proc, 0, (uint64_t)real);
+        klee_regs_push(ic, proc);
+    }
+    return 0;
+}
+
+int klee_enter_getsid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    if (!proc->sandbox || !proc->sandbox->unshare_pid)
+        return 0;
+
+    pid_t vpid = (pid_t)ev->args[0];
+    if (vpid == 0)
+        return 0;
+
+    pid_t real = translate_pid(proc->sandbox->pid_map, vpid);
+    if (real <= 0)
+        return 0;
+
+    if (real != vpid) {
+        klee_regs_fetch(ic, proc);
+        klee_regs_set_arg(proc, 0, (uint64_t)real);
+        klee_regs_push(ic, proc);
+    }
+    return 0;
+}
+
 /* ==================== UID/GID Enter Handlers ==================== */
 
 int klee_enter_setuid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)

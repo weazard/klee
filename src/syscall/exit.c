@@ -6,12 +6,15 @@
 #include "syscall/sysnum.h"
 #include "process/memory.h"
 #include "process/regs.h"
+#include "fs/fd_table.h"
 #include "ns/pid_ns.h"
 #include "ns/user_ns.h"
 #include "ns/uts_ns.h"
 #include "util/log.h"
 
+#include <ctype.h>
 #include <errno.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -336,6 +339,159 @@ int klee_exit_gettid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
         return 0;
     /* For the main thread, tid == pid */
     ev->retval = proc->virtual_pid;
+    return 1;
+}
+
+/* ==================== Process Group Exit Handlers ==================== */
+
+int klee_exit_getpgid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    (void)ic;
+    if (!proc->sandbox || !proc->sandbox->unshare_pid)
+        return 0;
+    if (ev->retval < 0)
+        return 0;
+
+    if (proc->sandbox->pid_map) {
+        pid_t real_pgid = (pid_t)ev->retval;
+        pid_t vpid = klee_pid_map_r2v(proc->sandbox->pid_map, real_pgid);
+        if (vpid > 0) {
+            ev->retval = vpid;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int klee_exit_getpgrp(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    return klee_exit_getpgid(proc, ic, ev);
+}
+
+int klee_exit_setsid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    return klee_exit_getpgid(proc, ic, ev);
+}
+
+int klee_exit_getsid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    return klee_exit_getpgid(proc, ic, ev);
+}
+
+/* ==================== /proc getdents64 Filtering ==================== */
+
+int klee_exit_getdents64(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    if (ev->retval <= 0)
+        return 0;
+
+    if (!proc->sandbox || !proc->sandbox->unshare_pid || !proc->sandbox->pid_map)
+        return 0;
+
+    /* Only filter the top-level /proc directory */
+    int dirfd = (int)ev->args[0];
+    const char *vpath = klee_fd_table_get(proc->fd_table, dirfd);
+    if (!vpath || strcmp(vpath, "/proc") != 0)
+        return 0;
+
+    size_t buf_len = (size_t)ev->retval;
+    if (buf_len > 65536)
+        return 0;
+
+    void *dirp_addr = (void *)(uintptr_t)ev->args[1];
+
+    uint8_t *in_buf = malloc(buf_len);
+    uint8_t *out_buf = malloc(buf_len);
+    if (!in_buf || !out_buf) {
+        free(in_buf);
+        free(out_buf);
+        return 0;
+    }
+
+    int rc = klee_read_mem(ic, ev->pid, in_buf, dirp_addr, buf_len);
+    if (rc < 0) {
+        free(in_buf);
+        free(out_buf);
+        return 0;
+    }
+
+    /*
+     * linux_dirent64 layout:
+     *   uint64_t d_ino;      (0)
+     *   int64_t  d_off;      (8)
+     *   uint16_t d_reclen;   (16)
+     *   uint8_t  d_type;     (18)
+     *   char     d_name[];   (19)
+     */
+    size_t in_pos = 0;
+    size_t out_pos = 0;
+
+    while (in_pos + 19 < buf_len) {
+        uint16_t reclen;
+        memcpy(&reclen, in_buf + in_pos + 16, 2);
+        if (reclen < 19 || in_pos + reclen > buf_len)
+            break;
+
+        char *d_name = (char *)(in_buf + in_pos + 19);
+        size_t name_max = reclen - 19;
+
+        /* Check if entry name is purely numeric (a PID directory) */
+        bool is_numeric = (d_name[0] != '\0');
+        for (size_t i = 0; i < name_max && d_name[i]; i++) {
+            if (!isdigit((unsigned char)d_name[i])) {
+                is_numeric = false;
+                break;
+            }
+        }
+
+        if (!is_numeric) {
+            /* Non-PID entry: copy as-is */
+            memcpy(out_buf + out_pos, in_buf + in_pos, reclen);
+            out_pos += reclen;
+        } else {
+            pid_t real_pid = (pid_t)atoi(d_name);
+            pid_t vpid = klee_pid_map_r2v(proc->sandbox->pid_map, real_pid);
+
+            if (vpid > 0) {
+                /* Translate: rewrite name to virtual PID */
+                char vpid_str[16];
+                int vpid_len = snprintf(vpid_str, sizeof(vpid_str), "%d", vpid);
+
+                /* New reclen: header(19) + name + null, 8-byte aligned */
+                size_t new_reclen = (19 + (size_t)vpid_len + 1 + 7) & ~(size_t)7;
+
+                if (out_pos + new_reclen <= buf_len) {
+                    memset(out_buf + out_pos, 0, new_reclen);
+                    /* Copy header (d_ino, d_off, d_type) */
+                    memcpy(out_buf + out_pos, in_buf + in_pos, 18);
+                    out_buf[out_pos + 18] = in_buf[in_pos + 18]; /* d_type */
+                    /* Write new reclen */
+                    uint16_t nr = (uint16_t)new_reclen;
+                    memcpy(out_buf + out_pos + 16, &nr, 2);
+                    /* Write translated name */
+                    memcpy(out_buf + out_pos + 19, vpid_str, (size_t)vpid_len + 1);
+                    out_pos += new_reclen;
+                }
+            }
+            /* else: PID not in namespace, filter out */
+        }
+
+        in_pos += reclen;
+    }
+
+    /* Write filtered buffer back to tracee */
+    if (out_pos > 0) {
+        rc = klee_write_mem(ic, ev->pid, dirp_addr, out_buf, out_pos);
+        if (rc < 0) {
+            free(in_buf);
+            free(out_buf);
+            return 0;
+        }
+    }
+
+    ev->retval = (long)out_pos;
+    free(in_buf);
+    free(out_buf);
     return 1;
 }
 

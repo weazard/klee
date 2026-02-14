@@ -95,6 +95,7 @@ void klee_dispatch_init(void)
     register_handler(KLEE_SYS_dup2,      "dup2",      NULL, klee_exit_dup2);
     register_handler(KLEE_SYS_dup3,      "dup3",      NULL, klee_exit_dup3);
     register_handler(KLEE_SYS_fcntl,     "fcntl",     NULL, klee_exit_fcntl);
+    register_handler(KLEE_SYS_getdents64, "getdents64", NULL, klee_exit_getdents64);
 
     /* PID namespace */
     register_handler(KLEE_SYS_getpid,    "getpid",    NULL, klee_exit_getpid);
@@ -103,6 +104,11 @@ void klee_dispatch_init(void)
     register_handler(KLEE_SYS_kill,      "kill",      klee_enter_kill, NULL);
     register_handler(KLEE_SYS_tgkill,    "tgkill",    klee_enter_tgkill, NULL);
     register_handler(KLEE_SYS_tkill,     "tkill",     klee_enter_tkill, NULL);
+    register_handler(KLEE_SYS_setpgid,   "setpgid",   klee_enter_setpgid, NULL);
+    register_handler(KLEE_SYS_getpgid,   "getpgid",   klee_enter_getpgid, klee_exit_getpgid);
+    register_handler(KLEE_SYS_getpgrp,   "getpgrp",   NULL, klee_exit_getpgrp);
+    register_handler(KLEE_SYS_setsid,    "setsid",    NULL, klee_exit_setsid);
+    register_handler(KLEE_SYS_getsid,    "getsid",    klee_enter_getsid, klee_exit_getsid);
 
     /* UID/GID */
     register_handler(KLEE_SYS_getuid,    "getuid",    NULL, klee_exit_getuid);

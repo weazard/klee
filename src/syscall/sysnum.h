@@ -90,6 +90,11 @@
 #define KLEE_SYS_kill            SYS_kill
 #define KLEE_SYS_tgkill          SYS_tgkill
 #define KLEE_SYS_tkill           SYS_tkill
+#define KLEE_SYS_setpgid         SYS_setpgid
+#define KLEE_SYS_getpgid         SYS_getpgid
+#define KLEE_SYS_getpgrp         SYS_getpgrp
+#define KLEE_SYS_setsid          SYS_setsid
+#define KLEE_SYS_getsid          SYS_getsid
 #define KLEE_SYS_wait4           SYS_wait4
 #define KLEE_SYS_waitid          SYS_waitid
 #define KLEE_SYS_exit            SYS_exit

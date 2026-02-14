@@ -27,6 +27,11 @@ int klee_exit_fcntl(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_exit_getpid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_exit_getppid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_exit_gettid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_exit_getpgid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_exit_getpgrp(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_exit_setsid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_exit_getsid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_exit_getdents64(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 
 /* UID/GID exit handlers */
 int klee_exit_getuid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);

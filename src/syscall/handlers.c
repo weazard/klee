@@ -69,6 +69,11 @@ int klee_get_intercepted_syscalls(int *out, size_t max_count)
         KLEE_SYS_vfork,
         KLEE_SYS_wait4,
         KLEE_SYS_waitid,
+        KLEE_SYS_setpgid,
+        KLEE_SYS_getpgid,
+        KLEE_SYS_getpgrp,
+        KLEE_SYS_setsid,
+        KLEE_SYS_getsid,
 
         /* UID/GID */
         KLEE_SYS_getuid,
