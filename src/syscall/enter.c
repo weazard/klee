@@ -786,6 +786,40 @@ int klee_enter_execve(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     int rc = translate_path_arg(proc, ic, ev, 0, -1);
     if (rc < 0) return rc;
 
+    /* If the tracee exec'd /proc/self/exe (or /proc/<vpid>/exe),
+     * translate_path_arg rewrote /proc/self → /proc/<real_pid>/exe.
+     * But the kernel's /proc/<pid>/exe symlink points to ld-linux
+     * (from PT_INTERP rewriting), not the actual program.  Chromium
+     * re-execs via /proc/self/exe to spawn --type=utility children;
+     * without this fix ld-linux receives --type=utility and errors.
+     *
+     * Substitute with vexe (the guest exe path) translated through
+     * the mount table, and overwrite the scratch area that
+     * translate_path_arg already allocated. */
+    if (proc->vexe[0] && proc->sandbox && proc->sandbox->mount_table &&
+        is_proc_exe_path(proc->saved_path) && proc->path_modified &&
+        ic->backend == INTERCEPT_PTRACE) {
+
+        KleeResolveCtx ctx = {
+            .mount_table = proc->sandbox->mount_table,
+            .fd_table = proc->fd_table,
+            .vcwd = proc->vcwd,
+            .vroot = klee_mount_table_get_root(proc->sandbox->mount_table),
+            .flags = 0,
+        };
+
+        char host_path[PATH_MAX];
+        rc = klee_path_guest_to_host(&ctx, proc->vexe, host_path, AT_FDCWD);
+        if (rc >= 0) {
+            KLEE_DEBUG("execve /proc/*/exe -> %s (host: %s)",
+                       proc->vexe, host_path);
+            snprintf(proc->saved_path, PATH_MAX, "%s", proc->vexe);
+            snprintf(proc->translated_path, PATH_MAX, "%s", host_path);
+            klee_write_string(ic, ev->pid,
+                              (void *)(uintptr_t)ev->args[0], host_path);
+        }
+    }
+
     /* Check for nested bwrap invocation — parse inline and rewrite */
     if (klee_nested_is_bwrap(proc->saved_path)) {
         if (klee_nested_handle_exec(proc, ic, ev) == 0)
