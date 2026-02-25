@@ -238,6 +238,24 @@ int main(int argc, char **argv)
     if (klee_log_get_level() >= LOG_DEBUG)
         klee_config_dump(&cfg);
 
+    /* Log child command line to session log */
+    if (cfg.argc > 0) {
+        char cmdbuf[1024];
+        int off = 0;
+        for (int i = 0; i < cfg.argc && off < (int)sizeof(cmdbuf) - 1; i++) {
+            int n = snprintf(cmdbuf + off, sizeof(cmdbuf) - (size_t)off,
+                             "%s%s", i ? " " : "", cfg.argv[i]);
+            if (n > 0) off += n;
+        }
+        KLEE_INFO("child command: %s", cmdbuf);
+    }
+
+    /* Log special FDs */
+    if (cfg.info_fd >= 0 || cfg.sync_fd >= 0 || cfg.block_fd >= 0) {
+        KLEE_DEBUG("special fds: info_fd=%d sync_fd=%d block_fd=%d",
+                   cfg.info_fd, cfg.sync_fd, cfg.block_fd);
+    }
+
     /* Initialize syscall dispatch table */
     klee_dispatch_init();
 

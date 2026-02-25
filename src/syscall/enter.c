@@ -1525,17 +1525,30 @@ static int translate_sockaddr_arg(KleeProcess *proc, KleeInterceptor *ic,
 
     /* Skip abstract sockets (sun_path[0] == '\0') — they live in a
      * kernel namespace, not the filesystem */
-    if (sun.sun_path[0] == '\0')
+    if (sun.sun_path[0] == '\0') {
+        size_t abs_off = offsetof(struct sockaddr_un, sun_path);
+        size_t abs_len = to_read > abs_off + 1 ? to_read - abs_off - 1 : 0;
+        if (abs_len > 0) {
+            char abs_name[108];
+            size_t n = abs_len < sizeof(abs_name)-1 ? abs_len : sizeof(abs_name)-1;
+            memcpy(abs_name, sun.sun_path + 1, n);
+            abs_name[n] = '\0';
+            KLEE_TRACE("socket: abstract @%s (pid=%d)", abs_name, ev->pid);
+        }
         return 0;
+    }
 
-    /* Ensure null termination for path extraction */
+    /* Ensure null termination for path extraction.
+     * addrlen typically includes the trailing NUL in the count, but some
+     * callers pass the exact strlen (no NUL).  We already memset sun to 0,
+     * so the only risk is addrlen covering the full sun_path with no room
+     * for a NUL — clamp in that case. */
     size_t path_offset = offsetof(struct sockaddr_un, sun_path);
     size_t path_max = to_read > path_offset ? to_read - path_offset : 0;
     if (path_max == 0)
         return 0;
-    if (path_max > sizeof(sun.sun_path))
-        path_max = sizeof(sun.sun_path);
-    sun.sun_path[path_max - 1] = '\0';
+    if (path_max >= sizeof(sun.sun_path))
+        sun.sun_path[sizeof(sun.sun_path) - 1] = '\0';
 
     /* Save original path */
     snprintf(proc->saved_path, sizeof(proc->saved_path), "%s", sun.sun_path);
@@ -1555,6 +1568,7 @@ static int translate_sockaddr_arg(KleeProcess *proc, KleeInterceptor *ic,
         return 0;
 
     if (strcmp(proc->saved_path, proc->translated_path) == 0) {
+        KLEE_TRACE("socket: unchanged %s (pid=%d)", proc->saved_path, ev->pid);
         proc->path_modified = false;
         return 0;
     }
