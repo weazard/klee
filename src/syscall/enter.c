@@ -689,9 +689,29 @@ static int handle_exec_interp(KleeProcess *proc, KleeInterceptor *ic,
     klee_regs_fetch(ic, proc);
     uint64_t rsp = klee_regs_get_sp(proc);
 
-    /* The translated script/binary host path was already written by
-     * translate_path_arg to: rsp - 128 - PATH_MAX */
+    /* Ensure the translated script/binary host path is in the scratch area.
+     * translate_path_arg writes it when path_modified=true, but we may also
+     * reach here when path_modified=false (e.g. a script resolved $0 to a
+     * host filesystem path via realpath).  Always write to be safe. */
     uint64_t addr_script = rsp - 128 - PATH_MAX;
+    int rc;
+    rc = klee_write_string(ic, ev->pid, (void *)(uintptr_t)addr_script,
+                           resolved_proc_exe ? current_host : proc->translated_path);
+    if (rc < 0) return 0;
+
+    /* If path wasn't already modified by translate_path_arg, we need to
+     * save the original arg[0] for exit-time restore (exec failure case)
+     * and set up the register pointing to the scratch area. */
+    if (!proc->path_modified) {
+        proc->saved_args[0] = ev->args[0];
+        klee_regs_set_arg(proc, 0, addr_script);
+        klee_regs_push(ic, proc);
+        proc->path_arg_idx[proc->path_arg_count++] = 0;
+        proc->path_modified = true;
+    } else if (resolved_proc_exe) {
+        /* Path was already modified, but we need to update the script path
+         * with the resolved /proc/PID/exe target (already written above). */
+    }
 
     /* Write additional strings to scratch area below translate_path_arg's area */
     uint64_t scratch = rsp - 128 - PATH_MAX * 5;
@@ -699,15 +719,6 @@ static int handle_exec_interp(KleeProcess *proc, KleeInterceptor *ic,
     uint64_t addr_ldlinux = 0;
     uint64_t addr_interp = 0;
     uint64_t addr_shebang_arg = 0;
-    int rc;
-
-    /* If we resolved a /proc/PID/exe path, rewrite the script path in
-     * tracee memory so ld-linux receives the actual binary path. */
-    if (resolved_proc_exe) {
-        rc = klee_write_string(ic, ev->pid, (void *)(uintptr_t)addr_script,
-                                current_host);
-        if (rc < 0) return 0;
-    }
 
     if (ldlinux_host[0]) {
         addr_ldlinux = scratch;
@@ -784,9 +795,16 @@ int klee_enter_execve(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 
     /* Handle shebang scripts and ELF PT_INTERP: detect interpreters that
      * the kernel would resolve on the host filesystem and rewrite execve
-     * to use the correctly translated versions. */
+     * to use the correctly translated versions.
+     *
+     * Note: we intentionally do NOT gate on proc->path_modified.  A tracee
+     * can exec a host filesystem path (e.g. from "realpath $0" in a script
+     * where $0 leaked the host path via shebang rewriting).  In that case
+     * the mount table won't change the path, but the binary's PT_INTERP
+     * may still need translation to avoid an ABI mismatch between the
+     * host's ld-linux and the runtime's libc. */
     if (proc->sandbox && proc->sandbox->mount_table &&
-        ic->backend == INTERCEPT_PTRACE && proc->path_modified) {
+        ic->backend == INTERCEPT_PTRACE) {
         handle_exec_interp(proc, ic, ev);
     }
 
