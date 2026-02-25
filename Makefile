@@ -40,7 +40,7 @@ FS_SRCS   = src/fs/radix_tree.c src/fs/mount_table.c src/fs/path_resolve.c \
             src/fs/fd_table.c src/fs/tmpfs.c src/fs/readonly.c src/fs/pivot.c \
             src/fs/overlay.c
 NS_SRCS   = src/ns/pid_ns.c src/ns/user_ns.c src/ns/ipc_ns.c \
-            src/ns/uts_ns.c src/ns/net_ns.c
+            src/ns/uts_ns.c src/ns/net_ns.c src/ns/proc_synth.c
 INTERCEPT_SRCS = src/intercept/intercept.c src/intercept/seccomp_notif.c \
                  src/intercept/ptrace_backend.c src/intercept/filter.c
 PROCESS_SRCS   = src/process/process.c src/process/event.c \

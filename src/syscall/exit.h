@@ -31,6 +31,7 @@ int klee_exit_getpgid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_exit_getpgrp(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_exit_setsid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_exit_getsid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_exit_ioctl(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_exit_getdents64(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 
 /* UID/GID exit handlers */

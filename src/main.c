@@ -18,6 +18,7 @@
 #include "ns/uts_ns.h"
 #include "ns/ipc_ns.h"
 #include "ns/net_ns.h"
+#include "ns/proc_synth.h"
 #include "fuse/fuse_proc.h"
 #include "steam/steam_compat.h"
 #include "util/log.h"
@@ -476,6 +477,7 @@ int main(int argc, char **argv)
     sandbox->pid_map = NULL;
     klee_sandbox_unref(sandbox);
     interceptor->destroy(interceptor);
+    klee_proc_synth_cleanup();
     klee_tmpfs_cleanup();
     klee_log_close_file();
     klee_config_destroy(&cfg);
@@ -498,6 +500,7 @@ cleanup:
     }
     if (interceptor)
         interceptor->destroy(interceptor);
+    klee_proc_synth_cleanup();
     klee_tmpfs_cleanup();
     klee_log_close_file();
     klee_config_destroy(&cfg);
