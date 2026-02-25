@@ -57,6 +57,7 @@ int klee_enter_tkill(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_setpgid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_getpgid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_getsid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_ioctl(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 
 /* UID/GID */
 int klee_enter_setuid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);

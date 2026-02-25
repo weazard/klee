@@ -134,6 +134,9 @@
 #define KLEE_SYS_bind            SYS_bind
 #define KLEE_SYS_sendmsg         SYS_sendmsg
 
+/* Terminal/ioctl */
+#define KLEE_SYS_ioctl           SYS_ioctl
+
 /* Misc */
 #define KLEE_SYS_ptrace          SYS_ptrace
 #define KLEE_SYS_prctl           SYS_prctl

@@ -109,6 +109,7 @@ void klee_dispatch_init(void)
     register_handler(KLEE_SYS_getpgrp,   "getpgrp",   NULL, klee_exit_getpgrp);
     register_handler(KLEE_SYS_setsid,    "setsid",    NULL, klee_exit_setsid);
     register_handler(KLEE_SYS_getsid,    "getsid",    klee_enter_getsid, klee_exit_getsid);
+    register_handler(KLEE_SYS_ioctl,    "ioctl",     klee_enter_ioctl, klee_exit_ioctl);
 
     /* UID/GID */
     register_handler(KLEE_SYS_getuid,    "getuid",    NULL, klee_exit_getuid);

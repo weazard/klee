@@ -9,6 +9,7 @@
 #include "fs/path_resolve.h"
 #include "fs/readonly.h"
 #include "ns/pid_ns.h"
+#include "ns/proc_synth.h"
 #include "ns/user_ns.h"
 #include "ns/uts_ns.h"
 #include "ns/ipc_ns.h"
@@ -22,6 +23,7 @@
 #include <unistd.h>
 #include <linux/seccomp.h>
 #include <linux/openat2.h>
+#include <sys/ioctl.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -101,6 +103,43 @@ static int translate_path_arg_ex(KleeProcess *proc, KleeInterceptor *ic,
         }
     }
 
+    /* Rewrite /proc/<vpid>/... to /proc/<real_pid>/... when the tracee
+     * uses its virtual PID to access /proc entries.  This is necessary
+     * when /proc is passthrough (no FUSE overlay) but getpid() returns
+     * virtual PIDs — programs like `ps` use getpid() to construct
+     * /proc/<pid>/... paths that don't exist on the host. */
+    bool vpid_rewritten = false;
+    pid_t proc_rewrite_real_pid = 0;  /* real PID in path after rewrite */
+    if (!proc_self_rewritten && proc->sandbox &&
+        proc->sandbox->unshare_pid && proc->sandbox->pid_map &&
+        strncmp(proc->saved_path, "/proc/", 6) == 0) {
+        const char *p = proc->saved_path + 6;
+        if (*p >= '1' && *p <= '9') {
+            pid_t vpid_val = 0;
+            const char *q = p;
+            while (*q >= '0' && *q <= '9') {
+                vpid_val = vpid_val * 10 + (*q - '0');
+                q++;
+            }
+            if (vpid_val > 0 && (*q == '/' || *q == '\0')) {
+                pid_t real_pid = klee_pid_map_v2r(proc->sandbox->pid_map,
+                                                   vpid_val);
+                if (real_pid > 0 && real_pid != vpid_val) {
+                    char rewritten[PATH_MAX];
+                    snprintf(rewritten, sizeof(rewritten), "/proc/%d%s",
+                             real_pid, q);
+                    snprintf(proc->saved_path, PATH_MAX, "%s", rewritten);
+                    vpid_rewritten = true;
+                    proc_rewrite_real_pid = real_pid;
+                }
+            }
+        }
+    }
+
+    /* Also track the real PID for /proc/self rewrites */
+    if (proc_self_rewritten)
+        proc_rewrite_real_pid = proc->real_pid;
+
     /* Get dirfd for *at() variants */
     int dirfd = AT_FDCWD;
     if (dirfd_idx >= 0)
@@ -140,11 +179,35 @@ static int translate_path_arg_ex(KleeProcess *proc, KleeInterceptor *ic,
         return 0;
     }
 
-    /* If /proc/self was rewritten, always force the write even if the mount
-     * table didn't change the path further — the tracee's memory still has
-     * the original /proc/self path which would resolve to klee's PID. */
+    /* Generate synthetic /proc/<pid>/stat and /proc/<pid>/status files
+     * with virtual PIDs.  The kernel's real /proc files contain host PIDs
+     * which would cause libproc2 (ps, top, etc.) to fail PID lookups. */
+    if ((proc_self_rewritten || vpid_rewritten) &&
+        proc_rewrite_real_pid > 0 &&
+        proc->sandbox && proc->sandbox->pid_map) {
+        const char *base = strrchr(proc->translated_path, '/');
+        if (base) {
+            base++;
+            char synth_path[PATH_MAX];
+            int src = -1;
+            if (strcmp(base, "stat") == 0)
+                src = klee_proc_synth_stat(proc_rewrite_real_pid,
+                                            proc->sandbox->pid_map,
+                                            synth_path, sizeof(synth_path));
+            else if (strcmp(base, "status") == 0)
+                src = klee_proc_synth_status(proc_rewrite_real_pid,
+                                              proc->sandbox->pid_map,
+                                              synth_path, sizeof(synth_path));
+            if (src == 0)
+                snprintf(proc->translated_path, PATH_MAX, "%s", synth_path);
+        }
+    }
+
+    /* If /proc/self or /proc/<vpid> was rewritten, always force the write
+     * even if the mount table didn't change the path further — the tracee's
+     * memory still has the original path which the kernel can't resolve. */
     if (strcmp(proc->saved_path, proc->translated_path) == 0 &&
-        !proc_self_rewritten) {
+        !proc_self_rewritten && !vpid_rewritten) {
         proc->path_modified = false;
         return 0;
     }
@@ -1090,6 +1153,41 @@ int klee_enter_getsid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
         klee_regs_set_arg(proc, 0, (uint64_t)real);
         klee_regs_push(ic, proc);
     }
+    return 0;
+}
+
+/* ==================== ioctl Enter Handler ==================== */
+
+int klee_enter_ioctl(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    if (!proc->sandbox || !proc->sandbox->unshare_pid)
+        return 0;
+
+    unsigned long request = ev->args[1];
+
+    if (request == TIOCSPGRP) {
+        /* tcsetpgrp: ioctl(fd, TIOCSPGRP, &pgid)
+         * The pgid is passed via pointer in arg2.  Read the virtual pgid
+         * from tracee memory, translate to real, and write it back. */
+        void *pgid_ptr = (void *)(uintptr_t)ev->args[2];
+        pid_t vpgid;
+        int rc = klee_read_mem(ic, ev->pid, &vpgid, pgid_ptr, sizeof(vpgid));
+        if (rc < 0)
+            return 0;
+
+        pid_t real_pgid = translate_pid(proc->sandbox->pid_map, vpgid);
+        if (real_pgid <= 0) {
+            KLEE_TRACE("ioctl TIOCSPGRP: unknown vpgid %d", vpgid);
+            return 0;
+        }
+
+        if (real_pgid != vpgid) {
+            ic->write_mem(ic, ev->pid, pgid_ptr, &real_pgid, sizeof(real_pgid));
+            /* Save original vpgid so exit handler can restore it */
+            proc->saved_args[2] = (uint64_t)(uintptr_t)vpgid;
+        }
+    }
+
     return 0;
 }
 

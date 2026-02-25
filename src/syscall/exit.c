@@ -21,6 +21,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
+#include <sys/ioctl.h>
 #include <sys/prctl.h>
 
 /* ==================== Filesystem Exit Handlers ==================== */
@@ -376,6 +377,44 @@ int klee_exit_setsid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 int klee_exit_getsid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
     return klee_exit_getpgid(proc, ic, ev);
+}
+
+/* ==================== ioctl Exit Handler ==================== */
+
+int klee_exit_ioctl(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    if (!proc->sandbox || !proc->sandbox->unshare_pid)
+        return 0;
+
+    unsigned long request = ev->args[1];
+
+    if (request == TIOCSPGRP) {
+        /* Restore the original virtual pgid in tracee memory so the
+         * tracee's copy isn't left containing the real pgid. */
+        void *pgid_ptr = (void *)(uintptr_t)ev->args[2];
+        pid_t vpgid = (pid_t)(uintptr_t)proc->saved_args[2];
+        if (vpgid > 0)
+            ic->write_mem(ic, ev->pid, pgid_ptr, &vpgid, sizeof(vpgid));
+    } else if (request == TIOCGPGRP || request == TIOCGSID) {
+        /* tcgetpgrp / TIOCGSID: kernel wrote a real pgid/sid into the
+         * tracee's buffer.  Translate it to a virtual PID. */
+        if (ev->retval < 0)
+            return 0;
+
+        void *pid_ptr = (void *)(uintptr_t)ev->args[2];
+        pid_t real_pid;
+        int rc = klee_read_mem(ic, ev->pid, &real_pid, pid_ptr, sizeof(real_pid));
+        if (rc < 0)
+            return 0;
+
+        if (proc->sandbox->pid_map) {
+            pid_t vpid = klee_pid_map_r2v(proc->sandbox->pid_map, real_pid);
+            if (vpid > 0 && vpid != real_pid)
+                ic->write_mem(ic, ev->pid, pid_ptr, &vpid, sizeof(vpid));
+        }
+    }
+
+    return 0;
 }
 
 /* ==================== /proc getdents64 Filtering ==================== */
