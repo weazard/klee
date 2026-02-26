@@ -56,6 +56,7 @@ typedef struct klee_sandbox {
     bool unshare_uts;
     bool unshare_net;
     bool unshare_cgroup;
+    bool zypak_detected;       /* true when Zypak environment is active */
     int ref_count;
 } KleeSandbox;
 
@@ -89,6 +90,7 @@ typedef struct klee_process {
     int current_syscall;
     int deny_errno;             /* non-zero when syscall was denied on enter */
     bool seccomp_entered;       /* waiting for extra enter-stop after SECCOMP event */
+    bool suppress_initial_stop; /* suppress first SIGSTOP after fork (ptrace artifact) */
     uint64_t saved_args[6];
     char saved_path[PATH_MAX];      /* original guest path */
     char resolved_guest[PATH_MAX];  /* absolute guest path after resolution */

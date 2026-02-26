@@ -157,6 +157,7 @@ static void handle_fork(KleeEventLoop *el, KleeProcess *parent,
         child->id_state = klee_id_state_clone(parent->id_state);
 
     child->state = PROC_STATE_RUNNING;
+    child->suppress_initial_stop = true;
 
     KLEE_DEBUG("fork: parent=%d child=%d vpid=%d",
                parent->real_pid, child_pid, child->virtual_pid);
@@ -176,6 +177,10 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
         if (el->sandbox && el->sandbox->pid_map)
             proc->virtual_pid = klee_pid_map_add(el->sandbox->pid_map, event->pid);
         proc->state = PROC_STATE_RUNNING;
+        /* New process from PTRACE_O_TRACEFORK — its initial SIGSTOP
+         * must be suppressed to avoid a spurious group-stop that
+         * makes the parent's waitpid report it as "Stopped". */
+        proc->suppress_initial_stop = true;
     }
 
     if (!proc)
@@ -327,6 +332,17 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
              * lets the operation proceed (same as SIG_IGN behavior). */
             if (sig == SIGTTOU || sig == SIGTTIN)
                 sig = 0;
+            /* Suppress the initial SIGSTOP that newly-forked children
+             * receive from PTRACE_O_TRACEFORK.  Without this, a race
+             * between the parent's fork event and the child's SIGSTOP
+             * can cause the SIGSTOP to be delivered, putting the child
+             * into group-stop.  The parent shell then sees it as
+             * "Stopped" even though the user never pressed Ctrl+Z. */
+            if (sig == SIGSTOP && proc->suppress_initial_stop) {
+                KLEE_DEBUG("suppressing initial SIGSTOP for pid=%d", event->pid);
+                sig = 0;
+                proc->suppress_initial_stop = false;
+            }
             el->interceptor->continue_running(el->interceptor,
                                                event->pid, sig);
         }
