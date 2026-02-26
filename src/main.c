@@ -304,6 +304,33 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
+    /* Auto-provision private /tmp when user namespace virtualization is
+     * active and the real UID differs from the virtual UID.  Without
+     * this, programs that construct UID-based paths under /tmp (tmux
+     * with /tmp/tmux-<uid>, D-Bus session sockets, etc.) may target
+     * directories owned by the real root user, causing EACCES because
+     * the kernel enforces real-UID permissions.
+     *
+     * Only provision if no explicit /tmp mount was already specified
+     * by the caller (e.g. --tmpfs /tmp or --bind ... /tmp). */
+    if (cfg.unshare_user) {
+        uid_t real_uid = getuid();
+        uid_t virt_uid = cfg.uid_set ? cfg.uid : 0;
+        if (real_uid != virt_uid) {
+            KleeMount *tmp_mount = klee_mount_table_resolve(mount_table, "/tmp");
+            if (!tmp_mount) {
+                char *tmp_path = klee_tmpfs_create("/tmp");
+                if (tmp_path) {
+                    klee_mount_table_add(mount_table, MOUNT_TMPFS, tmp_path,
+                                          "/tmp", false, 01777);
+                    KLEE_INFO("auto-provisioned private /tmp "
+                              "(real uid=%d != virtual uid=%d)",
+                              real_uid, virt_uid);
+                }
+            }
+        }
+    }
+
     /* Auto-expose Steam paths */
     klee_steam_auto_expose(mount_table);
 
