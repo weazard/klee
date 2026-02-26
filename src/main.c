@@ -21,6 +21,7 @@
 #include "ns/proc_synth.h"
 #include "fuse/fuse_proc.h"
 #include "steam/steam_compat.h"
+#include "compat/zypak_compat.h"
 #include "util/log.h"
 
 #include <stdlib.h>
@@ -305,6 +306,17 @@ int main(int argc, char **argv)
 
     /* Auto-expose Steam paths */
     klee_steam_auto_expose(mount_table);
+
+    /* Detect and configure Zypak (Flatpak Chrome sandbox bridge) */
+    if (klee_zypak_detect()) {
+        KLEE_INFO("Zypak detected in environment");
+        sandbox->zypak_detected = true;
+        klee_zypak_auto_expose(mount_table);
+        /* Force mimic strategy so Zypak uses flatpak-spawn (which KLEE
+         * intercepts) instead of the spawn strategy (which escapes via
+         * D-Bus portal).  0 = don't overwrite user's explicit choice. */
+        setenv("ZYPAK_ZYGOTE_STRATEGY_SPAWN", "0", 0);
+    }
 
     /* Create host-side mirrors for /run/host mounts so the kernel
      * can follow host-side symlinks that reference guest paths
