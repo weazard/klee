@@ -506,6 +506,7 @@ int main(int argc, char **argv)
         waitpid(child_pid, NULL, 0);
         goto cleanup;
     }
+    event_loop->initial_child_pid = child_pid;
 
     int exit_status = klee_event_loop_run(event_loop);
 

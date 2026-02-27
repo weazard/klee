@@ -18,6 +18,7 @@ typedef struct klee_event_loop {
     int signal_fd;
     int exit_status;
     bool running;
+    pid_t initial_child_pid;    /* direct child of klee — exit terminates loop */
 } KleeEventLoop;
 
 /* Create and initialize the event loop */
