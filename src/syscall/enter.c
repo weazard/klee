@@ -1480,8 +1480,17 @@ int klee_enter_prctl(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
         break;
 
     case PR_SET_DUMPABLE:
-        /* bwrap actively sets dumpable after dropping privs.
-         * Allow passthrough to kernel. */
+        /* Block attempts to clear dumpable status.  Klee reads/writes
+         * tracee memory via process_vm_readv/writev and PTRACE_PEEKDATA;
+         * a non-dumpable process returns EIO on these calls, breaking
+         * all path translation.  Programs like gpg-agent set dumpable=0
+         * to protect cryptographic material, but klee already confines
+         * them inside its sandbox.  Pretend it succeeded. */
+        if ((int)ev->args[1] == 0) {
+            KLEE_DEBUG("prctl(PR_SET_DUMPABLE, 0) blocked for pid=%d",
+                       proc->real_pid);
+            return -0; /* void syscall, return success */
+        }
         break;
 
     case PR_SET_NAME:
