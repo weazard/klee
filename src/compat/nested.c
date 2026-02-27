@@ -208,14 +208,84 @@ static int expand_args_fds(pid_t pid, int argc, char **argv,
 }
 
 /*
+ * Translate a guest source path to a host path using the standard
+ * klee_path_guest_to_host pattern (resolve + mount table translate).
+ * Returns a strdup'd host path, or strdup(original) on failure.
+ */
+static char *translate_nested_source(KleeProcess *proc, const char *guest_src)
+{
+    KleeResolveCtx ctx = {
+        .mount_table = proc->sandbox->mount_table,
+        .fd_table = proc->fd_table,
+        .vcwd = proc->vcwd,
+        .vroot = klee_mount_table_get_root(proc->sandbox->mount_table),
+        .flags = 0,
+    };
+    char host_path[PATH_MAX];
+    int rc = klee_path_guest_to_host(&ctx, guest_src, host_path, AT_FDCWD);
+    if (rc == 0 && strcmp(host_path, guest_src) != 0) {
+        KLEE_DEBUG("nested: translate source %s -> %s", guest_src, host_path);
+        return strdup(host_path);
+    }
+    return strdup(guest_src);
+}
+
+/*
  * Apply nested mount operations to the parent's mount table.
  * For FD-based ops, open the tracee's FD via /proc/<pid>/fd/<N>
  * to get a local FD that klee_mount_table_populate can use.
+ *
+ * Source paths in nested bwrap args are guest paths (e.g. /usr).
+ * Translate them to host paths via klee_path_guest_to_host before
+ * adding, so the child process can find files on the real filesystem.
  */
-static int apply_nested_mounts(KleeMountTable *mt, KleeConfig *cfg, pid_t pid)
+static int apply_nested_mounts(KleeProcess *proc, KleeConfig *cfg, pid_t pid)
 {
+    KleeMountTable *mt = proc->sandbox->mount_table;
     int local_fds[256];
     int local_fd_count = 0;
+
+    /* Translate bind mount source paths from guest to host */
+    for (KleeMountOp *op = cfg->mount_ops; op; op = op->next) {
+        bool needs_source_translate = false;
+
+        switch (op->type) {
+        case MOUNT_BIND_RW:
+        case MOUNT_BIND_RO:
+        case MOUNT_BIND_TRY:
+        case MOUNT_BIND_RO_TRY:
+        case MOUNT_DEV_BIND:
+        case MOUNT_DEV_BIND_TRY:
+            needs_source_translate = true;
+            break;
+        case MOUNT_OVERLAY:
+        case MOUNT_TMP_OVERLAY:
+        case MOUNT_RO_OVERLAY:
+            needs_source_translate = true;
+            /* Also translate overlay_srcs */
+            for (int i = 0; i < op->overlay_src_count; i++) {
+                if (op->overlay_srcs[i]) {
+                    char *translated = translate_nested_source(
+                        proc, op->overlay_srcs[i]);
+                    if (translated) {
+                        free(op->overlay_srcs[i]);
+                        op->overlay_srcs[i] = translated;
+                    }
+                }
+            }
+            break;
+        default:
+            break;
+        }
+
+        if (needs_source_translate && op->source) {
+            char *translated = translate_nested_source(proc, op->source);
+            if (translated) {
+                free(op->source);
+                op->source = translated;
+            }
+        }
+    }
 
     /* Replace tracee FD references with local FDs */
     for (KleeMountOp *op = cfg->mount_ops; op; op = op->next) {
@@ -431,8 +501,7 @@ int klee_nested_handle_exec(KleeProcess *proc, KleeInterceptor *ic,
 
     /* 5b. Apply nested mount operations to parent's mount table */
     if (proc->sandbox && proc->sandbox->mount_table && nested_cfg.mount_ops) {
-        rc = apply_nested_mounts(proc->sandbox->mount_table,
-                                 &nested_cfg, pid);
+        rc = apply_nested_mounts(proc, &nested_cfg, pid);
         if (rc < 0)
             KLEE_WARN("nested: some mount ops failed: %d", rc);
 

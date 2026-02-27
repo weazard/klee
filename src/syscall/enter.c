@@ -1528,17 +1528,15 @@ int klee_enter_seccomp(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     unsigned int operation = (unsigned int)ev->args[0];
 
     if (operation == SECCOMP_SET_MODE_FILTER) {
-        KLEE_DEBUG("child seccomp(SET_MODE_FILTER) from pid=%d", proc->real_pid);
-
-        /* Read sock_fprog from tracee at args[2] */
         void *fprog_addr = (void *)(uintptr_t)ev->args[2];
+
         if (fprog_addr) {
             struct sock_fprog fprog;
             int rc = klee_read_mem(ic, ev->pid, &fprog, fprog_addr, sizeof(fprog));
             if (rc == 0 && fprog.filter && fprog.len > 0) {
                 klee_compat_handle_seccomp_filter(ic, ev->pid, &fprog,
                                                    fprog_addr,
-                                                   proc->regs[REG_CURRENT].rsp);
+                                                   klee_regs_get_sp(proc));
             }
         }
         return 0;
