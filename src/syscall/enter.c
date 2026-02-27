@@ -24,6 +24,8 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/syscall.h>
+#include <sys/stat.h>
+#include <sys/utsname.h>
 #include <linux/seccomp.h>
 #include <linux/openat2.h>
 #include <sys/ioctl.h>
@@ -293,6 +295,85 @@ static int check_readonly_open(KleeProcess *proc, int flags)
     return 0;
 }
 
+/* ==================== unotify stat uid/gid rewriting ====================
+ *
+ * For seccomp_unotify, exit handlers don't run.  Syscalls like stat, lstat,
+ * fstat that the ptrace backend rewrites at exit time (uid/gid modification)
+ * must instead be handled at enter time.  We perform the syscall in the
+ * supervisor and modify the result before returning it to the tracee.
+ *
+ * This is safe because klee doesn't use real namespaces — the supervisor
+ * and tracee share the same filesystem view and credentials.
+ */
+static int unotify_stat_rewrite(KleeProcess *proc, KleeInterceptor *ic,
+                                  KleeEvent *ev, int statbuf_idx,
+                                  bool nofollow)
+{
+    if (ic->backend != INTERCEPT_SECCOMP_UNOTIFY)
+        return 0; /* ptrace: exit handler does this */
+    if (!proc->sandbox || !proc->sandbox->unshare_user || !proc->id_state)
+        return 0;
+
+    const char *path = proc->translated_path[0] ? proc->translated_path
+                                                  : proc->saved_path;
+    if (!path[0])
+        return 0;
+
+    struct stat st;
+    int rc = nofollow ? lstat(path, &st) : stat(path, &st);
+    if (rc < 0) {
+        ev->retval = -errno;
+        return 1;
+    }
+
+    uid_t real_uid = getuid();
+    gid_t real_gid = getgid();
+    if (st.st_uid == real_uid)
+        st.st_uid = proc->id_state->euid;
+    if (st.st_gid == real_gid)
+        st.st_gid = proc->id_state->egid;
+
+    void *stat_addr = (void *)(uintptr_t)ev->args[statbuf_idx];
+    ic->write_mem(ic, ev->pid, stat_addr, &st, sizeof(st));
+
+    ev->retval = 0;
+    return 1;
+}
+
+/* fstat variant: stat via /proc/<pid>/fd/<fd> since we can't access
+ * the tracee's FD directly from the supervisor. */
+static int unotify_fstat_rewrite(KleeProcess *proc, KleeInterceptor *ic,
+                                   KleeEvent *ev, int fd_idx, int statbuf_idx)
+{
+    if (ic->backend != INTERCEPT_SECCOMP_UNOTIFY)
+        return 0;
+    if (!proc->sandbox || !proc->sandbox->unshare_user || !proc->id_state)
+        return 0;
+
+    int fd = (int)ev->args[fd_idx];
+    char fd_path[64];
+    snprintf(fd_path, sizeof(fd_path), "/proc/%d/fd/%d", ev->pid, fd);
+
+    struct stat st;
+    if (stat(fd_path, &st) < 0) {
+        ev->retval = -errno;
+        return 1;
+    }
+
+    uid_t real_uid = getuid();
+    gid_t real_gid = getgid();
+    if (st.st_uid == real_uid)
+        st.st_uid = proc->id_state->euid;
+    if (st.st_gid == real_gid)
+        st.st_gid = proc->id_state->egid;
+
+    void *stat_addr = (void *)(uintptr_t)ev->args[statbuf_idx];
+    ic->write_mem(ic, ev->pid, stat_addr, &st, sizeof(st));
+
+    ev->retval = 0;
+    return 1;
+}
+
 /* ==================== Filesystem Enter Handlers ==================== */
 
 int klee_enter_open(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
@@ -397,12 +478,22 @@ int klee_enter_openat2(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 
 int klee_enter_stat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    return translate_path_arg(proc, ic, ev, 0, -1);
+    int rc = translate_path_arg(proc, ic, ev, 0, -1);
+    if (rc < 0) return rc;
+    return unotify_stat_rewrite(proc, ic, ev, 1, false);
 }
 
 int klee_enter_lstat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    return translate_path_arg_nofollow(proc, ic, ev, 0, -1);
+    int rc = translate_path_arg_nofollow(proc, ic, ev, 0, -1);
+    if (rc < 0) return rc;
+    return unotify_stat_rewrite(proc, ic, ev, 1, true);
+}
+
+int klee_enter_fstat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    /* fstat(fd, statbuf) */
+    return unotify_fstat_rewrite(proc, ic, ev, 0, 1);
 }
 
 int klee_enter_newfstatat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
@@ -413,10 +504,15 @@ int klee_enter_newfstatat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
      * otherwise -> stat semantics */
     int flags = (int)ev->args[3];
     if (flags & AT_EMPTY_PATH)
-        return 0;
-    if (flags & AT_SYMLINK_NOFOLLOW)
-        return translate_path_arg_nofollow(proc, ic, ev, 1, 0);
-    return translate_path_arg(proc, ic, ev, 1, 0);
+        return unotify_fstat_rewrite(proc, ic, ev, 0, 2);
+    if (flags & AT_SYMLINK_NOFOLLOW) {
+        int rc = translate_path_arg_nofollow(proc, ic, ev, 1, 0);
+        if (rc < 0) return rc;
+        return unotify_stat_rewrite(proc, ic, ev, 2, true);
+    }
+    int rc = translate_path_arg(proc, ic, ev, 1, 0);
+    if (rc < 0) return rc;
+    return unotify_stat_rewrite(proc, ic, ev, 2, false);
 }
 
 int klee_enter_statx(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
@@ -462,10 +558,25 @@ int klee_enter_readlink(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
         char path[PATH_MAX];
         int rc = klee_read_path(ic, ev->pid, path, sizeof(path), path_addr);
         if (rc >= 0 && is_proc_exe_path(path)) {
-            /* Save the path so the exit handler can detect this was a
-             * /proc/exe readlink and rewrite the result with vexe. */
             snprintf(proc->saved_path, sizeof(proc->saved_path), "%s", path);
-            return 0;  /* let kernel handle, exit handler rewrites */
+
+            /* For unotify: write vexe directly and skip the real syscall.
+             * There's no exit handler to rewrite the result. */
+            if (ic->backend == INTERCEPT_SECCOMP_UNOTIFY &&
+                proc->vexe[0] && proc->sandbox) {
+                void *buf = (void *)(uintptr_t)ev->args[1];
+                size_t bufsiz = (size_t)ev->args[2];
+                size_t vexe_len = strlen(proc->vexe);
+                if (vexe_len > bufsiz)
+                    vexe_len = bufsiz;
+                rc = ic->write_mem(ic, ev->pid, buf, proc->vexe, vexe_len);
+                if (rc == 0) {
+                    ev->retval = (long)vexe_len;
+                    return 1; /* handled */
+                }
+            }
+
+            return 0;  /* ptrace: let kernel handle, exit handler rewrites */
         }
     }
     return translate_path_arg_nofollow(proc, ic, ev, 0, -1);
@@ -480,6 +591,22 @@ int klee_enter_readlinkat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
         int rc = klee_read_path(ic, ev->pid, path, sizeof(path), path_addr);
         if (rc >= 0 && is_proc_exe_path(path)) {
             snprintf(proc->saved_path, sizeof(proc->saved_path), "%s", path);
+
+            /* For unotify: write vexe directly */
+            if (ic->backend == INTERCEPT_SECCOMP_UNOTIFY &&
+                proc->vexe[0] && proc->sandbox) {
+                void *buf = (void *)(uintptr_t)ev->args[2];
+                size_t bufsiz = (size_t)ev->args[3];
+                size_t vexe_len = strlen(proc->vexe);
+                if (vexe_len > bufsiz)
+                    vexe_len = bufsiz;
+                rc = ic->write_mem(ic, ev->pid, buf, proc->vexe, vexe_len);
+                if (rc == 0) {
+                    ev->retval = (long)vexe_len;
+                    return 1;
+                }
+            }
+
             return 0;
         }
     }
@@ -1195,6 +1322,152 @@ int klee_enter_getegid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     return 1;
 }
 
+int klee_enter_getresuid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    if (ic->backend != INTERCEPT_SECCOMP_UNOTIFY)
+        return 0;
+    if (!proc->sandbox || !proc->sandbox->unshare_user || !proc->id_state)
+        return 0;
+
+    uid_t ruid = proc->id_state->ruid;
+    uid_t euid = proc->id_state->euid;
+    uid_t suid = proc->id_state->suid;
+
+    void *ruid_ptr = (void *)(uintptr_t)ev->args[0];
+    void *euid_ptr = (void *)(uintptr_t)ev->args[1];
+    void *suid_ptr = (void *)(uintptr_t)ev->args[2];
+
+    if (ruid_ptr) ic->write_mem(ic, ev->pid, ruid_ptr, &ruid, sizeof(ruid));
+    if (euid_ptr) ic->write_mem(ic, ev->pid, euid_ptr, &euid, sizeof(euid));
+    if (suid_ptr) ic->write_mem(ic, ev->pid, suid_ptr, &suid, sizeof(suid));
+
+    ev->retval = 0;
+    return 1;
+}
+
+int klee_enter_getresgid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    if (ic->backend != INTERCEPT_SECCOMP_UNOTIFY)
+        return 0;
+    if (!proc->sandbox || !proc->sandbox->unshare_user || !proc->id_state)
+        return 0;
+
+    gid_t rgid = proc->id_state->rgid;
+    gid_t egid = proc->id_state->egid;
+    gid_t sgid = proc->id_state->sgid;
+
+    void *rgid_ptr = (void *)(uintptr_t)ev->args[0];
+    void *egid_ptr = (void *)(uintptr_t)ev->args[1];
+    void *sgid_ptr = (void *)(uintptr_t)ev->args[2];
+
+    if (rgid_ptr) ic->write_mem(ic, ev->pid, rgid_ptr, &rgid, sizeof(rgid));
+    if (egid_ptr) ic->write_mem(ic, ev->pid, egid_ptr, &egid, sizeof(egid));
+    if (sgid_ptr) ic->write_mem(ic, ev->pid, sgid_ptr, &sgid, sizeof(sgid));
+
+    ev->retval = 0;
+    return 1;
+}
+
+int klee_enter_getgroups(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    if (ic->backend != INTERCEPT_SECCOMP_UNOTIFY)
+        return 0;
+    if (!proc->sandbox || !proc->sandbox->unshare_user || !proc->id_state)
+        return 0;
+
+    int size = (int)ev->args[0];
+    if (size == 0) {
+        /* Query mode: how many groups? */
+        ev->retval = 1;
+        return 1;
+    }
+
+    void *list_ptr = (void *)(uintptr_t)ev->args[1];
+    if (size > 0 && list_ptr) {
+        gid_t gid = proc->id_state->rgid;
+        ic->write_mem(ic, ev->pid, list_ptr, &gid, sizeof(gid));
+    }
+
+    ev->retval = 1;
+    return 1;
+}
+
+int klee_enter_uname(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    if (ic->backend != INTERCEPT_SECCOMP_UNOTIFY)
+        return 0;
+    if (!proc->sandbox || !proc->sandbox->unshare_uts || !proc->sandbox->hostname)
+        return 0;
+
+    /* Perform uname in supervisor and override hostname */
+    struct utsname uts;
+    if (uname(&uts) < 0)
+        return 0; /* let kernel handle */
+
+    snprintf(uts.nodename, sizeof(uts.nodename), "%s", proc->sandbox->hostname);
+
+    void *buf = (void *)(uintptr_t)ev->args[0];
+    ic->write_mem(ic, ev->pid, buf, &uts, sizeof(uts));
+
+    ev->retval = 0;
+    return 1;
+}
+
+int klee_enter_getpgrp(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    (void)ev;
+    if (ic->backend != INTERCEPT_SECCOMP_UNOTIFY)
+        return 0;
+    if (!proc->sandbox || !proc->sandbox->unshare_pid)
+        return 0;
+
+    /* Get the tracee's process group (not the supervisor's) */
+    pid_t pgid = getpgid(proc->real_pid);
+    if (pgid < 0)
+        return 0;
+
+    if (proc->sandbox->pid_map) {
+        pid_t vpgid = klee_pid_map_r2v(proc->sandbox->pid_map, pgid);
+        if (vpgid > 0)
+            pgid = vpgid;
+    }
+
+    ev->retval = pgid;
+    return 1;
+}
+
+int klee_enter_fchdir(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    if (ic->backend != INTERCEPT_SECCOMP_UNOTIFY)
+        return 0;
+
+    /* Optimistically update vcwd from /proc/<pid>/fd/<fd> since
+     * there's no exit event to confirm the fchdir succeeded. */
+    int fd = (int)ev->args[0];
+    char fd_link[64];
+    char host_path[PATH_MAX];
+
+    snprintf(fd_link, sizeof(fd_link), "/proc/%d/fd/%d", ev->pid, fd);
+    ssize_t len = readlink(fd_link, host_path, sizeof(host_path) - 1);
+    if (len > 0) {
+        host_path[len] = '\0';
+        /* Try FD table first (has guest path) */
+        if (proc->fd_table) {
+            const char *vpath = klee_fd_table_get(proc->fd_table, fd);
+            if (vpath) {
+                snprintf(proc->vcwd, PATH_MAX, "%s", vpath);
+                KLEE_DEBUG("fchdir: vcwd=%s (from fd_table, unotify)", proc->vcwd);
+                return 0;
+            }
+        }
+        /* Fall back to host path — not ideal but better than stale vcwd */
+        snprintf(proc->vcwd, PATH_MAX, "%s", host_path);
+        KLEE_DEBUG("fchdir: vcwd=%s (from /proc/fd, unotify)", proc->vcwd);
+    }
+
+    return 0; /* CONTINUE — let kernel do the actual fchdir */
+}
+
 /* ==================== PID Namespace Enter Handlers ==================== */
 
 /* Helper: translate a PID from the virtual namespace to real.
@@ -1671,6 +1944,17 @@ int klee_enter_prctl(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
         }
         break;
 
+    case PR_CAPBSET_READ:
+        /* Under user namespace simulation, report all capabilities present.
+         * For ptrace, the exit handler sets retval=1.
+         * For unotify, handle at enter time since there's no exit handler. */
+        if (proc->sandbox && proc->sandbox->unshare_user &&
+            ic->backend == INTERCEPT_SECCOMP_UNOTIFY) {
+            ev->retval = 1;
+            return 1;
+        }
+        break;
+
     case PR_SET_NAME:
     case PR_GET_DUMPABLE:
     case PR_SET_NO_NEW_PRIVS:
@@ -1864,6 +2148,22 @@ static int translate_sockaddr_arg(KleeProcess *proc, KleeInterceptor *ic,
         /* Track both modified args for exit-time restore */
         proc->path_arg_idx[proc->path_arg_count++] = 1;
         proc->path_arg_idx[proc->path_arg_count++] = 2;
+    } else if (ic->backend == INTERCEPT_SECCOMP_UNOTIFY) {
+        /* Write translated sockaddr in-place to tracee memory.
+         * Can't modify the addrlen register, so the translated path
+         * must fit within the original addrlen. */
+        if (new_addrlen <= addrlen) {
+            rc = klee_write_mem(ic, ev->pid, addr_ptr,
+                                &new_sun, new_addrlen);
+            if (rc < 0) {
+                proc->path_modified = false;
+                return 0;
+            }
+        } else {
+            KLEE_DEBUG("unotify: translated sockaddr too long (%u > %u)",
+                       new_addrlen, addrlen);
+            proc->path_modified = false;
+        }
     }
 
     KLEE_TRACE("socket: translated %s -> %s",

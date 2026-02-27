@@ -44,7 +44,7 @@ void klee_dispatch_init(void)
 #endif
     register_handler(KLEE_SYS_stat,      "stat",      klee_enter_stat, klee_exit_stat);
     register_handler(KLEE_SYS_lstat,     "lstat",     klee_enter_lstat, klee_exit_stat);
-    register_handler(KLEE_SYS_fstat,     "fstat",     NULL, klee_exit_stat);
+    register_handler(KLEE_SYS_fstat,     "fstat",     klee_enter_fstat, klee_exit_stat);
 #ifdef KLEE_SYS_newfstatat
     register_handler(KLEE_SYS_newfstatat,"newfstatat", klee_enter_newfstatat, klee_exit_stat);
 #endif
@@ -83,7 +83,7 @@ void klee_dispatch_init(void)
     register_handler(KLEE_SYS_mknodat,   "mknodat",   klee_enter_mknodat, NULL);
 
     register_handler(KLEE_SYS_chdir,     "chdir",     klee_enter_chdir, klee_exit_chdir);
-    register_handler(KLEE_SYS_fchdir,    "fchdir",    NULL, klee_exit_fchdir);
+    register_handler(KLEE_SYS_fchdir,    "fchdir",    klee_enter_fchdir, klee_exit_fchdir);
     register_handler(KLEE_SYS_getcwd,    "getcwd",    klee_enter_getcwd, klee_exit_getcwd);
     register_handler(KLEE_SYS_chroot,    "chroot",    klee_enter_chroot, NULL);
     register_handler(KLEE_SYS_mount,     "mount",     klee_enter_mount, NULL);
@@ -106,7 +106,7 @@ void klee_dispatch_init(void)
     register_handler(KLEE_SYS_tkill,     "tkill",     klee_enter_tkill, NULL);
     register_handler(KLEE_SYS_setpgid,   "setpgid",   klee_enter_setpgid, NULL);
     register_handler(KLEE_SYS_getpgid,   "getpgid",   klee_enter_getpgid, klee_exit_getpgid);
-    register_handler(KLEE_SYS_getpgrp,   "getpgrp",   NULL, klee_exit_getpgrp);
+    register_handler(KLEE_SYS_getpgrp,   "getpgrp",   klee_enter_getpgrp, klee_exit_getpgrp);
     register_handler(KLEE_SYS_setsid,    "setsid",    NULL, klee_exit_setsid);
     register_handler(KLEE_SYS_getsid,    "getsid",    klee_enter_getsid, klee_exit_getsid);
     register_handler(KLEE_SYS_ioctl,    "ioctl",     klee_enter_ioctl, klee_exit_ioctl);
@@ -116,8 +116,8 @@ void klee_dispatch_init(void)
     register_handler(KLEE_SYS_geteuid,   "geteuid",   klee_enter_geteuid, klee_exit_geteuid);
     register_handler(KLEE_SYS_getgid,    "getgid",    klee_enter_getgid, klee_exit_getgid);
     register_handler(KLEE_SYS_getegid,   "getegid",   klee_enter_getegid, klee_exit_getegid);
-    register_handler(KLEE_SYS_getresuid, "getresuid", NULL, klee_exit_getresuid);
-    register_handler(KLEE_SYS_getresgid, "getresgid", NULL, klee_exit_getresgid);
+    register_handler(KLEE_SYS_getresuid, "getresuid", klee_enter_getresuid, klee_exit_getresuid);
+    register_handler(KLEE_SYS_getresgid, "getresgid", klee_enter_getresgid, klee_exit_getresgid);
     register_handler(KLEE_SYS_setuid,    "setuid",    klee_enter_setuid, NULL);
     register_handler(KLEE_SYS_setgid,    "setgid",    klee_enter_setgid, NULL);
     register_handler(KLEE_SYS_setreuid,  "setreuid",  klee_enter_setreuid, NULL);
@@ -127,10 +127,10 @@ void klee_dispatch_init(void)
     register_handler(KLEE_SYS_setfsuid,  "setfsuid",  klee_enter_setfsuid, NULL);
     register_handler(KLEE_SYS_setfsgid,  "setfsgid",  klee_enter_setfsgid, NULL);
     register_handler(KLEE_SYS_setgroups, "setgroups", klee_enter_setgroups, NULL);
-    register_handler(KLEE_SYS_getgroups, "getgroups", NULL, klee_exit_getgroups);
+    register_handler(KLEE_SYS_getgroups, "getgroups", klee_enter_getgroups, klee_exit_getgroups);
 
     /* UTS namespace */
-    register_handler(KLEE_SYS_uname,     "uname",     NULL, klee_exit_uname);
+    register_handler(KLEE_SYS_uname,     "uname",     klee_enter_uname, klee_exit_uname);
     register_handler(KLEE_SYS_sethostname,"sethostname", klee_enter_sethostname, NULL);
 
     /* IPC namespace */
