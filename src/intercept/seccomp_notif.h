@@ -19,7 +19,10 @@ int klee_seccomp_notif_available(void);
 int klee_seccomp_notif_respond_value(KleeInterceptor *ic, KleeEvent *event,
                                       long retval);
 
-/* Transfer the seccomp listener FD from child to parent */
+/* Transfer the seccomp listener FD from child to parent.
+ * Child writes FD number over a pipe (write is not intercepted).
+ * Parent reads the number; the FD is directly accessible because
+ * fork used CLONE_FILES (shared FD table). */
 int klee_seccomp_notif_send_fd(KleeInterceptor *ic, int listener_fd);
 int klee_seccomp_notif_recv_fd(KleeInterceptor *ic);
 

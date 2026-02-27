@@ -13,6 +13,8 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sched.h>
 #include <signal.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
@@ -144,9 +146,9 @@ int klee_interceptor_setup_parent(KleeInterceptor *interceptor, pid_t child_pid)
 {
     if (interceptor->backend == INTERCEPT_SECCOMP_UNOTIFY) {
         (void)child_pid;
-        /* Receive the listener FD from the child via SCM_RIGHTS.
-         * The child created the seccomp filter and sent the listener FD
-         * over the setup socketpair in install_child(). */
+        /* Receive the listener FD from the child.  The child writes the
+         * FD number over a pipe; since we forked with CLONE_FILES, the
+         * FD is directly accessible in our table. */
         int fd = klee_seccomp_notif_recv_fd(interceptor);
         if (fd < 0) {
             KLEE_ERROR("failed to receive seccomp listener fd from child: %s",
@@ -154,6 +156,23 @@ int klee_interceptor_setup_parent(KleeInterceptor *interceptor, pid_t child_pid)
             return fd;
         }
         interceptor->seccomp.notif_fd = fd;
+
+        /* Make the notif_fd non-blocking.  The event loop uses epoll to
+         * detect when a notification is pending, then calls
+         * ioctl(SECCOMP_IOCTL_NOTIF_RECV).  If the fd is blocking, the
+         * ioctl can hang forever when the child exits without a pending
+         * notification (the fd gets EPOLLHUP from epoll, but the blocking
+         * ioctl has nothing to read).  With O_NONBLOCK, the ioctl returns
+         * EAGAIN and the epoll loop can proceed to reap the zombie. */
+        int flags = fcntl(fd, F_GETFL);
+        if (flags >= 0)
+            fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+        /* No need to unshare(CLONE_FILES) here — when the child exec()s,
+         * the kernel automatically unshares the FD table and closes
+         * CLOEXEC FDs only in the child's new private copy.  The parent's
+         * listener FD is preserved. */
+
         KLEE_INFO("received seccomp listener fd=%d from child", fd);
         return 0;
     } else {
@@ -243,4 +262,17 @@ int klee_interceptor_setup_parent(KleeInterceptor *interceptor, pid_t child_pid)
 
         return 0;
     }
+}
+
+pid_t klee_interceptor_fork(KleeInterceptor *interceptor)
+{
+    if (interceptor->backend == INTERCEPT_SECCOMP_UNOTIFY) {
+        /* Use CLONE_FILES so parent and child share the FD table.
+         * This lets the parent directly access the seccomp listener FD
+         * that the child creates, without needing sendmsg (which is
+         * intercepted by the seccomp filter and would deadlock). */
+        return (pid_t)syscall(SYS_clone, (unsigned long)(CLONE_FILES | SIGCHLD),
+                              NULL, NULL, NULL, 0L);
+    }
+    return fork();
 }

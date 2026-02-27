@@ -19,7 +19,9 @@
 #include "util/log.h"
 
 #include <errno.h>
+#include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <signal.h>
@@ -32,6 +34,151 @@
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+
+/*
+ * For seccomp_unotify + execve: when the translated path is longer than
+ * the original, writing it in-place would overflow into adjacent argv
+ * strings (they're stored contiguously on the stack).  This function
+ * relocates any argv strings in the overflow zone to scratch space on the
+ * tracee's stack before the in-place write, preventing corruption.
+ */
+static void unotify_relocate_clobbered_argv(KleeInterceptor *ic,
+                                              KleeEvent *ev,
+                                              uintptr_t path_addr,
+                                              size_t orig_len,
+                                              size_t trans_len)
+{
+    uintptr_t clobber_start = path_addr + orig_len;
+    uintptr_t clobber_end = path_addr + trans_len;
+
+    /* argv is arg 1 for execve, arg 2 for execveat */
+    int argv_param = (ev->syscall_nr == SYS_execveat) ? 2 : 1;
+    uintptr_t argv_base = ev->args[argv_param];
+    if (!argv_base)
+        return;
+
+    /* Read the tracee's stack pointer from /proc/<pid>/syscall so we can
+     * place relocated strings in scratch space below the red zone.
+     * Format: "nr arg0 arg1 arg2 arg3 arg4 arg5 sp pc\n" (all hex). */
+    uint64_t rsp = 0;
+    {
+        char path[64], buf[256];
+        snprintf(path, sizeof(path), "/proc/%d/syscall", ev->pid);
+        int fd = open(path, O_RDONLY);
+        if (fd >= 0) {
+            ssize_t n = read(fd, buf, sizeof(buf) - 1);
+            close(fd);
+            if (n > 0) {
+                buf[n] = '\0';
+                /* Skip 7 fields (nr + 6 args) to reach sp */
+                char *p = buf;
+                for (int skip = 0; skip < 7; skip++) {
+                    while (*p && *p != ' ') p++;
+                    while (*p == ' ') p++;
+                }
+                if (*p)
+                    rsp = strtoull(p, NULL, 16);
+            }
+        }
+    }
+    if (!rsp)
+        return;
+
+    /* Scratch area: below the 128-byte red zone, 16-byte aligned */
+    uint64_t scratch = (rsp - 128 - 4096) & ~(uint64_t)15;
+
+    for (int i = 0; i < 4096; i++) {
+        uint64_t ptr;
+        uintptr_t slot = argv_base + (uintptr_t)i * sizeof(ptr);
+
+        if (ic->read_mem(ic, ev->pid, &ptr, (void *)slot, sizeof(ptr)) < 0)
+            break;
+        if (ptr == 0)
+            break;
+
+        /* Only relocate strings whose start falls in the clobber zone */
+        if (ptr < clobber_start || ptr >= clobber_end)
+            continue;
+
+        /* Read the string while it's still intact (before the overwrite) */
+        char str[PATH_MAX];
+        int slen = klee_read_string(ic, ev->pid, str, sizeof(str), (void *)ptr);
+        if (slen < 0)
+            continue;
+        size_t total = (size_t)slen + 1; /* include NUL */
+
+        /* Write to scratch area */
+        if (ic->write_mem(ic, ev->pid, (void *)scratch, str, total) < 0)
+            continue;
+
+        /* Patch the argv[i] pointer to the new location */
+        uint64_t new_ptr = scratch;
+        ic->write_mem(ic, ev->pid, (void *)slot, &new_ptr, sizeof(new_ptr));
+
+        KLEE_TRACE("unotify: relocated argv[%d] \"%s\" from %#lx to %#lx",
+                    i, str, (unsigned long)ptr, (unsigned long)scratch);
+
+        /* Advance scratch past this string (16-byte aligned) */
+        scratch -= (total + 15) & ~(size_t)15;
+    }
+}
+
+/*
+ * For seccomp_unotify: when the translated path is longer than the
+ * original, writing it in-place overflows into adjacent memory (corrupting
+ * e.g. ld.so's internal buffers during library loading).  Instead, create
+ * a symlink in a temporary directory and write the short symlink path
+ * in-place.  The kernel follows the symlink transparently during path
+ * resolution, so the syscall reaches the correct translated file.
+ *
+ * Returns the length of the redirect path (excluding NUL), or -1 on error.
+ */
+static char unotify_redir_dir[64];
+static int unotify_redir_seq;
+static bool unotify_redir_inited;
+
+static void unotify_redir_cleanup(void)
+{
+    if (!unotify_redir_inited)
+        return;
+    char path[PATH_MAX];
+    for (int i = 0; i < unotify_redir_seq; i++) {
+        snprintf(path, sizeof(path), "%s/%d", unotify_redir_dir, i);
+        unlink(path);
+    }
+    rmdir(unotify_redir_dir);
+}
+
+static int unotify_create_redirect(const char *target,
+                                    char *out, size_t out_size)
+{
+    if (!unotify_redir_inited) {
+        snprintf(unotify_redir_dir, sizeof(unotify_redir_dir),
+                 "/tmp/.kr%d", getpid());
+        if (mkdir(unotify_redir_dir, 0700) < 0 && errno != EEXIST) {
+            KLEE_DEBUG("unotify: failed to create redirect dir %s: %s",
+                        unotify_redir_dir, strerror(errno));
+            return -1;
+        }
+        atexit(unotify_redir_cleanup);
+        unotify_redir_inited = true;
+    }
+
+    char link[PATH_MAX];
+    snprintf(link, sizeof(link), "%s/%d", unotify_redir_dir, unotify_redir_seq);
+
+    unlink(link); /* remove stale symlink from a previous run */
+    if (symlink(target, link) < 0) {
+        KLEE_DEBUG("unotify: symlink(%s -> %s) failed: %s",
+                    link, target, strerror(errno));
+        return -1;
+    }
+
+    int n = snprintf(out, out_size, "%s/%d",
+                     unotify_redir_dir, unotify_redir_seq);
+    unotify_redir_seq++;
+    return (n < (int)out_size) ? n : -1;
+}
 
 /*
  * Helper: translate a path argument at the given register index.
@@ -257,7 +404,58 @@ static int translate_path_arg_ex(KleeProcess *proc, KleeInterceptor *ic,
     } else if (ic->backend == INTERCEPT_SECCOMP_UNOTIFY) {
         /* Write translated path in-place at the original buffer address.
          * The tracee's register still points here and we can't change it,
-         * so the kernel will pick up our overwritten string on CONTINUE. */
+         * so the kernel will pick up our overwritten string on CONTINUE.
+         *
+         * If the translated path is longer than the original, writing
+         * it in-place would overflow into adjacent memory — corrupting
+         * e.g. ld.so's path buffers during library loading.  Handle
+         * the overflow depending on the syscall type:
+         *
+         *  - execve/execveat: relocate argv strings that fall in the
+         *    overflow zone to scratch space, then write in-place.  After
+         *    exec the old address space is gone so the overflow is benign.
+         *
+         *  - all other syscalls: create a symlink from a short path to
+         *    the translated path, then write the short path in-place.
+         *    The kernel follows the symlink during path resolution. */
+        size_t orig_len = strlen(proc->saved_path) + 1;
+        size_t trans_len = strlen(proc->translated_path) + 1;
+
+        if (trans_len > orig_len) {
+            if (ev->syscall_nr == SYS_execve ||
+                ev->syscall_nr == SYS_execveat) {
+                /* Relocate argv strings in the overflow zone */
+                unotify_relocate_clobbered_argv(ic, ev, (uintptr_t)path_addr,
+                                                orig_len, trans_len);
+                /* Fall through to write translated path in-place —
+                 * the overflow lands in the old process image which is
+                 * replaced by exec, so it's harmless. */
+            } else {
+                /* Use symlink redirect to avoid overflow */
+                char redir[PATH_MAX];
+                int rlen = unotify_create_redirect(proc->translated_path,
+                                                   redir, sizeof(redir));
+                if (rlen >= 0 && (size_t)(rlen + 1) <= orig_len) {
+                    rc = klee_write_string(ic, ev->pid, path_addr, redir);
+                    if (rc >= 0) {
+                        KLEE_TRACE("translated: %s -> %s (via %s)",
+                                    proc->saved_path,
+                                    proc->translated_path, redir);
+                        return 0;
+                    }
+                }
+                /* Redirect failed or path too short — skip translation.
+                 * The kernel uses the original path, which may still
+                 * work via host symlinks. */
+                KLEE_DEBUG("unotify: overflow, skipping: %s -> %s "
+                            "(orig=%zu trans=%zu)",
+                            proc->saved_path, proc->translated_path,
+                            orig_len - 1, trans_len - 1);
+                proc->path_modified = false;
+                return 0;
+            }
+        }
+
         rc = klee_write_string(ic, ev->pid, path_addr, proc->translated_path);
         if (rc < 0) {
             KLEE_DEBUG("unotify: failed to write translated path in-place: %d", rc);

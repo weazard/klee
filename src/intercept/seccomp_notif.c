@@ -13,10 +13,10 @@
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
-#include <sys/socket.h>
 #include <linux/seccomp.h>
 
 #ifdef HAVE_SECCOMP_UNOTIFY
@@ -38,67 +38,6 @@
 #define SECCOMP_ADDFD_FLAG_SETFD (1UL << 0)
 #endif
 
-/* Send a file descriptor over a Unix socket using SCM_RIGHTS */
-static int send_fd_over_socket(int sock, int fd_to_send)
-{
-    char buf = 0;
-    struct iovec iov = { .iov_base = &buf, .iov_len = 1 };
-    union {
-        struct cmsghdr hdr;
-        char space[CMSG_SPACE(sizeof(int))];
-    } cmsg_buf;
-
-    struct msghdr msg;
-    memset(&msg, 0, sizeof(msg));
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.space;
-    msg.msg_controllen = sizeof(cmsg_buf.space);
-
-    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-    cmsg->cmsg_level = SOL_SOCKET;
-    cmsg->cmsg_type = SCM_RIGHTS;
-    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-    memcpy(CMSG_DATA(cmsg), &fd_to_send, sizeof(int));
-
-    if (sendmsg(sock, &msg, 0) < 0)
-        return -errno;
-    return 0;
-}
-
-/* Receive a file descriptor over a Unix socket using SCM_RIGHTS */
-static int recv_fd_from_socket(int sock)
-{
-    char buf;
-    struct iovec iov = { .iov_base = &buf, .iov_len = 1 };
-    union {
-        struct cmsghdr hdr;
-        char space[CMSG_SPACE(sizeof(int))];
-    } cmsg_buf;
-
-    struct msghdr msg;
-    memset(&msg, 0, sizeof(msg));
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.space;
-    msg.msg_controllen = sizeof(cmsg_buf.space);
-
-    ssize_t n = recvmsg(sock, &msg, 0);
-    if (n < 0)
-        return -errno;
-    if (n == 0)
-        return -ECONNRESET;
-
-    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-    if (!cmsg || cmsg->cmsg_level != SOL_SOCKET ||
-        cmsg->cmsg_type != SCM_RIGHTS ||
-        cmsg->cmsg_len != CMSG_LEN(sizeof(int)))
-        return -EPROTO;
-
-    int fd;
-    memcpy(&fd, CMSG_DATA(cmsg), sizeof(int));
-    return fd;
-}
 
 /* Read memory from tracee using /proc/pid/mem */
 static int seccomp_read_mem(KleeInterceptor *self, pid_t pid,
@@ -171,6 +110,8 @@ static int seccomp_wait_event(KleeInterceptor *self, KleeEvent *out)
         free(notif);
         if (err == EINTR)
             return -EINTR;
+        if (err == EAGAIN || err == EWOULDBLOCK)
+            return -EAGAIN;
         return -err;
     }
 
@@ -265,10 +206,10 @@ static void seccomp_destroy(KleeInterceptor *self)
         close(self->seccomp.notif_fd);
     if (self->seccomp.listener_fd >= 0)
         close(self->seccomp.listener_fd);
-    if (self->seccomp.setup_sock[0] >= 0)
-        close(self->seccomp.setup_sock[0]);
-    if (self->seccomp.setup_sock[1] >= 0)
-        close(self->seccomp.setup_sock[1]);
+    if (self->seccomp.setup_pipe[0] >= 0)
+        close(self->seccomp.setup_pipe[0]);
+    if (self->seccomp.setup_pipe[1] >= 0)
+        close(self->seccomp.setup_pipe[1]);
     free(self);
 }
 
@@ -302,35 +243,53 @@ int klee_seccomp_notif_respond_value(KleeInterceptor *ic, KleeEvent *event,
     return 0;
 }
 
-/* Send the seccomp listener FD from the child to the parent via the
- * setup socketpair.  Called by the child after installing the filter. */
+/* Send the seccomp listener FD number from the child to the parent via
+ * a pipe.  Uses write() which is NOT in the intercepted syscall list,
+ * so it works even after the seccomp USER_NOTIF filter is installed.
+ * (sendmsg IS intercepted, which is why the old SCM_RIGHTS approach
+ * deadlocked — the filter trapped sendmsg before anyone was listening.) */
+/* NOTE: with CLONE_FILES, close() here affects the parent too.
+ * We must not close pipe FDs until after unshare(CLONE_FILES). */
 int klee_seccomp_notif_send_fd(KleeInterceptor *ic, int listener_fd)
 {
-    if (ic->seccomp.setup_sock[1] < 0)
+    if (ic->seccomp.setup_pipe[1] < 0)
         return -EINVAL;
 
-    int rc = send_fd_over_socket(ic->seccomp.setup_sock[1], listener_fd);
-    close(ic->seccomp.setup_sock[1]);
-    ic->seccomp.setup_sock[1] = -1;
-    /* Also close our copy of the read end */
-    close(ic->seccomp.setup_sock[0]);
-    ic->seccomp.setup_sock[0] = -1;
-    return rc;
+    ssize_t n = write(ic->seccomp.setup_pipe[1], &listener_fd, sizeof(listener_fd));
+    if (n != sizeof(listener_fd))
+        return -errno;
+    return 0;
 }
 
-/* Receive the seccomp listener FD from the child via the setup socketpair.
- * Called by the parent after forking. */
+/* Receive the seccomp listener FD from the child.  The child writes the
+ * FD number over a pipe.  Since we forked with CLONE_FILES (shared FD
+ * table), the FD is directly accessible in the parent's table.
+ *
+ * IMPORTANT: we must NOT close the pipe write end before reading — with
+ * CLONE_FILES the FD table is shared, so closing the write end here
+ * would also close it in the child (preventing it from writing). */
 int klee_seccomp_notif_recv_fd(KleeInterceptor *ic)
 {
-    if (ic->seccomp.setup_sock[0] < 0)
+    if (ic->seccomp.setup_pipe[0] < 0)
         return -EINVAL;
 
-    int fd = recv_fd_from_socket(ic->seccomp.setup_sock[0]);
-    close(ic->seccomp.setup_sock[0]);
-    ic->seccomp.setup_sock[0] = -1;
-    /* Close our copy of the write end */
-    close(ic->seccomp.setup_sock[1]);
-    ic->seccomp.setup_sock[1] = -1;
+    /* Poll for data with a timeout (can't close write end to get EOF
+     * because CLONE_FILES means it's shared with the child). */
+    struct pollfd pfd = { .fd = ic->seccomp.setup_pipe[0], .events = POLLIN };
+    int ret = poll(&pfd, 1, 10000);  /* 10s timeout */
+    if (ret <= 0) {
+        KLEE_ERROR("timed out waiting for seccomp listener fd from child");
+        return -ETIMEDOUT;
+    }
+
+    int fd;
+    ssize_t n = read(ic->seccomp.setup_pipe[0], &fd, sizeof(fd));
+
+    if (n == 0)
+        return -ECONNRESET;
+    if (n != sizeof(fd))
+        return -EIO;
+
     return fd;
 }
 
@@ -343,19 +302,23 @@ KleeInterceptor *klee_seccomp_notif_create(void)
     ic->backend = INTERCEPT_SECCOMP_UNOTIFY;
     ic->seccomp.notif_fd = -1;
     ic->seccomp.listener_fd = -1;
-    ic->seccomp.setup_sock[0] = -1;
-    ic->seccomp.setup_sock[1] = -1;
+    ic->seccomp.setup_pipe[0] = -1;
+    ic->seccomp.setup_pipe[1] = -1;
 
-    /* Create socketpair for child→parent listener FD transfer */
-    int sv[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) < 0) {
-        KLEE_ERROR("socketpair for unotify FD transfer failed: %s",
+    /* Create pipe for child→parent listener FD number transfer.
+     * We use a pipe + pidfd_getfd() instead of a socketpair + SCM_RIGHTS
+     * because sendmsg is in our intercepted syscall list.  After the child
+     * installs the seccomp USER_NOTIF filter, sendmsg would be trapped
+     * with no listener yet, causing a deadlock.  write() is not intercepted. */
+    int pfd[2];
+    if (pipe2(pfd, O_CLOEXEC) < 0) {
+        KLEE_ERROR("pipe for unotify FD transfer failed: %s",
                     strerror(errno));
         free(ic);
         return NULL;
     }
-    ic->seccomp.setup_sock[0] = sv[0];
-    ic->seccomp.setup_sock[1] = sv[1];
+    ic->seccomp.setup_pipe[0] = pfd[0];
+    ic->seccomp.setup_pipe[1] = pfd[1];
 
     ic->wait_event = seccomp_wait_event;
     ic->respond = seccomp_respond;

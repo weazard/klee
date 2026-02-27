@@ -46,7 +46,7 @@ struct klee_interceptor {
         struct {
             int notif_fd;
             int listener_fd;
-            int setup_sock[2];  /* socketpair for child→parent FD transfer */
+            int setup_pipe[2];  /* pipe for child→parent FD number transfer */
         } seccomp;
         struct {
             unsigned long options;
@@ -88,5 +88,10 @@ int klee_interceptor_install_child(KleeInterceptor *interceptor);
 /* Setup parent side after child is started.
  * For ptrace: set PTRACE_SETOPTIONS. */
 int klee_interceptor_setup_parent(KleeInterceptor *interceptor, pid_t child_pid);
+
+/* Fork a child process.  For seccomp_unotify, uses CLONE_FILES so the
+ * parent can access the listener FD created by the child.  For ptrace,
+ * uses regular fork(). */
+pid_t klee_interceptor_fork(KleeInterceptor *interceptor);
 
 #endif /* KLEE_INTERCEPT_H */

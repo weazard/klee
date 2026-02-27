@@ -393,8 +393,23 @@ int main(int argc, char **argv)
     /* Wait on block fd if specified (bwrap does this after setup, before exec) */
     wait_block_fd(&cfg);
 
-    /* Fork child */
-    pid_t child_pid = fork();
+    /* Block SIGCHLD before fork so it's queued for signalfd rather than
+     * delivered and discarded with the default handler.  This is critical
+     * for the seccomp_unotify backend where the child may exit before the
+     * event loop's signalfd is created. */
+    if (interceptor->backend == INTERCEPT_SECCOMP_UNOTIFY) {
+        sigset_t mask;
+        sigemptyset(&mask);
+        sigaddset(&mask, SIGCHLD);
+        sigprocmask(SIG_BLOCK, &mask, NULL);
+    }
+
+    /* Fork child.  For the seccomp_unotify backend, this uses CLONE_FILES
+     * so parent and child share the FD table — needed because the child
+     * creates the seccomp listener FD and the parent must access it
+     * directly (sendmsg-based SCM_RIGHTS transfer would deadlock since
+     * sendmsg itself is intercepted by the filter). */
+    pid_t child_pid = klee_interceptor_fork(interceptor);
     if (child_pid < 0) {
         KLEE_ERROR("fork failed: %s", strerror(errno));
         goto cleanup;

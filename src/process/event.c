@@ -436,12 +436,42 @@ int klee_event_loop_run(KleeEventLoop *el)
                         }
                     }
                 } else if (events[i].data.fd == el->interceptor->seccomp.notif_fd) {
-                    /* Handle seccomp notification */
-                    KleeEvent event;
-                    int rc = el->interceptor->wait_event(el->interceptor, &event);
-                    if (rc == 0)
-                        klee_event_loop_handle(el, &event);
+                    /* Handle seccomp notification.  The notif_fd is
+                     * non-blocking, so SECCOMP_IOCTL_NOTIF_RECV returns
+                     * EAGAIN when no notification is pending. */
+                    if (events[i].events & (EPOLLHUP | EPOLLERR)) {
+                        /* Child's seccomp filter is gone (all target
+                         * processes exited).  Remove from epoll to
+                         * prevent busy-looping on the dead fd. */
+                        epoll_ctl(el->epoll_fd, EPOLL_CTL_DEL,
+                                  el->interceptor->seccomp.notif_fd, NULL);
+                    }
+                    if (events[i].events & EPOLLIN) {
+                        KleeEvent event;
+                        int rc = el->interceptor->wait_event(el->interceptor, &event);
+                        if (rc == 0)
+                            klee_event_loop_handle(el, &event);
+                    }
                 }
+            }
+
+            /* Fallback: reap zombies even if signalfd missed them.
+             * This can happen if SIGCHLD was delivered between the
+             * sigprocmask and signalfd creation, or with CLONE_FILES. */
+            {
+                int status;
+                pid_t pid;
+                while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+                    KLEE_DEBUG("fallback reap: pid=%d status=%d", pid, status);
+                    KleeEvent exit_ev = {
+                        .type = KLEE_EVENT_EXIT,
+                        .pid = pid,
+                        .retval = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status),
+                    };
+                    klee_event_loop_handle(el, &exit_ev);
+                }
+                if (pid < 0 && errno != ECHILD)
+                    KLEE_DEBUG("fallback waitpid: %s", strerror(errno));
             }
 
             /* Check if any children are still alive */
