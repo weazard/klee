@@ -24,13 +24,10 @@
 KleeInterceptor *klee_interceptor_create(void)
 {
 #ifdef HAVE_SECCOMP_UNOTIFY
-    if (klee_seccomp_notif_available()) {
-        KLEE_INFO("using seccomp_unotify interception backend");
+    if (getenv("KLEE_USE_UNOTIFY") && klee_seccomp_notif_available()) {
+        KLEE_INFO("using seccomp_unotify interception backend (experimental)");
         return klee_seccomp_notif_create();
     }
-    KLEE_INFO("seccomp_unotify not available, falling back to ptrace");
-#else
-    KLEE_INFO("seccomp_unotify not compiled in, using ptrace backend");
 #endif
     return klee_ptrace_create();
 }

@@ -11,10 +11,8 @@ PREFIX   ?= /usr/local
 BINDIR   ?= $(PREFIX)/bin
 
 # Feature detection
-HAVE_SECCOMP_UNOTIFY := $(shell echo '\#include <linux/seccomp.h>' | \
-	$(CC) -xc -c - -o /dev/null 2>/dev/null && echo 1 || echo 0)
-HAVE_PROCESS_VM := $(shell echo '\#include <sys/uio.h>\nint main(){process_vm_readv(0,0,0,0,0,0);}' | \
-	$(CC) -xc - -o /dev/null 2>/dev/null && echo 1 || echo 0)
+HAVE_SECCOMP_UNOTIFY := $(shell printf '#include <linux/seccomp.h>\n' | $(CC) -xc -c - -o /dev/null 2>/dev/null && echo 1 || echo 0)
+HAVE_PROCESS_VM := $(shell printf '#include <sys/uio.h>\nint main(){process_vm_readv(0,0,0,0,0,0);}\n' | $(CC) -xc - -o /dev/null 2>/dev/null && echo 1 || echo 0)
 
 # Optional FUSE3
 HAVE_FUSE3 := $(shell pkg-config --exists fuse3 2>/dev/null && echo 1 || echo 0)
