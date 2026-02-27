@@ -1485,11 +1485,16 @@ int klee_enter_prctl(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
          * a non-dumpable process returns EIO on these calls, breaking
          * all path translation.  Programs like gpg-agent set dumpable=0
          * to protect cryptographic material, but klee already confines
-         * them inside its sandbox.  Pretend it succeeded. */
-        if ((int)ev->args[1] == 0) {
-            KLEE_DEBUG("prctl(PR_SET_DUMPABLE, 0) blocked for pid=%d",
+         * them inside its sandbox.
+         *
+         * Rewrite arg from 0 (disable) to 1 (enable) so the kernel
+         * executes a harmless no-op and returns success to the tracee. */
+        if ((int)ev->args[1] == 0 && ic->backend == INTERCEPT_PTRACE) {
+            KLEE_DEBUG("prctl(PR_SET_DUMPABLE, 0) -> 1 for pid=%d",
                        proc->real_pid);
-            return -0; /* void syscall, return success */
+            klee_regs_fetch(ic, proc);
+            klee_regs_set_arg(proc, 1, 1);
+            klee_regs_push(ic, proc);
         }
         break;
 
