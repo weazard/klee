@@ -46,6 +46,7 @@ struct klee_interceptor {
         struct {
             int notif_fd;
             int listener_fd;
+            int setup_sock[2];  /* socketpair for child→parent FD transfer */
         } seccomp;
         struct {
             unsigned long options;

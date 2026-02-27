@@ -6,6 +6,7 @@
 #include "process/memory.h"
 #include "process/regs.h"
 #include "syscall/dispatch.h"
+#include "intercept/seccomp_notif.h"
 #include "ns/pid_ns.h"
 #include "ns/user_ns.h"
 #include "fuse/fuse_proc.h"
@@ -241,9 +242,18 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
             el->interceptor->respond(el->interceptor, event, -1, -rc);
             return 0;
         }
-        /* Continue the syscall */
+        /* Continue or respond */
         if (el->interceptor->backend == INTERCEPT_SECCOMP_UNOTIFY) {
-            el->interceptor->respond(el->interceptor, event, 0, 0);
+            if (rc > 0) {
+                /* Enter handler fully handled this syscall for unotify.
+                 * Skip the real syscall and return the specified value. */
+                klee_seccomp_notif_respond_value(el->interceptor,
+                                                   event, event->retval);
+            } else {
+                /* Let the kernel execute the syscall (path translation
+                 * has been written in-place to tracee memory). */
+                el->interceptor->respond(el->interceptor, event, 0, 0);
+            }
         } else {
             el->interceptor->continue_syscall(el->interceptor, event->pid, 0);
         }
@@ -442,10 +452,8 @@ int klee_event_loop_run(KleeEventLoop *el)
         }
     }
 
-    /* Kill any remaining traced processes (e.g. daemon children like
-     * gpg-agent that outlived the initial child).  With ptrace, these
-     * processes are still stopped — detach and kill them so they don't
-     * linger as zombies. */
+    /* Kill any remaining processes (e.g. daemon children like gpg-agent
+     * that outlived the initial child). */
     if (el->proctable->count > 0) {
         KLEE_DEBUG("killing %zu remaining processes", el->proctable->count);
         for (size_t i = 0; i < el->proctable->by_pid->capacity; i++) {
@@ -454,10 +462,14 @@ int klee_event_loop_run(KleeEventLoop *el)
                 continue;
             pid_t pid = (pid_t)ent->key;
             KLEE_DEBUG("killing leftover pid=%d", pid);
-            /* Detach from the ptraced process and deliver SIGKILL.
-             * Without detaching first, the process stays ptrace-stopped
-             * and waitpid returns WIFSTOPPED instead of WIFEXITED. */
-            ptrace(PTRACE_DETACH, pid, 0, SIGKILL);
+            if (el->interceptor->backend == INTERCEPT_PTRACE) {
+                /* Detach from ptraced process and deliver SIGKILL.
+                 * Without detaching first, it stays ptrace-stopped. */
+                ptrace(PTRACE_DETACH, pid, 0, SIGKILL);
+            } else {
+                /* For unotify: just SIGKILL — no ptrace attachment. */
+                kill(pid, SIGKILL);
+            }
         }
         /* Reap all killed children */
         while (waitpid(-1, NULL, WNOHANG) > 0)

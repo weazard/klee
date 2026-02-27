@@ -78,6 +78,16 @@ int klee_interceptor_install_child(KleeInterceptor *interceptor)
 
         interceptor->seccomp.listener_fd = fd;
         klee_bpf_free(&prog);
+
+        /* Transfer the listener FD to the parent via the setup socketpair.
+         * The child holds the FD from seccomp(NEW_LISTENER) but the parent
+         * needs it to receive notifications. */
+        int rc = klee_seccomp_notif_send_fd(interceptor, fd);
+        if (rc < 0) {
+            KLEE_ERROR("failed to send listener fd to parent: %s",
+                        strerror(-rc));
+            return rc;
+        }
         return 0;
 #else
         return -ENOTSUP;
@@ -133,11 +143,18 @@ int klee_interceptor_install_child(KleeInterceptor *interceptor)
 int klee_interceptor_setup_parent(KleeInterceptor *interceptor, pid_t child_pid)
 {
     if (interceptor->backend == INTERCEPT_SECCOMP_UNOTIFY) {
-        /* The listener fd was obtained in install_child, but it's in the child
-         * process. We need to receive it via SCM_RIGHTS or pidfd_getfd.
-         * For simplicity, we use the listener_fd directly since it was set
-         * before the fork. */
-        interceptor->seccomp.notif_fd = interceptor->seccomp.listener_fd;
+        (void)child_pid;
+        /* Receive the listener FD from the child via SCM_RIGHTS.
+         * The child created the seccomp filter and sent the listener FD
+         * over the setup socketpair in install_child(). */
+        int fd = klee_seccomp_notif_recv_fd(interceptor);
+        if (fd < 0) {
+            KLEE_ERROR("failed to receive seccomp listener fd from child: %s",
+                        strerror(-fd));
+            return fd;
+        }
+        interceptor->seccomp.notif_fd = fd;
+        KLEE_INFO("received seccomp listener fd=%d from child", fd);
         return 0;
     } else {
         /* ptrace: wait for child's SIGSTOP, set options (including

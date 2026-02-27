@@ -22,6 +22,8 @@
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <signal.h>
+#include <sys/syscall.h>
 #include <linux/seccomp.h>
 #include <linux/openat2.h>
 #include <sys/ioctl.h>
@@ -215,12 +217,17 @@ static int translate_path_arg_ex(KleeProcess *proc, KleeInterceptor *ic,
 
     proc->path_modified = true;
 
-    /* Write translated path to tracee via stack scratch area.
-     * We must NOT write to the original buffer because the translated
-     * path may be longer (e.g. symlink resolution: /lib/... → /usr/lib/...),
-     * which would overflow the buffer and corrupt adjacent heap memory.
-     * Instead, write to a scratch area below the tracee's stack pointer
-     * and update the syscall argument register to point there. */
+    /* Write translated path to tracee memory.
+     *
+     * For ptrace: write to a scratch area below the stack and update the
+     * syscall argument register to point there.  We must NOT write to the
+     * original buffer because the translated path may be longer.
+     *
+     * For seccomp_unotify: write the translated path in-place to the
+     * original buffer address.  We cannot modify registers with unotify,
+     * so the kernel will read the path from the address already in the
+     * register.  The tracee is stopped during the notification so the
+     * overwrite is safe.  If the translated path is too long we skip. */
     if (ic->backend == INTERCEPT_PTRACE) {
         /* Save original arg value for exit-time restore */
         proc->saved_args[arg_idx] = ev->args[arg_idx];
@@ -245,6 +252,16 @@ static int translate_path_arg_ex(KleeProcess *proc, KleeInterceptor *ic,
 
         /* Track which arg was modified for exit-time restore */
         proc->path_arg_idx[proc->path_arg_count++] = arg_idx;
+    } else if (ic->backend == INTERCEPT_SECCOMP_UNOTIFY) {
+        /* Write translated path in-place at the original buffer address.
+         * The tracee's register still points here and we can't change it,
+         * so the kernel will pick up our overwritten string on CONTINUE. */
+        rc = klee_write_string(ic, ev->pid, path_addr, proc->translated_path);
+        if (rc < 0) {
+            KLEE_DEBUG("unotify: failed to write translated path in-place: %d", rc);
+            proc->path_modified = false;
+            return 0;
+        }
     }
 
     KLEE_TRACE("translated: %s -> %s", proc->saved_path, proc->translated_path);
@@ -362,7 +379,8 @@ int klee_enter_openat2(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 
     proc->path_modified = true;
 
-    if (ic->backend == INTERCEPT_PTRACE) {
+    /* Write translated path to tracee (both backends) */
+    if (ic->backend == INTERCEPT_PTRACE || ic->backend == INTERCEPT_SECCOMP_UNOTIFY) {
         rc = klee_write_string(ic, ev->pid, path_addr, proc->translated_path);
         if (rc < 0) {
             proc->path_modified = false;
@@ -817,8 +835,7 @@ int klee_enter_execve(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
      * the mount table, and overwrite the scratch area that
      * translate_path_arg already allocated. */
     if (proc->vexe[0] && proc->sandbox && proc->sandbox->mount_table &&
-        is_proc_exe_path(proc->saved_path) && proc->path_modified &&
-        ic->backend == INTERCEPT_PTRACE) {
+        is_proc_exe_path(proc->saved_path) && proc->path_modified) {
 
         KleeResolveCtx ctx = {
             .mount_table = proc->sandbox->mount_table,
@@ -836,6 +853,8 @@ int klee_enter_execve(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
             snprintf(proc->saved_path, PATH_MAX, "%s", proc->vexe);
             snprintf(proc->resolved_guest, PATH_MAX, "%s", proc->vexe);
             snprintf(proc->translated_path, PATH_MAX, "%s", host_path);
+            /* For ptrace: path was written to scratch area, overwrite it.
+             * For unotify: path was written in-place, overwrite it. */
             klee_write_string(ic, ev->pid,
                               (void *)(uintptr_t)ev->args[0], host_path);
         }
@@ -1029,7 +1048,17 @@ int klee_enter_mknodat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 
 int klee_enter_chdir(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    return translate_path_arg(proc, ic, ev, 0, -1);
+    int rc = translate_path_arg(proc, ic, ev, 0, -1);
+    if (rc < 0) return rc;
+
+    /* For unotify: optimistically update vcwd at enter time since we
+     * won't see the exit event.  If the chdir fails, vcwd will be
+     * slightly out of sync, but subsequent path translations still work
+     * because the mount table handles the real path mapping. */
+    if (ic->backend == INTERCEPT_SECCOMP_UNOTIFY && proc->resolved_guest[0])
+        snprintf(proc->vcwd, PATH_MAX, "%s", proc->resolved_guest);
+
+    return 0;
 }
 
 int klee_enter_chroot(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
@@ -1059,6 +1088,111 @@ int klee_enter_close(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     int fd = (int)ev->args[0];
     klee_fd_table_remove(proc->fd_table, fd);
     return 0; /* Let it proceed */
+}
+
+/* ==================== unotify Enter-Time Handlers ====================
+ *
+ * These handlers implement enter-time responses for syscalls that ptrace
+ * handles at exit time (by modifying return values).  Since seccomp_unotify
+ * only intercepts at enter time, we must return the virtual values directly
+ * without executing the real syscall.
+ *
+ * Convention: returning > 0 from an enter handler means "handled, use
+ * ev->retval as the response".  The event loop calls respond_value()
+ * instead of CONTINUE for these cases.
+ */
+
+int klee_enter_getpid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    if (ic->backend != INTERCEPT_SECCOMP_UNOTIFY)
+        return 0; /* ptrace: handled at exit */
+    if (!proc->sandbox || !proc->sandbox->unshare_pid)
+        return 0;
+    ev->retval = proc->virtual_pid;
+    return 1;
+}
+
+int klee_enter_getppid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    if (ic->backend != INTERCEPT_SECCOMP_UNOTIFY)
+        return 0;
+    if (!proc->sandbox || !proc->sandbox->unshare_pid)
+        return 0;
+    ev->retval = proc->virtual_ppid;
+    return 1;
+}
+
+int klee_enter_gettid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    if (ic->backend != INTERCEPT_SECCOMP_UNOTIFY)
+        return 0;
+    if (!proc->sandbox || !proc->sandbox->unshare_pid)
+        return 0;
+    /* For now, return virtual_pid (no thread-level mapping yet) */
+    ev->retval = proc->virtual_pid;
+    return 1;
+}
+
+int klee_enter_getcwd(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    if (ic->backend != INTERCEPT_SECCOMP_UNOTIFY)
+        return 0;
+    if (!proc->vcwd[0])
+        return 0;
+
+    void *buf = (void *)(uintptr_t)ev->args[0];
+    size_t buf_len = (size_t)ev->args[1];
+    size_t vcwd_len = strlen(proc->vcwd) + 1;
+
+    if (!buf || vcwd_len > buf_len)
+        return 0; /* Let kernel handle (will return ERANGE) */
+
+    int rc = ic->write_mem(ic, ev->pid, buf, proc->vcwd, vcwd_len);
+    if (rc < 0)
+        return 0;
+
+    ev->retval = (long)vcwd_len;
+    return 1;
+}
+
+int klee_enter_getuid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    if (ic->backend != INTERCEPT_SECCOMP_UNOTIFY)
+        return 0;
+    if (!proc->sandbox || !proc->sandbox->unshare_user || !proc->id_state)
+        return 0;
+    ev->retval = (long)proc->id_state->ruid;
+    return 1;
+}
+
+int klee_enter_geteuid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    if (ic->backend != INTERCEPT_SECCOMP_UNOTIFY)
+        return 0;
+    if (!proc->sandbox || !proc->sandbox->unshare_user || !proc->id_state)
+        return 0;
+    ev->retval = (long)proc->id_state->euid;
+    return 1;
+}
+
+int klee_enter_getgid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    if (ic->backend != INTERCEPT_SECCOMP_UNOTIFY)
+        return 0;
+    if (!proc->sandbox || !proc->sandbox->unshare_user || !proc->id_state)
+        return 0;
+    ev->retval = (long)proc->id_state->rgid;
+    return 1;
+}
+
+int klee_enter_getegid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    if (ic->backend != INTERCEPT_SECCOMP_UNOTIFY)
+        return 0;
+    if (!proc->sandbox || !proc->sandbox->unshare_user || !proc->id_state)
+        return 0;
+    ev->retval = (long)proc->id_state->egid;
+    return 1;
 }
 
 /* ==================== PID Namespace Enter Handlers ==================== */
@@ -1092,15 +1226,19 @@ int klee_enter_kill(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 
     pid_t real = translate_pid(proc->sandbox->pid_map, vpid);
     if (real <= 0) {
-        /* PID not in the map — likely an exited process or a real PID
-         * cached by glibc.  Pass through and let the kernel decide
-         * (returns ESRCH for truly dead processes). */
         KLEE_TRACE("kill: pid=%d target vpid=%d not in map, passthrough",
                     proc->real_pid, vpid);
         return 0;
     }
 
     if (real != vpid) {
+        if (ic->backend == INTERCEPT_SECCOMP_UNOTIFY) {
+            /* Can't modify registers — perform kill in supervisor */
+            int sig = (int)ev->args[1];
+            int ret = kill(real, sig);
+            ev->retval = (ret == 0) ? 0 : -errno;
+            return 1; /* handled */
+        }
         klee_regs_fetch(ic, proc);
         klee_regs_set_arg(proc, 0, (uint64_t)real);
         klee_regs_push(ic, proc);
@@ -1120,15 +1258,18 @@ int klee_enter_tgkill(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     pid_t real_tid = translate_pid(proc->sandbox->pid_map, vtid);
 
     if (real_tgid <= 0 || real_tid <= 0) {
-        /* PID/TID not in the map.  Pass through to kernel rather than
-         * denying — handles glibc-cached real TIDs (raise/abort pattern)
-         * and already-exited threads (crashpad cleanup). */
         KLEE_TRACE("tgkill: pid=%d tgid=%d tid=%d not fully mapped, passthrough",
                     proc->real_pid, vtgid, vtid);
         return 0;
     }
 
     if (real_tgid != vtgid || real_tid != vtid) {
+        if (ic->backend == INTERCEPT_SECCOMP_UNOTIFY) {
+            int sig = (int)ev->args[2];
+            int ret = (int)syscall(SYS_tgkill, real_tgid, real_tid, sig);
+            ev->retval = (ret == 0) ? 0 : -errno;
+            return 1; /* handled */
+        }
         klee_regs_fetch(ic, proc);
         klee_regs_set_arg(proc, 0, (uint64_t)real_tgid);
         klee_regs_set_arg(proc, 1, (uint64_t)real_tid);
@@ -1151,6 +1292,12 @@ int klee_enter_tkill(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     }
 
     if (real != vpid) {
+        if (ic->backend == INTERCEPT_SECCOMP_UNOTIFY) {
+            int sig = (int)ev->args[1];
+            int ret = (int)syscall(SYS_tkill, real, sig);
+            ev->retval = (ret == 0) ? 0 : -errno;
+            return 1; /* handled */
+        }
         klee_regs_fetch(ic, proc);
         klee_regs_set_arg(proc, 0, (uint64_t)real);
         klee_regs_push(ic, proc);
@@ -1167,32 +1314,30 @@ int klee_enter_setpgid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 
     pid_t vpid = (pid_t)ev->args[0];
     pid_t vpgid = (pid_t)ev->args[1];
-    bool modified = false;
 
-    if (vpid != 0) {
-        pid_t real = translate_pid(proc->sandbox->pid_map, vpid);
-        if (real <= 0)
-            return 0;
-        if (real != vpid) {
-            if (!modified) klee_regs_fetch(ic, proc);
-            klee_regs_set_arg(proc, 0, (uint64_t)real);
-            modified = true;
+    pid_t real_pid = (vpid != 0) ? translate_pid(proc->sandbox->pid_map, vpid) : 0;
+    pid_t real_pgid = (vpgid != 0) ? translate_pid(proc->sandbox->pid_map, vpgid) : 0;
+
+    if ((vpid != 0 && real_pid <= 0) || (vpgid != 0 && real_pgid <= 0))
+        return 0;
+
+    bool need_translate = (vpid != 0 && real_pid != vpid) ||
+                          (vpgid != 0 && real_pgid != vpgid);
+    if (need_translate) {
+        if (ic->backend == INTERCEPT_SECCOMP_UNOTIFY) {
+            pid_t p = real_pid ? real_pid : vpid;
+            pid_t g = real_pgid ? real_pgid : vpgid;
+            int ret = (int)syscall(SYS_setpgid, p, g);
+            ev->retval = (ret == 0) ? 0 : -errno;
+            return 1;
         }
-    }
-
-    if (vpgid != 0) {
-        pid_t real = translate_pid(proc->sandbox->pid_map, vpgid);
-        if (real <= 0)
-            return 0;
-        if (real != vpgid) {
-            if (!modified) klee_regs_fetch(ic, proc);
-            klee_regs_set_arg(proc, 1, (uint64_t)real);
-            modified = true;
-        }
-    }
-
-    if (modified)
+        klee_regs_fetch(ic, proc);
+        if (vpid != 0 && real_pid != vpid)
+            klee_regs_set_arg(proc, 0, (uint64_t)real_pid);
+        if (vpgid != 0 && real_pgid != vpgid)
+            klee_regs_set_arg(proc, 1, (uint64_t)real_pgid);
         klee_regs_push(ic, proc);
+    }
     return 0;
 }
 
@@ -1210,6 +1355,17 @@ int klee_enter_getpgid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
         return 0;
 
     if (real != vpid) {
+        if (ic->backend == INTERCEPT_SECCOMP_UNOTIFY) {
+            pid_t pgid = getpgid(real);
+            if (pgid < 0) {
+                ev->retval = -errno;
+            } else {
+                /* Translate returned pgid back to virtual */
+                pid_t vpgid_ret = klee_pid_map_r2v(proc->sandbox->pid_map, pgid);
+                ev->retval = vpgid_ret > 0 ? vpgid_ret : pgid;
+            }
+            return 1;
+        }
         klee_regs_fetch(ic, proc);
         klee_regs_set_arg(proc, 0, (uint64_t)real);
         klee_regs_push(ic, proc);
@@ -1231,6 +1387,16 @@ int klee_enter_getsid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
         return 0;
 
     if (real != vpid) {
+        if (ic->backend == INTERCEPT_SECCOMP_UNOTIFY) {
+            pid_t sid = getsid(real);
+            if (sid < 0) {
+                ev->retval = -errno;
+            } else {
+                pid_t vsid = klee_pid_map_r2v(proc->sandbox->pid_map, sid);
+                ev->retval = vsid > 0 ? vsid : sid;
+            }
+            return 1;
+        }
         klee_regs_fetch(ic, proc);
         klee_regs_set_arg(proc, 0, (uint64_t)real);
         klee_regs_push(ic, proc);
@@ -1481,20 +1647,27 @@ int klee_enter_prctl(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 
     case PR_SET_DUMPABLE:
         /* Block attempts to clear dumpable status.  Klee reads/writes
-         * tracee memory via process_vm_readv/writev and PTRACE_PEEKDATA;
-         * a non-dumpable process returns EIO on these calls, breaking
-         * all path translation.  Programs like gpg-agent set dumpable=0
-         * to protect cryptographic material, but klee already confines
-         * them inside its sandbox.
-         *
-         * Rewrite arg from 0 (disable) to 1 (enable) so the kernel
-         * executes a harmless no-op and returns success to the tracee. */
-        if ((int)ev->args[1] == 0 && ic->backend == INTERCEPT_PTRACE) {
-            KLEE_DEBUG("prctl(PR_SET_DUMPABLE, 0) -> 1 for pid=%d",
-                       proc->real_pid);
-            klee_regs_fetch(ic, proc);
-            klee_regs_set_arg(proc, 1, 1);
-            klee_regs_push(ic, proc);
+         * tracee memory via process_vm_readv/writev, PTRACE_PEEKDATA,
+         * and /proc/pid/mem; a non-dumpable process returns EIO on
+         * these calls, breaking all path translation.  Programs like
+         * gpg-agent set dumpable=0 to protect cryptographic material,
+         * but klee already confines them inside its sandbox. */
+        if ((int)ev->args[1] == 0) {
+            if (ic->backend == INTERCEPT_PTRACE) {
+                /* Rewrite arg from 0 to 1 so the kernel no-ops */
+                KLEE_DEBUG("prctl(PR_SET_DUMPABLE, 0) -> 1 for pid=%d",
+                           proc->real_pid);
+                klee_regs_fetch(ic, proc);
+                klee_regs_set_arg(proc, 1, 1);
+                klee_regs_push(ic, proc);
+            } else if (ic->backend == INTERCEPT_SECCOMP_UNOTIFY) {
+                /* Can't modify registers — skip the syscall entirely
+                 * and return 0 (success) to the tracee. */
+                KLEE_DEBUG("prctl(PR_SET_DUMPABLE, 0) blocked for pid=%d",
+                           proc->real_pid);
+                ev->retval = 0;
+                return 1; /* handled: respond with retval */
+            }
         }
         break;
 

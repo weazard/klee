@@ -50,6 +50,16 @@ int klee_enter_mount(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_umount(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_close(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 
+/* unotify enter-time handlers (for exit-only syscalls under seccomp_unotify) */
+int klee_enter_getpid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_getppid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_gettid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_getcwd(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_getuid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_geteuid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_getgid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_getegid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+
 /* PID namespace */
 int klee_enter_kill(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_tgkill(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
