@@ -1536,7 +1536,9 @@ int klee_enter_seccomp(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
             struct sock_fprog fprog;
             int rc = klee_read_mem(ic, ev->pid, &fprog, fprog_addr, sizeof(fprog));
             if (rc == 0 && fprog.filter && fprog.len > 0) {
-                klee_compat_handle_seccomp_filter(ic, ev->pid, &fprog);
+                klee_compat_handle_seccomp_filter(ic, ev->pid, &fprog,
+                                                   fprog_addr,
+                                                   proc->regs[REG_CURRENT].rsp);
             }
         }
         return 0;
