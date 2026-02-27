@@ -307,6 +307,14 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
 
     case KLEE_EVENT_EXEC:
         klee_process_exec(proc, proc->vexe);
+        /* After successful exec the old process image is gone — there will
+         * be no syscall-exit-stop for the execve.  Reset state so the next
+         * intercepted syscall from the new program isn't misclassified as
+         * a syscall exit for the old execve. */
+        proc->state = PROC_STATE_RUNNING;
+        proc->path_modified = false;
+        proc->path_arg_count = 0;
+        proc->seccomp_entered = false;
         if (el->interceptor->backend == INTERCEPT_PTRACE)
             el->interceptor->continue_running(el->interceptor, event->pid, 0);
         break;
