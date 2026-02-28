@@ -15,7 +15,6 @@
 #include "ns/ipc_ns.h"
 #include "compat/seccomp_filter.h"
 #include "compat/nested.h"
-#include "compat/zypak_compat.h"
 #include "util/log.h"
 
 #include <errno.h>
@@ -1189,15 +1188,6 @@ int klee_enter_execve(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     if (klee_nested_is_bwrap(proc->saved_path)) {
         if (klee_nested_handle_exec(proc, ic, ev) == 0)
             return 0; /* handler sets vexe and manipulates registers */
-        /* Fall through on failure — let original exec proceed */
-    }
-
-    /* Check for flatpak-spawn (Zypak mimic strategy) — intercept and
-     * run target command directly inside KLEE's process tree */
-    if (proc->sandbox && proc->sandbox->zypak_detected &&
-        klee_zypak_is_flatpak_spawn(proc->saved_path)) {
-        if (klee_zypak_handle_flatpak_spawn(proc, ic, ev) == 0)
-            return 0;
         /* Fall through on failure — let original exec proceed */
     }
 

@@ -127,6 +127,7 @@ int klee_exit_statx(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 
     ic->write_mem(ic, ev->pid, (char *)statx_addr + uid_off, &uid_val, sizeof(uid_val));
     ic->write_mem(ic, ev->pid, (char *)statx_addr + gid_off, &gid_val, sizeof(gid_val));
+
     return 0;
 }
 
