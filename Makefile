@@ -48,8 +48,7 @@ PROCESS_SRCS   = src/process/process.c src/process/event.c \
 SYSCALL_SRCS   = src/syscall/dispatch.c src/syscall/enter.c \
                  src/syscall/exit.c src/syscall/handlers.c
 COMPAT_SRCS    = src/compat/seccomp_filter.c src/compat/io_uring_block.c \
-                 src/compat/edge_cases.c src/compat/nested.c \
-                 src/compat/zypak_compat.c
+                 src/compat/edge_cases.c src/compat/nested.c
 STEAM_SRCS     = src/steam/steam_compat.c
 
 # fuse_mountinfo and fuse_pidns are always compiled (no FUSE dependency)
