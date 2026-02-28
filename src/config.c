@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <limits.h>
 
 void klee_config_init(KleeConfig *cfg)
 {
@@ -98,7 +99,15 @@ KleeMountOp *klee_config_add_mount(KleeConfig *cfg, MountType type,
         return NULL;
 
     op->type = type;
-    op->source = source ? strdup(source) : NULL;
+    if (source) {
+        char resolved[PATH_MAX];
+        if (realpath(source, resolved))
+            op->source = strdup(resolved);
+        else
+            op->source = strdup(source); /* keep original on failure */
+    } else {
+        op->source = NULL;
+    }
     op->dest = dest ? strdup(dest) : NULL;
     /* Per-type default permissions matching bwrap:
      * --file defaults to 0666, --bind-data/--ro-bind-data to 0600,

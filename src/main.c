@@ -21,7 +21,6 @@
 #include "ns/proc_synth.h"
 #include "fuse/fuse_proc.h"
 #include "steam/steam_compat.h"
-#include "compat/zypak_compat.h"
 #include "util/log.h"
 
 #include <stdlib.h>
@@ -251,6 +250,10 @@ int main(int argc, char **argv)
         KLEE_INFO("child command: %s", cmdbuf);
     }
 
+    /* Log namespace and ID config */
+    KLEE_DEBUG("config: unshare_user=%d uid_set=%d uid=%d gid_set=%d gid=%d",
+               cfg.unshare_user, cfg.uid_set, cfg.uid, cfg.gid_set, cfg.gid);
+
     /* Log special FDs */
     if (cfg.info_fd >= 0 || cfg.sync_fd >= 0 || cfg.block_fd >= 0) {
         KLEE_DEBUG("special fds: info_fd=%d sync_fd=%d block_fd=%d",
@@ -331,19 +334,19 @@ int main(int argc, char **argv)
         }
     }
 
+    /* Pre-apply --setenv entries to the parent process so that detection
+     * functions (steam) and syscall handlers (which run in the parent)
+     * can see bwrap's --setenv arguments via getenv().
+     * Only apply SET operations — never CLEAR/UNSET, which would destroy
+     * env vars the parent needs (PATH, HOME, etc.).
+     * The child also applies these in setup_environment() (idempotent). */
+    for (const KleeEnvOp *op = cfg.env_ops; op; op = op->next) {
+        if (op->type == ENV_OP_SET)
+            setenv(op->key, op->value, 1);
+    }
+
     /* Auto-expose Steam paths */
     klee_steam_auto_expose(mount_table);
-
-    /* Detect and configure Zypak (Flatpak Chrome sandbox bridge) */
-    if (klee_zypak_detect()) {
-        KLEE_INFO("Zypak detected in environment");
-        sandbox->zypak_detected = true;
-        klee_zypak_auto_expose(mount_table);
-        /* Force mimic strategy so Zypak uses flatpak-spawn (which KLEE
-         * intercepts) instead of the spawn strategy (which escapes via
-         * D-Bus portal).  0 = don't overwrite user's explicit choice. */
-        setenv("ZYPAK_ZYGOTE_STRATEGY_SPAWN", "0", 0);
-    }
 
     /* Create host-side mirrors for /run/host mounts so the kernel
      * can follow host-side symlinks that reference guest paths
@@ -506,6 +509,7 @@ int main(int argc, char **argv)
         waitpid(child_pid, NULL, 0);
         goto cleanup;
     }
+    event_loop->initial_child_pid = child_pid;
 
     int exit_status = klee_event_loop_run(event_loop);
 

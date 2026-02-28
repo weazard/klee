@@ -56,7 +56,6 @@ typedef struct klee_sandbox {
     bool unshare_uts;
     bool unshare_net;
     bool unshare_cgroup;
-    bool zypak_detected;       /* true when Zypak environment is active */
     int ref_count;
 } KleeSandbox;
 

@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/epoll.h>
+#include <sys/ptrace.h>
 #include <sys/signalfd.h>
 #include <sys/wait.h>
 
@@ -101,6 +102,17 @@ static void handle_process_exit(KleeEventLoop *el, KleeProcess *proc,
         el->sandbox->pid_map &&
         klee_pid_map_is_init(el->sandbox->pid_map, real_pid)) {
         KLEE_INFO("PID 1 exited, terminating namespace");
+        el->exit_status = exit_status;
+        el->running = false;
+    }
+
+    /* If this is the initial child (the command klee launched), stop the
+     * event loop.  Daemon children like gpg-agent may still be alive —
+     * they will be cleaned up by SIGKILL below.  This matches real
+     * bwrap behavior: bwrap exits when its direct child exits. */
+    if (real_pid == el->initial_child_pid) {
+        KLEE_INFO("initial child exited (pid=%d status=%d), stopping",
+                   real_pid, exit_status);
         el->exit_status = exit_status;
         el->running = false;
     }
@@ -307,6 +319,14 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
 
     case KLEE_EVENT_EXEC:
         klee_process_exec(proc, proc->vexe);
+        /* After successful exec the old process image is gone — there will
+         * be no syscall-exit-stop for the execve.  Reset state so the next
+         * intercepted syscall from the new program isn't misclassified as
+         * a syscall exit for the old execve. */
+        proc->state = PROC_STATE_RUNNING;
+        proc->path_modified = false;
+        proc->path_arg_count = 0;
+        proc->seccomp_entered = false;
         if (el->interceptor->backend == INTERCEPT_PTRACE)
             el->interceptor->continue_running(el->interceptor, event->pid, 0);
         break;
@@ -420,6 +440,28 @@ int klee_event_loop_run(KleeEventLoop *el)
                 break;
             }
         }
+    }
+
+    /* Kill any remaining traced processes (e.g. daemon children like
+     * gpg-agent that outlived the initial child).  With ptrace, these
+     * processes are still stopped — detach and kill them so they don't
+     * linger as zombies. */
+    if (el->proctable->count > 0) {
+        KLEE_DEBUG("killing %zu remaining processes", el->proctable->count);
+        for (size_t i = 0; i < el->proctable->by_pid->capacity; i++) {
+            KleeHTEntry *ent = &el->proctable->by_pid->entries[i];
+            if (!ent->occupied || ent->deleted)
+                continue;
+            pid_t pid = (pid_t)ent->key;
+            KLEE_DEBUG("killing leftover pid=%d", pid);
+            /* Detach from the ptraced process and deliver SIGKILL.
+             * Without detaching first, the process stays ptrace-stopped
+             * and waitpid returns WIFSTOPPED instead of WIFEXITED. */
+            ptrace(PTRACE_DETACH, pid, 0, SIGKILL);
+        }
+        /* Reap all killed children */
+        while (waitpid(-1, NULL, WNOHANG) > 0)
+            ;
     }
 
     KLEE_INFO("event loop exited with status %d", el->exit_status);
