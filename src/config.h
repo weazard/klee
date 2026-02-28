@@ -161,6 +161,9 @@ typedef struct klee_config {
     char *exec_label;
     char *file_label;
 
+    /* Compat flags */
+    bool zypak_detected;
+
     /* Diagnostic */
     bool level_prefix;
 } KleeConfig;

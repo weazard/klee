@@ -100,11 +100,19 @@ KleeMountOp *klee_config_add_mount(KleeConfig *cfg, MountType type,
 
     op->type = type;
     if (source) {
-        char resolved[PATH_MAX];
-        if (realpath(source, resolved))
-            op->source = strdup(resolved);
-        else
-            op->source = strdup(source); /* keep original on failure */
+        /* Symlink targets are container-internal paths, not host paths.
+         * realpath() would resolve them on the host filesystem, which
+         * corrupts paths like /run/host/monitor/resolv.conf that only
+         * exist inside the container's mount namespace. */
+        if (type == MOUNT_SYMLINK) {
+            op->source = strdup(source);
+        } else {
+            char resolved[PATH_MAX];
+            if (realpath(source, resolved))
+                op->source = strdup(resolved);
+            else
+                op->source = strdup(source); /* keep original on failure */
+        }
     } else {
         op->source = NULL;
     }

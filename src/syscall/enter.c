@@ -15,6 +15,7 @@
 #include "ns/ipc_ns.h"
 #include "compat/seccomp_filter.h"
 #include "compat/nested.h"
+#include "compat/zypak_compat.h"
 #include "util/log.h"
 
 #include <errno.h>
@@ -845,6 +846,97 @@ int klee_enter_execve(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
         if (klee_nested_handle_exec(proc, ic, ev) == 0)
             return 0; /* handler sets vexe and manipulates registers */
         /* Fall through on failure — let original exec proceed */
+    }
+
+    /* Check for flatpak-spawn (Zypak mimic strategy) — intercept and
+     * run target command directly inside klee's process tree */
+    if (proc->sandbox && proc->sandbox->zypak_detected &&
+        klee_zypak_is_flatpak_spawn(proc->saved_path)) {
+        if (klee_zypak_handle_flatpak_spawn(proc, ic, ev) == 0)
+            return 0;
+        /* Fall through on failure — let original exec proceed */
+    }
+
+    /* Check for chrome-sandbox exec (Chrome SUID sandbox helper).
+     * Chrome execs chrome-sandbox via raw syscall, bypassing Zypak's
+     * LD_PRELOAD exec overrides that set up FD 235 IPC.  Without that
+     * IPC, zypak-sandbox exits immediately ("Host is gone").
+     *
+     * Rewrite the execve to run the target binary (argv[1]) directly,
+     * skipping the sandbox helper.  Also nullify CHROME_DEVEL_SANDBOX
+     * in envp so child processes don't retry the SUID sandbox.
+     *
+     * Falls through to shebang/interp handling so the target binary's
+     * PT_INTERP gets correctly translated. */
+    if (proc->sandbox && proc->sandbox->zypak_detected &&
+        klee_zypak_is_chrome_sandbox(proc->saved_path) &&
+        ic->backend == INTERCEPT_PTRACE) {
+        uint64_t argv_addr = ev->args[1];
+        uint64_t argv1_ptr = 0;
+        int csrc = klee_read_mem(ic, ev->pid, &argv1_ptr,
+                            (const void *)(uintptr_t)(argv_addr + 8),
+                            sizeof(argv1_ptr));
+        if (csrc == 0 && argv1_ptr != 0) {
+            char target_guest[PATH_MAX];
+            csrc = klee_read_string(ic, ev->pid, target_guest,
+                                    sizeof(target_guest),
+                                    (const void *)(uintptr_t)argv1_ptr);
+            if (csrc >= 0 && target_guest[0]) {
+                /* Translate target through mount table */
+                char target_host[PATH_MAX];
+                snprintf(target_host, PATH_MAX, "%s", target_guest);
+                if (proc->sandbox->mount_table) {
+                    KleeResolveCtx ctx = {
+                        .mount_table = proc->sandbox->mount_table,
+                        .fd_table = proc->fd_table,
+                        .vcwd = proc->vcwd,
+                        .vroot = klee_mount_table_get_root(
+                                     proc->sandbox->mount_table),
+                        .flags = 0,
+                    };
+                    if (klee_path_guest_to_host(&ctx, target_guest,
+                                                target_host, AT_FDCWD) < 0)
+                        snprintf(target_host, PATH_MAX, "%s", target_guest);
+                }
+
+                KLEE_INFO("zypak: chrome-sandbox bypass: %s -> %s",
+                          target_guest, target_host);
+
+                /* Overwrite exec path with target host path */
+                klee_regs_fetch(ic, proc);
+                if (proc->path_modified) {
+                    uint64_t arg0_scratch = klee_regs_get_arg(proc, 0);
+                    klee_write_string(ic, ev->pid,
+                                      (void *)(uintptr_t)arg0_scratch,
+                                      target_host);
+                } else {
+                    uint64_t rsp = klee_regs_get_sp(proc);
+                    uint64_t scratch = rsp - 128 - PATH_MAX;
+                    klee_write_string(ic, ev->pid,
+                                      (void *)(uintptr_t)scratch,
+                                      target_host);
+                    klee_regs_set_arg(proc, 0, scratch);
+                    proc->saved_args[0] = ev->args[0];
+                    proc->path_arg_idx[proc->path_arg_count++] = 0;
+                    proc->path_modified = true;
+                }
+
+                /* Shift argv to skip chrome-sandbox entry:
+                 * [chrome-sandbox, target, args...] → [target, args...] */
+                klee_regs_set_arg(proc, 1, argv_addr + 8);
+                klee_regs_push(ic, proc);
+                ev->args[1] = argv_addr + 8;
+
+                /* Update proc paths for downstream handlers */
+                snprintf(proc->saved_path, PATH_MAX, "%s", target_guest);
+                snprintf(proc->resolved_guest, PATH_MAX, "%s", target_guest);
+                snprintf(proc->translated_path, PATH_MAX, "%s", target_host);
+
+                /* Nullify CHROME_DEVEL_SANDBOX in tracee envp */
+                klee_zypak_nullify_sandbox_env(ic, ev->pid, ev->args[2]);
+            }
+        }
+        /* Fall through to shebang/interp handling for the target binary */
     }
 
     /* Handle shebang scripts and ELF PT_INTERP: detect interpreters that

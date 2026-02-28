@@ -10,6 +10,7 @@
 #include "ns/pid_ns.h"
 #include "ns/user_ns.h"
 #include "ns/uts_ns.h"
+#include "compat/zypak_compat.h"
 #include "util/log.h"
 
 #include <ctype.h>
@@ -86,6 +87,17 @@ int klee_exit_stat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
         st.st_uid = proc->id_state->euid;
     if (st.st_gid == real_gid)
         st.st_gid = proc->id_state->egid;
+
+    /* Fake SUID ownership for chrome-sandbox when zypak is active.
+     * Chrome stat()s the sandbox helper before exec and requires
+     * root ownership + setuid bit. */
+    if (proc->sandbox->zypak_detected &&
+        klee_zypak_is_chrome_sandbox(proc->saved_path)) {
+        st.st_uid = 0;
+        st.st_mode |= S_ISUID | S_IXUSR | S_IXGRP | S_IXOTH;
+        KLEE_DEBUG("stat: faked SUID for chrome-sandbox: %s",
+                   proc->saved_path);
+    }
 
     ic->write_mem(ic, ev->pid, stat_addr, &st, sizeof(st));
     return 0;

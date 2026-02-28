@@ -21,6 +21,7 @@
 #include "ns/proc_synth.h"
 #include "fuse/fuse_proc.h"
 #include "steam/steam_compat.h"
+#include "compat/zypak_compat.h"
 #include "util/log.h"
 
 #include <stdlib.h>
@@ -141,6 +142,15 @@ static void child_process(KleeInterceptor *interceptor, const KleeConfig *cfg,
 
     /* Setup environment */
     setup_environment(cfg);
+
+    /* Re-apply forced Zypak overrides.  setup_environment() processes
+     * bwrap --setenv ops (and possibly --clearenv) which may restore
+     * values klee needs to force.  Use the cfg flag since env vars set
+     * in the parent may have been wiped by --clearenv. */
+    if (cfg->zypak_detected) {
+        setenv("CHROME_DEVEL_SANDBOX", "", 1);
+        setenv("ZYPAK_ZYGOTE_STRATEGY_SPAWN", "0", 1);
+    }
 
     /* New session if requested */
     if (cfg->new_session) {
@@ -348,6 +358,41 @@ int main(int argc, char **argv)
     /* Auto-expose Steam paths */
     klee_steam_auto_expose(mount_table);
 
+    /* Detect and configure Zypak (Flatpak Chrome sandbox bridge).
+     * Check both env vars (from bwrap --setenv) and mount table
+     * (zypak-wrapper.sh sets ZYPAK_BIN inside the sandbox). */
+    if (klee_zypak_detect() || klee_zypak_detect_from_mounts(mount_table)) {
+        KLEE_INFO("Zypak detected in environment");
+        sandbox->zypak_detected = true;
+        cfg.zypak_detected = true;
+        klee_zypak_auto_expose(mount_table);
+        /* Ensure ZYPAK_BIN is set in the parent so syscall handlers
+         * can resolve Zypak paths.  In mount-table detection mode,
+         * ZYPAK_BIN won't be set yet (zypak-wrapper.sh sets it inside
+         * the sandbox). */
+        if (!getenv("ZYPAK_BIN"))
+            setenv("ZYPAK_BIN", "/app/bin", 0);
+        /* Force mimic strategy so Zypak uses flatpak-spawn (which klee
+         * intercepts) instead of the spawn strategy (which escapes via
+         * D-Bus portal). */
+        setenv("ZYPAK_ZYGOTE_STRATEGY_SPAWN", "0", 1);
+        /* Disable Chrome's SUID sandbox helper.  Chrome execs
+         * chrome-sandbox via raw syscall, but the Flatpak stub just
+         * does exit(1), killing the zygote.  Setting this empty makes
+         * Chrome use its namespace sandbox instead, which works
+         * natively under klee (clone CLONE_NEWUSER as real root). */
+        setenv("CHROME_DEVEL_SANDBOX", "", 1);
+        /* Force user namespace emulation.  Flatpak doesn't pass
+         * --unshare-user to bwrap, but Chrome fatally refuses to run
+         * as root (geteuid()==0).  Enabling unshare_user activates
+         * UID/GID interception so klee virtualizes to non-root. */
+        if (!cfg.unshare_user) {
+            cfg.unshare_user = true;
+            sandbox->unshare_user = true;
+            KLEE_INFO("zypak: forced unshare_user for Chrome compatibility");
+        }
+    }
+
     /* Create host-side mirrors for /run/host mounts so the kernel
      * can follow host-side symlinks that reference guest paths
      * (e.g. pressure-vessel runtime library overlays). */
@@ -451,10 +496,12 @@ int main(int argc, char **argv)
         init_proc->virtual_ppid = 0;
     }
 
-    /* Set initial ID state */
+    /* Set initial ID state.  When Zypak is detected and no explicit
+     * --uid/--gid was given, default to UID/GID 1000 instead of 0.
+     * Chrome fatally refuses to run as root. */
     if (cfg.unshare_user) {
-        uid_t uid = cfg.uid_set ? cfg.uid : 0;
-        gid_t gid = cfg.gid_set ? cfg.gid : 0;
+        uid_t uid = cfg.uid_set ? cfg.uid : (sandbox->zypak_detected ? 1000 : 0);
+        gid_t gid = cfg.gid_set ? cfg.gid : (sandbox->zypak_detected ? 1000 : 0);
         init_proc->id_state = klee_id_state_create(uid, gid);
     }
 
