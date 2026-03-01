@@ -152,8 +152,8 @@
 #define KLEE_SYS_io_uring_enter  SYS_io_uring_enter
 #endif
 
-/* Total number of syscalls we intercept */
-#define KLEE_INTERCEPTED_SYSCALL_COUNT 90
+/* Total number of syscalls we intercept (must be >= actual count in handlers.c) */
+#define KLEE_INTERCEPTED_SYSCALL_COUNT 128
 
 /* Get the list of all syscall numbers to intercept */
 int klee_get_intercepted_syscalls(int *out, size_t max_count);

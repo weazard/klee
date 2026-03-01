@@ -499,6 +499,7 @@ int main(int argc, char **argv)
         waitpid(child_pid, NULL, 0);
         goto cleanup;
     }
+    sandbox->proctable = proctable;
 
     KleeProcess *init_proc = klee_process_create(proctable, child_pid, sandbox);
     if (!init_proc) {

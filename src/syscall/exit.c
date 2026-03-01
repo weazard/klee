@@ -143,19 +143,28 @@ int klee_exit_statx(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     return 0;
 }
 
-/* Check if a saved path is /proc/self/exe or /proc/<pid>/exe */
-static bool is_proc_exe_readlink(const char *path)
+/* Check if a saved path is /proc/self/exe or /proc/<pid>/exe.
+ * If it is, optionally extract the target PID (0 = "self"). */
+static bool is_proc_exe_readlink(const char *path, pid_t *out_pid)
 {
     if (strncmp(path, "/proc/", 6) != 0)
         return false;
     const char *p = path + 6;
-    if (strcmp(p, "self/exe") == 0)
+    if (strcmp(p, "self/exe") == 0) {
+        if (out_pid) *out_pid = 0;
         return true;
+    }
     /* /proc/<pid>/exe */
     if (*p >= '1' && *p <= '9') {
-        while (*p >= '0' && *p <= '9')
+        pid_t pid = 0;
+        while (*p >= '0' && *p <= '9') {
+            pid = pid * 10 + (*p - '0');
             p++;
-        return strcmp(p, "/exe") == 0;
+        }
+        if (strcmp(p, "/exe") == 0) {
+            if (out_pid) *out_pid = pid;
+            return true;
+        }
     }
     return false;
 }
@@ -166,14 +175,35 @@ int klee_exit_readlink(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
         return 0;
 
     /* If this was a /proc/self/exe or /proc/<pid>/exe readlink, rewrite
-     * the result with the virtual exe path (proc->vexe).
+     * the result with the virtual exe path.
      *
      * The exec interpreter handler rewrites execve to invoke ld-linux as
      * the actual binary, so the kernel's /proc/self/exe points to ld-linux
      * instead of the real program.  This breaks programs like Chromium that
-     * use readlink("/proc/self/exe") to find their data directory. */
-    if (proc->vexe[0] && proc->sandbox &&
-        is_proc_exe_readlink(proc->saved_path)) {
+     * use readlink("/proc/self/exe") to find their data directory.
+     *
+     * For /proc/<other_pid>/exe, look up that process's vexe so that
+     * cross-process readlinks (e.g. zypak reading parent's exe) return
+     * the correct binary path rather than the calling process's vexe. */
+    pid_t target_pid = 0;
+    if (proc->sandbox && is_proc_exe_readlink(proc->saved_path, &target_pid)) {
+        const char *vexe = proc->vexe;
+
+        /* If the path names a specific PID that isn't us, look it up */
+        if (target_pid != 0 && target_pid != proc->real_pid &&
+            proc->sandbox->proctable) {
+            KleeProcess *target = klee_process_find(
+                proc->sandbox->proctable, target_pid);
+            if (target && target->vexe[0]) {
+                vexe = target->vexe;
+                KLEE_TRACE("readlink exe: cross-pid %d -> %s",
+                           target_pid, vexe);
+            }
+        }
+
+        if (!vexe[0])
+            return 0;
+
         void *buf_addr;
         size_t bufsiz;
         if (ev->syscall_nr == KLEE_SYS_readlink) {
@@ -184,14 +214,14 @@ int klee_exit_readlink(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
             bufsiz = (size_t)ev->args[3];
         }
 
-        size_t vexe_len = strlen(proc->vexe);
+        size_t vexe_len = strlen(vexe);
         if (vexe_len > bufsiz)
             vexe_len = bufsiz;
 
-        int rc = klee_write_mem(ic, ev->pid, buf_addr, proc->vexe, vexe_len);
+        int rc = klee_write_mem(ic, ev->pid, buf_addr, vexe, vexe_len);
         if (rc == 0) {
             ev->retval = (long)vexe_len;
-            KLEE_TRACE("readlink exe: rewritten to %s", proc->vexe);
+            KLEE_TRACE("readlink exe: rewritten to %s", vexe);
             return 1; /* retval modified */
         }
     }

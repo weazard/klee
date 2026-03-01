@@ -41,6 +41,8 @@ enum {
     REG_SLOTS    = 3,
 };
 
+typedef struct klee_process_table KleeProcessTable;
+
 typedef struct klee_sandbox {
     KleeMountTable *mount_table;
     KleePidMap *pid_map;
@@ -48,6 +50,7 @@ typedef struct klee_sandbox {
     KleeIpcNs *ipc_ns;
     KleeNetNs *net_ns;
     KleeFuseProc *fuse_proc;
+    KleeProcessTable *proctable; /* back-pointer for cross-PID lookups */
     char *proc_snapshot_path;   /* tmpfs /proc snapshot (fallback when no FUSE) */
     char *hostname;
     bool unshare_pid;

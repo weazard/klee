@@ -1655,6 +1655,10 @@ int klee_enter_prctl(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 int klee_enter_seccomp(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
     unsigned int operation = (unsigned int)ev->args[0];
+    unsigned int flags = (unsigned int)ev->args[1];
+
+    KLEE_DEBUG("seccomp: pid=%d op=%u flags=0x%x arg2=0x%lx",
+               proc->real_pid, operation, flags, (unsigned long)ev->args[2]);
 
     if (operation == SECCOMP_SET_MODE_FILTER) {
         void *fprog_addr = (void *)(uintptr_t)ev->args[2];
@@ -1666,6 +1670,11 @@ int klee_enter_seccomp(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
                 klee_compat_handle_seccomp_filter(ic, ev->pid, &fprog,
                                                    fprog_addr,
                                                    klee_regs_get_sp(proc));
+            } else {
+                KLEE_DEBUG("seccomp: pid=%d filter skip (rc=%d filter=%p len=%d)",
+                           proc->real_pid, rc,
+                           rc == 0 ? (void *)fprog.filter : NULL,
+                           rc == 0 ? fprog.len : 0);
             }
         }
         return 0;
