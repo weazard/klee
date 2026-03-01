@@ -554,6 +554,8 @@ int klee_exit_getuid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     (void)ic;
     if (!proc->sandbox || !proc->sandbox->unshare_user || !proc->id_state)
         return 0;
+    if (proc->skip_uid_virt)
+        return 0;
     ev->retval = proc->id_state->ruid;
     return 1;
 }
@@ -562,6 +564,8 @@ int klee_exit_geteuid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
     (void)ic;
     if (!proc->sandbox || !proc->sandbox->unshare_user || !proc->id_state)
+        return 0;
+    if (proc->skip_uid_virt)
         return 0;
     ev->retval = proc->id_state->euid;
     return 1;
@@ -572,6 +576,8 @@ int klee_exit_getgid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     (void)ic;
     if (!proc->sandbox || !proc->sandbox->unshare_user || !proc->id_state)
         return 0;
+    if (proc->skip_uid_virt)
+        return 0;
     ev->retval = proc->id_state->rgid;
     return 1;
 }
@@ -580,6 +586,8 @@ int klee_exit_getegid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
     (void)ic;
     if (!proc->sandbox || !proc->sandbox->unshare_user || !proc->id_state)
+        return 0;
+    if (proc->skip_uid_virt)
         return 0;
     ev->retval = proc->id_state->egid;
     return 1;
@@ -590,6 +598,8 @@ int klee_exit_getresuid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     if (ev->retval < 0)
         return 0;
     if (!proc->sandbox || !proc->sandbox->unshare_user || !proc->id_state)
+        return 0;
+    if (proc->skip_uid_virt)
         return 0;
 
     /* Write virtual UIDs to tracee pointers */
@@ -609,6 +619,8 @@ int klee_exit_getresgid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
         return 0;
     if (!proc->sandbox || !proc->sandbox->unshare_user || !proc->id_state)
         return 0;
+    if (proc->skip_uid_virt)
+        return 0;
 
     gid_t rgid = proc->id_state->rgid;
     gid_t egid = proc->id_state->egid;
@@ -624,6 +636,8 @@ int klee_exit_getgroups(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
     (void)ic;
     if (!proc->sandbox || !proc->sandbox->unshare_user)
+        return 0;
+    if (proc->skip_uid_virt)
         return 0;
     /* Return single group matching virtual gid */
     ev->retval = 1;
@@ -676,6 +690,10 @@ int klee_exit_getsockopt(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
         return 0;
     if (!proc->sandbox || !proc->sandbox->unshare_user || !proc->id_state)
         return 0;
+    /* Processes with skip_uid_virt expect real UID/GID everywhere.
+     * Rewriting SO_PEERCRED to virtual values would cause mismatches. */
+    if (proc->skip_uid_virt)
+        return 0;
 
     int level = (int)ev->args[1];
     int optname = (int)ev->args[2];
@@ -713,5 +731,107 @@ int klee_exit_getsockopt(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 
         ic->write_mem(ic, ev->pid, optval, &cred, sizeof(cred));
     }
+    return 0;
+}
+
+/* ==================== recvmsg SCM_CREDENTIALS Translation ==================== */
+
+/*
+ * Intercept recvmsg() exit to fix received SCM_CREDENTIALS.
+ *
+ * When klee virtualizes UID/GID (unshare_user), the kernel fills
+ * SCM_CREDENTIALS with the sender's REAL pid/uid/gid.  If the sender
+ * is another klee-traced process with UID virtualization, the receiver
+ * sees the real UID (e.g. 0) instead of the virtual UID (e.g. 1000).
+ *
+ * This breaks D-Bus EXTERNAL authentication: the D-Bus server compares
+ * the AUTH EXTERNAL uid (virtual, from getuid()) against the credentials
+ * from SCM_CREDENTIALS (real, from kernel).  By translating the received
+ * credentials to match the virtual UID, D-Bus auth succeeds.
+ */
+int klee_exit_recvmsg(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    if (ev->retval < 0)
+        return 0;
+    if (!proc->id_state || !proc->sandbox)
+        return 0;
+    /* Processes with skip_uid_virt expect real UID/GID everywhere.
+     * Rewriting SCM_CREDENTIALS to virtual values would break them. */
+    if (proc->skip_uid_virt)
+        return 0;
+
+    /* recvmsg(int sockfd, struct msghdr *msg, int flags) */
+    void *msg_addr = (void *)(uintptr_t)ev->args[1];
+    if (!msg_addr)
+        return 0;
+
+    struct msghdr msg;
+    int rc = klee_read_mem(ic, ev->pid, &msg, msg_addr, sizeof(msg));
+    if (rc < 0)
+        return 0;
+
+    if (!msg.msg_control || msg.msg_controllen == 0)
+        return 0;
+
+    size_t ctrllen = msg.msg_controllen;
+    if (ctrllen > 4096)
+        return 0;
+
+    char ctrl_buf[4096];
+    void *ctrl_addr = msg.msg_control;
+    rc = klee_read_mem(ic, ev->pid, ctrl_buf, ctrl_addr, ctrllen);
+    if (rc < 0)
+        return 0;
+
+    bool modified = false;
+    struct msghdr local_msg;
+    memset(&local_msg, 0, sizeof(local_msg));
+    local_msg.msg_control = ctrl_buf;
+    local_msg.msg_controllen = ctrllen;
+
+    uid_t real_uid = getuid();
+    gid_t real_gid = getgid();
+
+    for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&local_msg);
+         cmsg != NULL;
+         cmsg = CMSG_NXTHDR(&local_msg, cmsg)) {
+        if (cmsg->cmsg_level == SOL_SOCKET &&
+            cmsg->cmsg_type == SCM_CREDENTIALS &&
+            cmsg->cmsg_len >= CMSG_LEN(sizeof(struct ucred))) {
+            struct ucred *cred = (struct ucred *)CMSG_DATA(cmsg);
+
+            if (cred->uid == real_uid || cred->gid == real_gid) {
+                KLEE_TRACE("recvmsg SCM_CREDENTIALS: pid=%d uid=%d gid=%d -> "
+                           "uid=%d gid=%d",
+                           cred->pid, cred->uid, cred->gid,
+                           proc->id_state->euid, proc->id_state->egid);
+
+                if (cred->uid == real_uid)
+                    cred->uid = proc->id_state->euid;
+                if (cred->gid == real_gid)
+                    cred->gid = proc->id_state->egid;
+
+                /* Translate PID if PID namespace is active */
+                if (proc->sandbox->unshare_pid && proc->sandbox->pid_map) {
+                    pid_t vpid = klee_pid_map_r2v(proc->sandbox->pid_map,
+                                                   cred->pid);
+                    if (vpid > 0)
+                        cred->pid = vpid;
+                    else if (cred->pid > 0)
+                        cred->pid = 0;
+                }
+
+                modified = true;
+            }
+        }
+    }
+
+    if (!modified)
+        return 0;
+
+    rc = klee_write_mem(ic, ev->pid, ctrl_addr, ctrl_buf, ctrllen);
+    if (rc < 0)
+        KLEE_DEBUG("recvmsg: failed to write back SCM_CREDENTIALS: %d", rc);
+
     return 0;
 }

@@ -6,6 +6,7 @@
 #include "process/memory.h"
 #include "process/regs.h"
 #include "syscall/dispatch.h"
+#include "syscall/sysnum.h"
 #include "ns/pid_ns.h"
 #include "ns/user_ns.h"
 #include "fuse/fuse_proc.h"
@@ -245,7 +246,31 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
         if (el->interceptor->backend == INTERCEPT_SECCOMP_UNOTIFY) {
             el->interceptor->respond(el->interceptor, event, 0, 0);
         } else {
-            el->interceptor->continue_syscall(el->interceptor, event->pid, 0);
+            /* Optimization for ptrace+seccomp: when the exit handler will
+             * be a no-op, use PTRACE_CONT to skip the exit-stop (and the
+             * extra enter-stop from seccomp).  This reduces from 3 ptrace
+             * stops to 1, which is critical for Chrome's recvmsg spin
+             * (~600K+ non-blocking calls that monopolize the event loop). */
+            bool need_exit = true;
+            if (!proc->path_modified) {
+                const KleeSyscallHandler *h = klee_dispatch_get(event->syscall_nr);
+                if (!h || !h->exit) {
+                    /* No exit handler -> exit stop is wasted */
+                    need_exit = false;
+                } else if (proc->skip_uid_virt) {
+                    /* UID-only exit handlers are no-ops when skip_uid_virt */
+                    int nr = event->syscall_nr;
+                    if (nr == KLEE_SYS_recvmsg || nr == KLEE_SYS_getsockopt)
+                        need_exit = false;
+                }
+            }
+            if (need_exit) {
+                el->interceptor->continue_syscall(el->interceptor, event->pid, 0);
+            } else {
+                proc->state = PROC_STATE_RUNNING;
+                proc->seccomp_entered = false;
+                el->interceptor->continue_running(el->interceptor, event->pid, 0);
+            }
         }
         break;
 

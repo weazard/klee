@@ -391,6 +391,24 @@ int main(int argc, char **argv)
             sandbox->unshare_user = true;
             KLEE_INFO("zypak: forced unshare_user for Chrome compatibility");
         }
+        /* Default to uid/gid 1000 if bwrap didn't specify --uid/--gid.
+         * Chrome's root check is geteuid()==0, so the virtual uid must
+         * be non-zero for processes that don't have --no-sandbox. */
+        if (!cfg.uid_set) {
+            cfg.uid = 1000;
+            cfg.uid_set = true;
+        }
+        if (!cfg.gid_set) {
+            cfg.gid = 1000;
+            cfg.gid_set = true;
+        }
+        /* Disable PID namespace virtualization for Chrome/Zypak.
+         * klee assigns virtual PIDs to every clone (including threads),
+         * but clone()/CLONE_CHILD_SETTID return real TIDs while
+         * gettid() returns virtual TIDs — this mismatch breaks
+         * Chrome's Mojo IPC and thread management. */
+        cfg.unshare_pid = false;
+        sandbox->unshare_pid = false;
     }
 
     /* Create host-side mirrors for /run/host mounts so the kernel
@@ -504,6 +522,13 @@ int main(int argc, char **argv)
         gid_t gid = cfg.gid_set ? cfg.gid : (sandbox->zypak_detected ? 1000 : 0);
         init_proc->id_state = klee_id_state_create(uid, gid);
     }
+
+    /* In Zypak mode, the initial process (Chrome main, launched with
+     * --no-sandbox) skips UID virtualization so getuid() returns real
+     * uid=0.  This lets D-Bus AUTH EXTERNAL match SO_PEERCRED.
+     * Child processes re-evaluate on exec (see enter.c). */
+    if (cfg.zypak_detected)
+        init_proc->skip_uid_virt = true;
 
     /* Set initial virtual CWD */
     if (cfg.chdir_path)

@@ -133,6 +133,8 @@
 #define KLEE_SYS_connect         SYS_connect
 #define KLEE_SYS_bind            SYS_bind
 #define KLEE_SYS_sendmsg         SYS_sendmsg
+#define KLEE_SYS_recvmsg         SYS_recvmsg
+#define KLEE_SYS_recvfrom        SYS_recvfrom
 
 /* Terminal/ioctl */
 #define KLEE_SYS_ioctl           SYS_ioctl

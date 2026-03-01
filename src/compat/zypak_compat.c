@@ -779,6 +779,9 @@ int klee_zypak_handle_flatpak_spawn(KleeProcess *proc, KleeInterceptor *ic,
 
     /* 7. Set vexe to the target command's resolved guest path */
     snprintf(proc->vexe, PATH_MAX, "%s", target_abs);
+    snprintf(proc->saved_path, PATH_MAX, "%s", target_abs);
+    snprintf(proc->resolved_guest, PATH_MAX, "%s", target_abs);
+    snprintf(proc->translated_path, PATH_MAX, "%s", target_host);
 
 out:
     fps_opts_destroy(&opts);

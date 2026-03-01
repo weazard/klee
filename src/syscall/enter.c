@@ -801,6 +801,34 @@ static int handle_exec_interp(KleeProcess *proc, KleeInterceptor *ic,
     return 0;
 }
 
+/* Scan tracee argv for --no-sandbox (used for per-process UID virt in Zypak mode).
+ * Returns true if found. Reads up to 256 argv entries from tracee memory. */
+static bool tracee_argv_has_no_sandbox(KleeInterceptor *ic, pid_t pid,
+                                        uint64_t argv_addr)
+{
+    if (!argv_addr)
+        return false;
+
+    for (int i = 0; i < 256; i++) {
+        uint64_t ptr = 0;
+        int rc = klee_read_mem(ic, pid, &ptr,
+                               (const void *)(uintptr_t)(argv_addr + (uint64_t)i * 8),
+                               sizeof(ptr));
+        if (rc < 0 || ptr == 0)
+            break;
+
+        char arg[32]; /* "--no-sandbox" is 12 chars + NUL */
+        rc = klee_read_string(ic, pid, arg, sizeof(arg),
+                              (const void *)(uintptr_t)ptr);
+        if (rc < 0)
+            continue;
+
+        if (strcmp(arg, "--no-sandbox") == 0)
+            return true;
+    }
+    return false;
+}
+
 int klee_enter_execve(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
     int rc = translate_path_arg(proc, ic, ev, 0, -1);
@@ -836,8 +864,9 @@ int klee_enter_execve(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
             snprintf(proc->saved_path, PATH_MAX, "%s", proc->vexe);
             snprintf(proc->resolved_guest, PATH_MAX, "%s", proc->vexe);
             snprintf(proc->translated_path, PATH_MAX, "%s", host_path);
+            uint64_t arg0_scratch = klee_regs_get_arg(proc, 0);
             klee_write_string(ic, ev->pid,
-                              (void *)(uintptr_t)ev->args[0], host_path);
+                              (void *)(uintptr_t)arg0_scratch, host_path);
         }
     }
 
@@ -852,8 +881,10 @@ int klee_enter_execve(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
      * run target command directly inside klee's process tree */
     if (proc->sandbox && proc->sandbox->zypak_detected &&
         klee_zypak_is_flatpak_spawn(proc->saved_path)) {
-        if (klee_zypak_handle_flatpak_spawn(proc, ic, ev) == 0)
-            return 0;
+        if (klee_zypak_handle_flatpak_spawn(proc, ic, ev) == 0) {
+            ev->args[1] = klee_regs_get_arg(proc, 1);
+            /* Fall through to handle_exec_interp for PT_INTERP translation */
+        }
         /* Fall through on failure — let original exec proceed */
     }
 
@@ -956,6 +987,18 @@ int klee_enter_execve(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 
     /* Save exe path for vexe update on exit */
     snprintf(proc->vexe, PATH_MAX, "%s", proc->saved_path);
+
+    /* Per-process UID virtualization for Zypak: on exec, determine whether
+     * this process should skip UID virtualization.  Processes with --no-sandbox
+     * (Chrome main, GPU) skip it so getuid() returns real uid=0 for D-Bus
+     * AUTH EXTERNAL.  Processes without it (zygote, utility) keep virtual
+     * uid to pass Chrome's root check. */
+    if (proc->sandbox && proc->sandbox->zypak_detected) {
+        proc->skip_uid_virt = tracee_argv_has_no_sandbox(ic, ev->pid, ev->args[1]);
+        KLEE_DEBUG("execve pid=%d %s: skip_uid_virt=%d",
+                   proc->real_pid, proc->saved_path, proc->skip_uid_virt);
+    }
+
     return 0;
 }
 
@@ -964,6 +1007,10 @@ int klee_enter_execveat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     int rc = translate_path_arg(proc, ic, ev, 1, 0);
     if (rc < 0) return rc;
     snprintf(proc->vexe, PATH_MAX, "%s", proc->saved_path);
+
+    if (proc->sandbox && proc->sandbox->zypak_detected)
+        proc->skip_uid_virt = tracee_argv_has_no_sandbox(ic, ev->pid, ev->args[2]);
+
     return 0;
 }
 

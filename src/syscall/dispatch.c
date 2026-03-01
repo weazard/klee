@@ -142,6 +142,8 @@ void klee_dispatch_init(void)
     register_handler(KLEE_SYS_bind,      "bind",      klee_enter_bind, NULL);
     register_handler(KLEE_SYS_connect,   "connect",   klee_enter_connect, NULL);
     register_handler(KLEE_SYS_sendmsg,   "sendmsg",   klee_enter_sendmsg, NULL);
+    register_handler(KLEE_SYS_recvmsg,   "recvmsg",   NULL, klee_exit_recvmsg);
+    register_handler(KLEE_SYS_recvfrom,  "recvfrom",  NULL, NULL);
 
     /* Misc */
     register_handler(KLEE_SYS_ptrace,    "ptrace",    klee_enter_ptrace, NULL);

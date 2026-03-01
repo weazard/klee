@@ -91,6 +91,10 @@ typedef struct klee_process {
     int deny_errno;             /* non-zero when syscall was denied on enter */
     bool seccomp_entered;       /* waiting for extra enter-stop after SECCOMP event */
     bool suppress_initial_stop; /* suppress first SIGSTOP after fork (ptrace artifact) */
+    bool skip_uid_virt;         /* skip UID/GID virtualization for this process
+                                 * (returns real uid from getuid/geteuid instead of
+                                 * virtual — used for Chrome main process so D-Bus
+                                 * AUTH EXTERNAL matches SO_PEERCRED) */
     uint64_t saved_args[6];
     char saved_path[PATH_MAX];      /* original guest path */
     char resolved_guest[PATH_MAX];  /* absolute guest path after resolution */

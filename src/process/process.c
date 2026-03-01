@@ -145,6 +145,7 @@ KleeProcess *klee_process_fork(KleeProcessTable *pt, KleeProcess *parent,
     /* Copy state from parent */
     memcpy(child->vcwd, parent->vcwd, PATH_MAX);
     memcpy(child->vexe, parent->vexe, PATH_MAX);
+    child->skip_uid_virt = parent->skip_uid_virt;
 
     /* Clone FD table */
     klee_fd_table_destroy(child->fd_table);
