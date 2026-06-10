@@ -57,16 +57,6 @@ void klee_config_destroy(KleeConfig *cfg)
         env_op = next;
     }
 
-    for (int i = 0; i < cfg->setenv_count; i++) {
-        free(cfg->setenv_pairs[i].key);
-        free(cfg->setenv_pairs[i].value);
-    }
-    free(cfg->setenv_pairs);
-
-    for (int i = 0; i < cfg->unsetenv_count; i++)
-        free(cfg->unsetenv_keys[i]);
-    free(cfg->unsetenv_keys);
-
     for (int i = 0; i < cfg->lock_file_count; i++)
         free(cfg->lock_files[i]);
     free(cfg->lock_files);
@@ -100,37 +90,44 @@ KleeMountOp *klee_config_add_mount(KleeConfig *cfg, MountType type,
     op->type = type;
     op->source = source ? strdup(source) : NULL;
     op->dest = dest ? strdup(dest) : NULL;
-    /* Per-type default permissions matching bwrap:
-     * --file defaults to 0666, --bind-data/--ro-bind-data to 0600,
-     * everything else defaults to 0755. */
-    if (cfg->pending_perms_set) {
-        op->perms = cfg->pending_perms;
-    } else {
-        switch (type) {
-        case MOUNT_FILE:
-            op->perms = 0666;
-            break;
-        case MOUNT_BIND_DATA:
-        case MOUNT_RO_BIND_DATA:
-            op->perms = 0600;
-            break;
-        default:
-            op->perms = 0755;
-            break;
-        }
-    }
-    op->size = cfg->pending_size_set ? cfg->pending_size : 0u;
 
-    if (cfg->pending_overlay_src_count > 0) {
+    /* Only the option types that create files/dirs consume a pending
+     * --perms; only --tmpfs consumes a pending --size; only the overlay
+     * mounts consume pending --overlay-src entries.  The CLI parser
+     * reports an error if pending state is left unconsumed, matching
+     * bwrap. Per-type defaults also match bwrap: --file is 0666,
+     * --bind-data/--ro-bind-data are 0600, the rest 0755. */
+    switch (type) {
+    case MOUNT_FILE:
+        op->perms = cfg->pending_perms_set ? cfg->pending_perms : 0666;
+        cfg->pending_perms_set = false;
+        break;
+    case MOUNT_BIND_DATA:
+    case MOUNT_RO_BIND_DATA:
+        op->perms = cfg->pending_perms_set ? cfg->pending_perms : 0600;
+        cfg->pending_perms_set = false;
+        break;
+    case MOUNT_TMPFS:
+        op->size = cfg->pending_size_set ? cfg->pending_size : 0u;
+        cfg->pending_size_set = false;
+        /* fall through */
+    case MOUNT_DIR:
+        op->perms = cfg->pending_perms_set ? cfg->pending_perms : 0755;
+        cfg->pending_perms_set = false;
+        break;
+    case MOUNT_OVERLAY:
+    case MOUNT_TMP_OVERLAY:
+    case MOUNT_RO_OVERLAY:
         op->overlay_srcs = cfg->pending_overlay_srcs;
         op->overlay_src_count = cfg->pending_overlay_src_count;
         cfg->pending_overlay_srcs = NULL;
         cfg->pending_overlay_src_count = 0;
+        op->perms = 0755;
+        break;
+    default:
+        op->perms = 0755;
+        break;
     }
-
-    /* Reset pending state */
-    cfg->pending_perms_set = false;
-    cfg->pending_size_set = false;
 
     /* Append to tail */
     op->next = NULL;

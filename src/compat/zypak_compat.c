@@ -386,6 +386,10 @@ int klee_zypak_handle_flatpak_spawn(KleeProcess *proc, KleeInterceptor *ic,
     FlatpakSpawnOpts opts;
     int ret = 0;
 
+    /* Initialize before any goto out — fps_opts_destroy must not see
+     * garbage if argv reading fails before the parse step. */
+    fps_opts_init(&opts);
+
     KLEE_INFO("zypak: intercepting flatpak-spawn execve from pid=%d", pid);
 
     /* 1. Read tracee argv from memory */
@@ -422,7 +426,7 @@ int klee_zypak_handle_flatpak_spawn(KleeProcess *proc, KleeInterceptor *ic,
         int cur_envc = 0;
         rc = read_tracee_argv(ic, pid, ev->args[2],
                               &cur_envp, &cur_envc);
-        if (rc == 0 && cur_envc >= 0) {
+        if (rc == 0) {
             rc = apply_fps_env(&opts, cur_envp, cur_envc,
                                &new_envp, &new_envc);
             if (rc == 0) {

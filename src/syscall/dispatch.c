@@ -38,6 +38,7 @@ void klee_dispatch_init(void)
 
     /* Filesystem path-rewriting syscalls (enter handlers) */
     register_handler(KLEE_SYS_open,      "open",      klee_enter_open, klee_exit_open);
+    register_handler(KLEE_SYS_creat,     "creat",     klee_enter_creat, klee_exit_open);
     register_handler(KLEE_SYS_openat,    "openat",    klee_enter_openat, klee_exit_open);
 #ifdef KLEE_SYS_openat2
     register_handler(KLEE_SYS_openat2,   "openat2",   klee_enter_openat2, klee_exit_open);

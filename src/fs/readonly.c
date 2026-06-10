@@ -67,8 +67,10 @@ bool klee_readonly_check_open(const KleeMountTable *mt, const char *guest_path,
         return true;
     }
 
-    if (flags & (O_CREAT | O_TRUNC | O_APPEND)) {
-        KLEE_DEBUG("readonly: blocking open(create/trunc/append) on %s",
+    /* O_APPEND alone is harmless with O_RDONLY; O_TRUNC truncates and
+     * O_CREAT may create even when the access mode is read-only. */
+    if (flags & (O_CREAT | O_TRUNC)) {
+        KLEE_DEBUG("readonly: blocking open(create/trunc) on %s",
                    guest_path);
         return true;
     }

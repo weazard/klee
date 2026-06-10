@@ -12,6 +12,7 @@
 int klee_enter_open(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_openat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_openat2(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_creat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_stat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_lstat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_newfstatat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);

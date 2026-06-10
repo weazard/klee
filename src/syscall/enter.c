@@ -206,13 +206,14 @@ static int translate_path_arg_ex(KleeProcess *proc, KleeInterceptor *ic,
 
     /* If /proc/self or /proc/<vpid> was rewritten, always force the write
      * even if the mount table didn't change the path further — the tracee's
-     * memory still has the original path which the kernel can't resolve. */
+     * memory still has the original path which the kernel can't resolve.
+     * Note: never CLEAR path_modified here — a previous path argument of
+     * the same syscall (e.g. rename oldpath) may already have set it. */
     if (strcmp(proc->saved_path, proc->translated_path) == 0 &&
-        !proc_self_rewritten && !vpid_rewritten) {
-        proc->path_modified = false;
+        !proc_self_rewritten && !vpid_rewritten)
         return 0;
-    }
 
+    bool prev_modified = proc->path_modified;
     proc->path_modified = true;
 
     /* Write translated path to tracee via stack scratch area.
@@ -235,7 +236,7 @@ static int translate_path_arg_ex(KleeProcess *proc, KleeInterceptor *ic,
                                proc->translated_path);
         if (rc < 0) {
             KLEE_DEBUG("failed to write translated path to scratch: %d", rc);
-            proc->path_modified = false;
+            proc->path_modified = prev_modified;
             return 0;
         }
 
@@ -290,6 +291,14 @@ int klee_enter_openat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     int rc = translate_path_arg(proc, ic, ev, 1, 0);
     if (rc < 0) return rc;
     return check_readonly_open(proc, (int)ev->args[2]);
+}
+
+int klee_enter_creat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    /* creat(path, mode) == open(path, O_CREAT|O_WRONLY|O_TRUNC, mode) */
+    int rc = translate_path_arg(proc, ic, ev, 0, -1);
+    if (rc < 0) return rc;
+    return check_readonly_open(proc, O_CREAT | O_WRONLY | O_TRUNC);
 }
 
 int klee_enter_openat2(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
@@ -350,24 +359,42 @@ int klee_enter_openat2(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     if (!ctx.mount_table)
         return 0;
 
-    rc = klee_path_guest_to_host(&ctx, proc->saved_path,
-                                  proc->translated_path, dirfd);
+    /* Resolve and translate in two steps so resolved_guest is available
+     * for the readonly check below. */
+    rc = klee_path_resolve(&ctx, proc->saved_path, proc->resolved_guest,
+                            dirfd);
     if (rc < 0)
         return 0;
 
-    if (strcmp(proc->saved_path, proc->translated_path) == 0) {
-        proc->path_modified = false;
+    rc = klee_mount_table_translate(ctx.mount_table, proc->resolved_guest,
+                                     proc->translated_path, PATH_MAX);
+    if (rc < 0)
         return 0;
-    }
+
+    if (strcmp(proc->saved_path, proc->translated_path) == 0)
+        return check_readonly_open(proc, (int)how.flags);
 
     proc->path_modified = true;
 
+    /* Write the translated path to a scratch area below the tracee's
+     * stack — the original buffer may be too small for the longer host
+     * path — and repoint the pathname register at it. */
     if (ic->backend == INTERCEPT_PTRACE) {
-        rc = klee_write_string(ic, ev->pid, path_addr, proc->translated_path);
+        proc->saved_args[1] = ev->args[1];
+
+        klee_regs_fetch(ic, proc);
+        uint64_t rsp = klee_regs_get_sp(proc);
+        uint64_t scratch = rsp - 128 -
+                           PATH_MAX * (uint64_t)(proc->path_arg_count + 1);
+        rc = klee_write_string(ic, ev->pid, (void *)(uintptr_t)scratch,
+                               proc->translated_path);
         if (rc < 0) {
             proc->path_modified = false;
             return 0;
         }
+        klee_regs_set_arg(proc, 1, scratch);
+        klee_regs_push(ic, proc);
+        proc->path_arg_idx[proc->path_arg_count++] = 1;
     }
 
     KLEE_TRACE("openat2: translated %s -> %s (resolve=0x%lx)",
@@ -816,13 +843,21 @@ int klee_enter_execve(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
                        proc->vexe, host_path);
             snprintf(proc->saved_path, PATH_MAX, "%s", proc->vexe);
             snprintf(proc->translated_path, PATH_MAX, "%s", host_path);
-            klee_write_string(ic, ev->pid,
-                              (void *)(uintptr_t)ev->args[0], host_path);
+            /* Overwrite the scratch slot translate_path_arg already
+             * pointed arg0 at — never the tracee's original buffer,
+             * which may be too small for the host path. */
+            klee_regs_fetch(ic, proc);
+            uint64_t scratch = klee_regs_get_arg(proc, 0);
+            klee_write_string(ic, ev->pid, (void *)(uintptr_t)scratch,
+                              host_path);
         }
     }
 
-    /* Check for nested bwrap invocation — parse inline and rewrite */
-    if (klee_nested_is_bwrap(proc->saved_path)) {
+    /* Check for nested bwrap invocation — parse inline and rewrite.
+     * Both this and the flatpak-spawn handler rewrite the tracee's
+     * argument registers, which only the ptrace backend supports. */
+    if (ic->backend == INTERCEPT_PTRACE &&
+        klee_nested_is_bwrap(proc->saved_path)) {
         if (klee_nested_handle_exec(proc, ic, ev) == 0)
             return 0; /* handler sets vexe and manipulates registers */
         /* Fall through on failure — let original exec proceed */
@@ -830,7 +865,8 @@ int klee_enter_execve(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 
     /* Check for flatpak-spawn (Zypak mimic strategy) — intercept and
      * run target command directly inside KLEE's process tree */
-    if (proc->sandbox && proc->sandbox->zypak_detected &&
+    if (ic->backend == INTERCEPT_PTRACE &&
+        proc->sandbox && proc->sandbox->zypak_detected &&
         klee_zypak_is_flatpak_spawn(proc->saved_path)) {
         if (klee_zypak_handle_flatpak_spawn(proc, ic, ev) == 0)
             return 0;
@@ -871,8 +907,10 @@ int klee_enter_rename(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     if (rc < 0) return rc;
     rc = check_readonly(proc, ev->syscall_nr);
     if (rc < 0) return rc;
-    /* Also translate dest path (arg 1) - need a second translate */
-    return translate_path_arg_nofollow(proc, ic, ev, 1, -1);
+    /* Also translate and check the dest path (arg 1) */
+    rc = translate_path_arg_nofollow(proc, ic, ev, 1, -1);
+    if (rc < 0) return rc;
+    return check_readonly(proc, ev->syscall_nr);
 }
 
 int klee_enter_renameat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
@@ -881,7 +919,9 @@ int klee_enter_renameat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     if (rc < 0) return rc;
     rc = check_readonly(proc, ev->syscall_nr);
     if (rc < 0) return rc;
-    return translate_path_arg_nofollow(proc, ic, ev, 3, 2);
+    rc = translate_path_arg_nofollow(proc, ic, ev, 3, 2);
+    if (rc < 0) return rc;
+    return check_readonly(proc, ev->syscall_nr);
 }
 
 int klee_enter_renameat2(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
@@ -926,19 +966,29 @@ int klee_enter_unlinkat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 
 int klee_enter_link(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    /* link(oldpath, newpath) - oldpath should not follow final symlink */
+    /* link(oldpath, newpath) - oldpath should not follow final symlink.
+     * Only newpath needs a readonly check: link creates the new entry
+     * without modifying oldpath. */
     int rc = translate_path_arg_nofollow(proc, ic, ev, 0, -1);
     if (rc < 0) return rc;
-    return translate_path_arg_nofollow(proc, ic, ev, 1, -1);
+    rc = translate_path_arg_nofollow(proc, ic, ev, 1, -1);
+    if (rc < 0) return rc;
+    return check_readonly(proc, ev->syscall_nr);
 }
 
 int klee_enter_linkat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
     /* linkat(olddirfd, oldpath, newdirfd, newpath, flags)
      * Default: don't follow on oldpath. AT_SYMLINK_FOLLOW changes this. */
-    int rc = translate_path_arg_nofollow(proc, ic, ev, 1, 0);
+    int rc;
+    if ((int)ev->args[4] & AT_SYMLINK_FOLLOW)
+        rc = translate_path_arg(proc, ic, ev, 1, 0);
+    else
+        rc = translate_path_arg_nofollow(proc, ic, ev, 1, 0);
     if (rc < 0) return rc;
-    return translate_path_arg_nofollow(proc, ic, ev, 3, 2);
+    rc = translate_path_arg_nofollow(proc, ic, ev, 3, 2);
+    if (rc < 0) return rc;
+    return check_readonly(proc, ev->syscall_nr);
 }
 
 int klee_enter_symlink(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
@@ -973,17 +1023,27 @@ int klee_enter_fchmodat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 
 int klee_enter_chown(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    return translate_path_arg(proc, ic, ev, 0, -1);
+    int rc = translate_path_arg(proc, ic, ev, 0, -1);
+    if (rc < 0) return rc;
+    return check_readonly(proc, ev->syscall_nr);
 }
 
 int klee_enter_lchown(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    return translate_path_arg_nofollow(proc, ic, ev, 0, -1);
+    int rc = translate_path_arg_nofollow(proc, ic, ev, 0, -1);
+    if (rc < 0) return rc;
+    return check_readonly(proc, ev->syscall_nr);
 }
 
 int klee_enter_fchownat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    return translate_path_arg(proc, ic, ev, 1, 0);
+    int rc;
+    if ((int)ev->args[4] & AT_SYMLINK_NOFOLLOW)
+        rc = translate_path_arg_nofollow(proc, ic, ev, 1, 0);
+    else
+        rc = translate_path_arg(proc, ic, ev, 1, 0);
+    if (rc < 0) return rc;
+    return check_readonly(proc, ev->syscall_nr);
 }
 
 int klee_enter_truncate(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
@@ -1330,8 +1390,9 @@ int klee_enter_setgroups(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     (void)ic; (void)ev;
     if (!proc->sandbox || !proc->sandbox->unshare_user)
         return 0;
-    /* Void the syscall and return success */
-    return 0;
+    /* Void the syscall and return success — the real setgroups would
+     * fail with EPERM for the unprivileged tracee. */
+    return 1;
 }
 
 /* ==================== UTS / IPC Enter Handlers ==================== */
@@ -1351,48 +1412,45 @@ int klee_enter_sethostname(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev
         return 0;
     hostname[len] = '\0';
 
-    klee_uts_set_hostname(proc->sandbox->hostname ? NULL : proc->sandbox, hostname);
+    klee_uts_set_hostname(proc->sandbox, hostname);
     /* Void the real syscall, return success */
-    return -0;
+    return 1;
+}
+
+/* Translate an SysV IPC key (arg 0) into the sandbox's private key space.
+ * Mutating ev->args alone does nothing — the tracee's registers must be
+ * updated for the kernel to see the new key. */
+static int translate_ipc_key_arg(KleeProcess *proc, KleeInterceptor *ic,
+                                  KleeEvent *ev, const char *name)
+{
+    if (!proc->sandbox || !proc->sandbox->unshare_ipc || !proc->sandbox->ipc_ns)
+        return 0;
+
+    key_t key = (key_t)ev->args[0];
+    key_t real_key = klee_ipc_ns_translate_key(proc->sandbox->ipc_ns, key);
+    if (real_key == key)
+        return 0;
+
+    klee_regs_fetch(ic, proc);
+    klee_regs_set_arg(proc, 0, (uint64_t)(unsigned int)real_key);
+    klee_regs_push(ic, proc);
+    KLEE_TRACE("%s: translated key %d -> %d", name, key, real_key);
+    return 0;
 }
 
 int klee_enter_shmget(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    (void)ic;
-    if (!proc->sandbox || !proc->sandbox->unshare_ipc || !proc->sandbox->ipc_ns)
-        return 0;
-
-    key_t key = (key_t)ev->args[0];
-    key_t real_key = klee_ipc_ns_translate_key(proc->sandbox->ipc_ns, key);
-    ev->args[0] = (uint64_t)(unsigned int)real_key;
-    KLEE_TRACE("shmget: translated key %d -> %d", key, real_key);
-    return 0;
+    return translate_ipc_key_arg(proc, ic, ev, "shmget");
 }
 
 int klee_enter_msgget(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    (void)ic;
-    if (!proc->sandbox || !proc->sandbox->unshare_ipc || !proc->sandbox->ipc_ns)
-        return 0;
-
-    key_t key = (key_t)ev->args[0];
-    key_t real_key = klee_ipc_ns_translate_key(proc->sandbox->ipc_ns, key);
-    ev->args[0] = (uint64_t)(unsigned int)real_key;
-    KLEE_TRACE("msgget: translated key %d -> %d", key, real_key);
-    return 0;
+    return translate_ipc_key_arg(proc, ic, ev, "msgget");
 }
 
 int klee_enter_semget(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    (void)ic;
-    if (!proc->sandbox || !proc->sandbox->unshare_ipc || !proc->sandbox->ipc_ns)
-        return 0;
-
-    key_t key = (key_t)ev->args[0];
-    key_t real_key = klee_ipc_ns_translate_key(proc->sandbox->ipc_ns, key);
-    ev->args[0] = (uint64_t)(unsigned int)real_key;
-    KLEE_TRACE("semget: translated key %d -> %d", key, real_key);
-    return 0;
+    return translate_ipc_key_arg(proc, ic, ev, "semget");
 }
 
 /* ==================== Misc Enter Handlers ==================== */
@@ -1430,7 +1488,7 @@ int klee_enter_prctl(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
                            fd, proc->vexe);
             }
             /* Void the real syscall (return success) */
-            return -0;
+            return 1;
         }
         break;
     }
@@ -1441,7 +1499,7 @@ int klee_enter_prctl(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
         if (proc->sandbox && proc->sandbox->unshare_user) {
             KLEE_DEBUG("prctl(PR_CAPBSET_DROP, %lu) voided under user ns",
                        (unsigned long)ev->args[1]);
-            return -0;
+            return 1;
         }
         break;
 
@@ -1451,7 +1509,7 @@ int klee_enter_prctl(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
         if (proc->sandbox && proc->sandbox->unshare_user) {
             KLEE_DEBUG("prctl(PR_SET_KEEPCAPS, %lu) voided under user ns",
                        (unsigned long)ev->args[1]);
-            return -0;
+            return 1;
         }
         break;
 
@@ -1476,7 +1534,7 @@ int klee_enter_prctl(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
         /* Under user namespace simulation, void ambient cap operations */
         if (proc->sandbox && proc->sandbox->unshare_user) {
             KLEE_DEBUG("prctl(PR_CAP_AMBIENT) voided under user ns");
-            return -0;
+            return 1;
         }
         break;
 #endif
@@ -1502,7 +1560,7 @@ int klee_enter_seccomp(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
             struct sock_fprog fprog;
             int rc = klee_read_mem(ic, ev->pid, &fprog, fprog_addr, sizeof(fprog));
             if (rc == 0 && fprog.filter && fprog.len > 0) {
-                klee_compat_handle_seccomp_filter(ic, ev->pid, &fprog);
+                klee_compat_handle_seccomp_filter(proc, ic, ev, &fprog);
             }
         }
         return 0;
@@ -1762,10 +1820,38 @@ int klee_enter_sendmsg(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     if (!modified)
         return 0;
 
-    /* Write modified control data back to tracee (same address, same size) */
-    rc = klee_write_mem(ic, ev->pid, ctrl_addr, ctrl_buf, ctrllen);
-    if (rc < 0)
-        KLEE_DEBUG("sendmsg: failed to write back SCM_CREDENTIALS: %d", rc);
+    if (ic->backend == INTERCEPT_PTRACE) {
+        /* Build a modified msghdr + control buffer in scratch memory below
+         * the tracee's stack and repoint arg1 there, leaving the tracee's
+         * own buffers untouched.  Registers are restored at syscall exit. */
+        klee_regs_fetch(ic, proc);
+        uint64_t rsp = klee_regs_get_sp(proc);
+        uint64_t ctrl_scratch = (rsp - 128 - ctrllen) & ~7ULL;
+        uint64_t msg_scratch = (ctrl_scratch - sizeof(msg)) & ~7ULL;
+
+        rc = klee_write_mem(ic, ev->pid, (void *)(uintptr_t)ctrl_scratch,
+                            ctrl_buf, ctrllen);
+        if (rc < 0)
+            return 0;
+
+        msg.msg_control = (void *)(uintptr_t)ctrl_scratch;
+        rc = klee_write_mem(ic, ev->pid, (void *)(uintptr_t)msg_scratch,
+                            &msg, sizeof(msg));
+        if (rc < 0)
+            return 0;
+
+        proc->saved_args[1] = ev->args[1];
+        klee_regs_set_arg(proc, 1, msg_scratch);
+        klee_regs_push(ic, proc);
+        proc->path_arg_idx[proc->path_arg_count++] = 1;
+        proc->path_modified = true;
+    } else {
+        /* seccomp backend: no register rewriting available — write the
+         * modified control data back in place (same address, same size) */
+        rc = klee_write_mem(ic, ev->pid, ctrl_addr, ctrl_buf, ctrllen);
+        if (rc < 0)
+            KLEE_DEBUG("sendmsg: failed to write back SCM_CREDENTIALS: %d", rc);
+    }
 
     return 0;
 }

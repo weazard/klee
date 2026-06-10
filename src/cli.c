@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <errno.h>
 #include <unistd.h>
 
@@ -129,6 +130,12 @@ static int add_overlay_src(KleeConfig *cfg, const char *path)
     return 0;
 }
 
+/* Modifier options set pending state consumed by the next option */
+static bool is_modifier_option(const char *opt)
+{
+    return strcmp(opt, "--perms") == 0 || strcmp(opt, "--size") == 0;
+}
+
 static int klee_cli_parse_recurse(KleeConfig *cfg, int argc, char **argv,
                                    bool from_args_fd);
 
@@ -137,13 +144,23 @@ static int parse_args_fd(KleeConfig *cfg, int fd)
 {
     /* Read entire content */
     char *buf = NULL;
-    size_t buf_size = 0;
     size_t buf_len = 0;
     char tmp[4096];
     ssize_t n;
 
-    while ((n = read(fd, tmp, sizeof(tmp))) > 0) {
-        char *new_buf = realloc(buf, buf_size + (size_t)n + 1);
+    for (;;) {
+        n = read(fd, tmp, sizeof(tmp));
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            int err = errno;
+            KLEE_ERROR("--args: read failed: %s", strerror(err));
+            free(buf);
+            return -err;
+        }
+        if (n == 0)
+            break;
+        char *new_buf = realloc(buf, buf_len + (size_t)n + 1);
         if (!new_buf) {
             free(buf);
             return -ENOMEM;
@@ -151,8 +168,8 @@ static int parse_args_fd(KleeConfig *cfg, int fd)
         buf = new_buf;
         memcpy(buf + buf_len, tmp, (size_t)n);
         buf_len += (size_t)n;
-        buf_size = buf_len + 1;
     }
+    close(fd);
 
     if (!buf || buf_len == 0) {
         free(buf);
@@ -202,7 +219,16 @@ static int parse_args_fd(KleeConfig *cfg, int fd)
 
 int klee_cli_parse(KleeConfig *cfg, int argc, char **argv)
 {
-    return klee_cli_parse_recurse(cfg, argc, argv, false);
+    int rc = klee_cli_parse_recurse(cfg, argc, argv, false);
+    if (rc != 0)
+        return rc;
+
+    if (cfg->pending_overlay_src_count > 0) {
+        KLEE_ERROR("--overlay-src must be followed by another --overlay-src "
+                   "or one of --overlay, --tmp-overlay, or --ro-overlay");
+        return -EINVAL;
+    }
+    return 0;
 }
 
 static int klee_cli_parse_recurse(KleeConfig *cfg, int argc, char **argv,
@@ -351,11 +377,9 @@ static int klee_cli_parse_recurse(KleeConfig *cfg, int argc, char **argv,
                 KLEE_ERROR("--overlay requires at least one --overlay-src");
                 return -EINVAL;
             }
-            KleeMountOp *op = klee_config_add_mount(cfg, MOUNT_OVERLAY, argv[i+1], argv[i+3]);
-            if (op) {
-                free(op->source);
-                op->source = strdup(argv[i+1]);
-            }
+            /* argv[i+2] is the overlayfs workdir; the userspace overlay
+             * emulation writes straight to the upper dir and needs none. */
+            klee_config_add_mount(cfg, MOUNT_OVERLAY, argv[i+1], argv[i+3]);
             i += 4;
         }
         else if (strcmp(arg, "--tmp-overlay") == 0) {
@@ -380,7 +404,7 @@ static int klee_cli_parse_recurse(KleeConfig *cfg, int argc, char **argv,
         else if (strcmp(arg, "--perms") == 0) {
             if ((rc = need_args(i, argc, 1, arg)) < 0) return rc;
             if (cfg->pending_perms_set) {
-                KLEE_ERROR("--perms given twice without being consumed");
+                KLEE_ERROR("--perms given twice for the same action");
                 return -EINVAL;
             }
             int perms;
@@ -391,10 +415,16 @@ static int klee_cli_parse_recurse(KleeConfig *cfg, int argc, char **argv,
         }
         else if (strcmp(arg, "--size") == 0) {
             if ((rc = need_args(i, argc, 1, arg)) < 0) return rc;
+            if (cfg->pending_size_set) {
+                KLEE_ERROR("--size given twice for the same action");
+                return -EINVAL;
+            }
             char *end;
+            errno = 0;
             unsigned long long size_val = strtoull(argv[i+1], &end, 0);
-            if (*end != '\0' || end == argv[i+1] || size_val == 0) {
-                KLEE_ERROR("invalid size: %s", argv[i+1]);
+            if (errno != 0 || *end != '\0' || end == argv[i+1] ||
+                size_val == 0 || size_val > (SIZE_MAX >> 1)) {
+                KLEE_ERROR("--size takes a non-zero number of bytes");
                 return -EINVAL;
             }
             cfg->pending_size = (size_t)size_val;
@@ -444,7 +474,9 @@ static int klee_cli_parse_recurse(KleeConfig *cfg, int argc, char **argv,
             i++;
         }
         else if (strcmp(arg, "--share-net") == 0) {
-            cfg->share_net = true;
+            /* Order-sensitive like bwrap: undoes a preceding --unshare-net
+             * (typically from --unshare-all) but not a following one. */
+            cfg->unshare_net = false;
             i++;
         }
         /* ==================== Identity ==================== */
@@ -489,7 +521,6 @@ static int klee_cli_parse_recurse(KleeConfig *cfg, int argc, char **argv,
             i += 2;
         }
         else if (strcmp(arg, "--clearenv") == 0) {
-            cfg->clearenv = true;
             add_env_op(cfg, ENV_OP_CLEAR, NULL, NULL);
             i++;
         }
@@ -584,6 +615,10 @@ static int klee_cli_parse_recurse(KleeConfig *cfg, int argc, char **argv,
             cfg->assert_userns_disabled = true;
             i++;
         }
+        else if (strcmp(arg, "--not-a-security-boundary") == 0) {
+            cfg->not_a_security_boundary = true;
+            i++;
+        }
         /* ==================== Misc ==================== */
         else if (strcmp(arg, "--args") == 0) {
             if (from_args_fd) {
@@ -631,13 +666,39 @@ static int klee_cli_parse_recurse(KleeConfig *cfg, int argc, char **argv,
             KLEE_ERROR("Unknown option %s", arg);
             return -EINVAL;
         }
+
+        /* Pending modifier state must be consumed by the directly
+         * following option (matching bwrap); klee_config_add_mount()
+         * clears it only for option types that accept the modifier. */
+        if (!is_modifier_option(arg)) {
+            if (cfg->pending_perms_set) {
+                KLEE_ERROR("--perms must be followed by an option that creates a file");
+                return -EINVAL;
+            }
+            if (cfg->pending_size_set) {
+                KLEE_ERROR("--size must be followed by --tmpfs");
+                return -EINVAL;
+            }
+        }
+        if (strcmp(arg, "--overlay-src") != 0 &&
+            cfg->pending_overlay_src_count > 0) {
+            KLEE_ERROR("--overlay-src must be followed by another --overlay-src "
+                       "or one of --overlay, --tmp-overlay, or --ro-overlay");
+            return -EINVAL;
+        }
     }
 
-    /* Handle --share-net overriding --unshare-net */
-    if (cfg->share_net)
-        cfg->unshare_net = false;
+    /* Everything remaining is the child command.  Arguments read via
+     * --args FD only contribute options (like bwrap); the strings live
+     * in a temporary buffer that is freed when parse_args_fd returns,
+     * so they must not end up in cfg->argv. */
+    if (from_args_fd) {
+        if (i < argc)
+            KLEE_WARN("--args: ignoring %d trailing non-option argument(s)",
+                      argc - i);
+        return 0;
+    }
 
-    /* Everything remaining is the child command */
     if (i < argc) {
         cfg->argc = argc - i;
         cfg->argv = &argv[i];
@@ -703,7 +764,7 @@ void klee_cli_usage(const char *progname)
         "  --clearenv                Clear all environment variables\n"
         "  --new-session             Create new terminal session\n"
         "  --die-with-parent         Kill sandbox on parent death\n"
-        "  --as-pid-1               Run as PID 1 in sandbox\n"
+        "  --as-pid-1                Run as PID 1 in sandbox\n"
         "\n"
         "FD options:\n"
         "  --lock-file PATH          Lock file path\n"
@@ -728,6 +789,8 @@ void klee_cli_usage(const char *progname)
         "  --level-prefix            Prepend message level to output\n"
         "  --exec-label LABEL        Set SELinux exec label\n"
         "  --file-label LABEL        Set SELinux file label\n"
+        "  --not-a-security-boundary Do not fail hard when sandbox setup steps fail;\n"
+        "                            use only when the sandbox is not a security boundary\n"
         "\n",
         progname);
 }

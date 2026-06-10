@@ -37,7 +37,7 @@ endif
 # Source files
 UTIL_SRCS = src/util/log.c src/util/arena.c src/util/hash_table.c
 FS_SRCS   = src/fs/radix_tree.c src/fs/mount_table.c src/fs/path_resolve.c \
-            src/fs/fd_table.c src/fs/tmpfs.c src/fs/readonly.c src/fs/pivot.c \
+            src/fs/fd_table.c src/fs/tmpfs.c src/fs/readonly.c \
             src/fs/overlay.c
 NS_SRCS   = src/ns/pid_ns.c src/ns/user_ns.c src/ns/ipc_ns.c \
             src/ns/uts_ns.c src/ns/net_ns.c src/ns/proc_synth.c
@@ -48,8 +48,7 @@ PROCESS_SRCS   = src/process/process.c src/process/event.c \
 SYSCALL_SRCS   = src/syscall/dispatch.c src/syscall/enter.c \
                  src/syscall/exit.c src/syscall/handlers.c
 COMPAT_SRCS    = src/compat/seccomp_filter.c src/compat/io_uring_block.c \
-                 src/compat/edge_cases.c src/compat/nested.c \
-                 src/compat/zypak_compat.c
+                 src/compat/nested.c src/compat/zypak_compat.c
 STEAM_SRCS     = src/steam/steam_compat.c
 
 # fuse_mountinfo and fuse_pidns are always compiled (no FUSE dependency)
@@ -114,10 +113,10 @@ tests/test_cli: tests/test_cli.c src/cli.o src/config.o $(COMMON_TEST_OBJS)
 tests/test_radix_tree: tests/test_radix_tree.c src/fs/radix_tree.o $(COMMON_TEST_OBJS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-tests/test_mount_table: tests/test_mount_table.c src/fs/mount_table.o src/fs/radix_tree.o src/fs/tmpfs.o src/fs/pivot.o src/fs/overlay.o src/fuse/fuse_mountinfo.o src/config.o $(COMMON_TEST_OBJS)
+tests/test_mount_table: tests/test_mount_table.c src/fs/mount_table.o src/fs/radix_tree.o src/fs/tmpfs.o src/fs/overlay.o src/fuse/fuse_mountinfo.o src/config.o $(COMMON_TEST_OBJS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-tests/test_path_resolve: tests/test_path_resolve.c src/fs/path_resolve.o src/fs/mount_table.o src/fs/radix_tree.o src/fs/tmpfs.o src/fs/pivot.o src/fs/fd_table.o src/fs/overlay.o src/fuse/fuse_mountinfo.o src/config.o $(COMMON_TEST_OBJS)
+tests/test_path_resolve: tests/test_path_resolve.c src/fs/path_resolve.o src/fs/mount_table.o src/fs/radix_tree.o src/fs/tmpfs.o src/fs/fd_table.o src/fs/overlay.o src/fuse/fuse_mountinfo.o src/config.o $(COMMON_TEST_OBJS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 tests/test_pid_ns: tests/test_pid_ns.c src/ns/pid_ns.o $(COMMON_TEST_OBJS)

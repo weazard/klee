@@ -28,15 +28,17 @@ struct klee_fuse_proc {
     char mount_path[PATH_MAX];
     KleeProcessTable *proctable;
     KleeSandbox *sandbox;
-    int fuse_fd;
     pthread_t fuse_thread;
     bool thread_started;
 };
 
 /* FUSE operations - passthrough with selective synthesis */
 
-/* Translate a FUSE /proc path with virtual PIDs to a real /proc path */
-static void translate_proc_path(const char *path, char *real_path, size_t size)
+/* Translate a FUSE /proc path with virtual PIDs to a real /proc path.
+ * Returns 0 on success, -ENOENT when PID isolation is active and the
+ * numeric component is not a known virtual PID — falling through to the
+ * host's /proc/<pid> would leak processes outside the sandbox. */
+static int translate_proc_path(const char *path, char *real_path, size_t size)
 {
     struct fuse_context *fctx = fuse_get_context();
     KleeFuseProc *fp = fctx ? fctx->private_data : NULL;
@@ -51,19 +53,20 @@ static void translate_proc_path(const char *path, char *real_path, size_t size)
         if (end > p && (*end == '/' || *end == '\0')) {
             char vpid_str[32];
             size_t len = (size_t)(end - p);
-            if (len < sizeof(vpid_str)) {
-                memcpy(vpid_str, p, len);
-                vpid_str[len] = '\0';
-                pid_t vpid = (pid_t)atoi(vpid_str);
-                pid_t real_pid = klee_pid_map_v2r(pid_map, vpid);
-                if (real_pid > 0) {
-                    snprintf(real_path, size, "/proc/%d%s", real_pid, end);
-                    return;
-                }
-            }
+            if (len >= sizeof(vpid_str))
+                return -ENOENT;
+            memcpy(vpid_str, p, len);
+            vpid_str[len] = '\0';
+            pid_t vpid = (pid_t)atoi(vpid_str);
+            pid_t real_pid = klee_pid_map_v2r(pid_map, vpid);
+            if (real_pid <= 0)
+                return -ENOENT;
+            snprintf(real_path, size, "/proc/%d%s", real_pid, end);
+            return 0;
         }
     }
     snprintf(real_path, size, "/proc%s", path);
+    return 0;
 }
 
 /* Paths that bwrap masks as read-only within /proc */
@@ -83,7 +86,9 @@ static int fuse_proc_getattr(const char *path, struct stat *stbuf,
 {
     (void)fi;
     char real_path[PATH_MAX];
-    translate_proc_path(path, real_path, sizeof(real_path));
+    int trc = translate_proc_path(path, real_path, sizeof(real_path));
+    if (trc < 0)
+        return trc;
 
     if (lstat(real_path, stbuf) < 0)
         return -errno;
@@ -105,7 +110,9 @@ static int fuse_proc_readdir(const char *path, void *buf,
     (void)flags;
 
     char real_path[PATH_MAX];
-    translate_proc_path(path, real_path, sizeof(real_path));
+    int trc = translate_proc_path(path, real_path, sizeof(real_path));
+    if (trc < 0)
+        return trc;
 
     DIR *dp = opendir(real_path);
     if (!dp)
@@ -385,7 +392,9 @@ static int fuse_proc_read(const char *path, char *buf, size_t size,
 
     /* Read the real /proc content */
     char real_path[PATH_MAX];
-    translate_proc_path(path, real_path, sizeof(real_path));
+    int trc = translate_proc_path(path, real_path, sizeof(real_path));
+    if (trc < 0)
+        return trc;
 
     int fd = open(real_path, O_RDONLY);
     if (fd < 0)
@@ -436,7 +445,9 @@ static int fuse_proc_read(const char *path, char *buf, size_t size,
 static int fuse_proc_readlink(const char *path, char *buf, size_t size)
 {
     char real_path[PATH_MAX];
-    translate_proc_path(path, real_path, sizeof(real_path));
+    int trc = translate_proc_path(path, real_path, sizeof(real_path));
+    if (trc < 0)
+        return trc;
 
     int res = readlink(real_path, buf, size - 1);
     if (res < 0)
@@ -454,7 +465,9 @@ static int fuse_proc_open(const char *path, struct fuse_file_info *fi)
         return -EACCES;
 
     char real_path[PATH_MAX];
-    translate_proc_path(path, real_path, sizeof(real_path));
+    int trc = translate_proc_path(path, real_path, sizeof(real_path));
+    if (trc < 0)
+        return trc;
 
     int fd = open(real_path, fi->flags & ~(O_CREAT | O_EXCL | O_TRUNC));
     if (fd < 0)
@@ -471,7 +484,9 @@ static int fuse_proc_write(const char *path, const char *buf, size_t size,
         return -EACCES;
 
     char real_path[PATH_MAX];
-    translate_proc_path(path, real_path, sizeof(real_path));
+    int trc = translate_proc_path(path, real_path, sizeof(real_path));
+    if (trc < 0)
+        return trc;
 
     int fd = (int)fi->fh;
     if (fd <= 0) {
@@ -495,7 +510,9 @@ static int fuse_proc_truncate(const char *path, off_t size,
         return -EACCES;
 
     char real_path[PATH_MAX];
-    translate_proc_path(path, real_path, sizeof(real_path));
+    int trc = translate_proc_path(path, real_path, sizeof(real_path));
+    if (trc < 0)
+        return trc;
 
     int res = truncate(real_path, size);
     if (res < 0)
@@ -528,7 +545,6 @@ KleeFuseProc *klee_fuse_proc_create(KleeProcessTable *pt, KleeSandbox *sb)
 
     fp->proctable = pt;
     fp->sandbox = sb;
-    fp->fuse_fd = -1;
 
     snprintf(fp->mount_path, sizeof(fp->mount_path),
              "/tmp/klee-proc-%d", getpid());
@@ -539,29 +555,30 @@ KleeFuseProc *klee_fuse_proc_create(KleeProcessTable *pt, KleeSandbox *sb)
         return NULL;
     }
 
-    /* Try allow_other first (requires user_allow_other in /etc/fuse.conf),
-     * fall back without it for same-user access */
+    /* Try allow_other first (requires user_allow_other in /etc/fuse.conf).
+     * allow_other is rejected at mount time, not at fuse_new, so the
+     * fallback retries the whole create+mount without it. */
+    struct fuse *fuse = NULL;
     char *argv_ao[] = { "klee-fuse", "-o", "allow_other", NULL };
-    struct fuse_args args = FUSE_ARGS_INIT(3, argv_ao);
+    char *argv_plain[] = { "klee-fuse", NULL };
+    struct fuse_args arg_sets[] = {
+        FUSE_ARGS_INIT(3, argv_ao),
+        FUSE_ARGS_INIT(1, argv_plain),
+    };
 
-    struct fuse *fuse = fuse_new(&args, &fuse_proc_ops,
-                                  sizeof(fuse_proc_ops), fp);
-    if (!fuse) {
-        /* Retry without allow_other */
-        char *argv_plain[] = { "klee-fuse", NULL };
-        struct fuse_args args2 = FUSE_ARGS_INIT(1, argv_plain);
-        fuse = fuse_new(&args2, &fuse_proc_ops, sizeof(fuse_proc_ops), fp);
-        if (!fuse) {
-            KLEE_WARN("failed to create FUSE session");
-            rmdir(fp->mount_path);
-            free(fp);
-            return NULL;
-        }
+    for (size_t i = 0; i < sizeof(arg_sets) / sizeof(arg_sets[0]); i++) {
+        fuse = fuse_new(&arg_sets[i], &fuse_proc_ops,
+                        sizeof(fuse_proc_ops), fp);
+        if (!fuse)
+            continue;
+        if (fuse_mount(fuse, fp->mount_path) == 0)
+            break;
+        fuse_destroy(fuse);
+        fuse = NULL;
     }
 
-    if (fuse_mount(fuse, fp->mount_path) < 0) {
+    if (!fuse) {
         KLEE_WARN("failed to mount FUSE at %s", fp->mount_path);
-        fuse_destroy(fuse);
         rmdir(fp->mount_path);
         free(fp);
         return NULL;
@@ -569,7 +586,6 @@ KleeFuseProc *klee_fuse_proc_create(KleeProcessTable *pt, KleeSandbox *sb)
 
     fp->fuse = fuse;
     fp->se = fuse_get_session(fuse);
-    fp->fuse_fd = fuse_session_fd(fp->se);
 
     /* Start FUSE processing thread */
     if (pthread_create(&fp->fuse_thread, NULL, fuse_loop_thread, fp) != 0) {
@@ -590,14 +606,17 @@ void klee_fuse_proc_destroy(KleeFuseProc *fp)
 {
     if (!fp)
         return;
+    /* Unmount first: it closes the /dev/fuse fd, which unblocks the loop
+     * thread's blocking read.  fuse_session_exit alone does not wake a
+     * thread parked in the kernel, so joining before unmount deadlocks. */
     if (fp->se)
         fuse_session_exit(fp->se);
+    if (fp->fuse)
+        fuse_unmount(fp->fuse);
     if (fp->thread_started)
         pthread_join(fp->fuse_thread, NULL);
-    if (fp->fuse) {
-        fuse_unmount(fp->fuse);
+    if (fp->fuse)
         fuse_destroy(fp->fuse);
-    }
     rmdir(fp->mount_path);
     free(fp);
 }
@@ -605,25 +624,6 @@ void klee_fuse_proc_destroy(KleeFuseProc *fp)
 const char *klee_fuse_proc_get_path(const KleeFuseProc *fp)
 {
     return fp ? fp->mount_path : NULL;
-}
-
-int klee_fuse_proc_get_fd(const KleeFuseProc *fp)
-{
-    return fp ? fp->fuse_fd : -1;
-}
-
-int klee_fuse_proc_process(KleeFuseProc *fp)
-{
-    if (!fp || !fp->se)
-        return -1;
-
-    struct fuse_buf fbuf = { .mem = NULL };
-    int res = fuse_session_receive_buf(fp->se, &fbuf);
-    if (res <= 0)
-        return res;
-    fuse_session_process_buf(fp->se, &fbuf);
-    free(fbuf.mem);
-    return 0;
 }
 
 #else /* !HAVE_FUSE3 */
@@ -641,8 +641,6 @@ KleeFuseProc *klee_fuse_proc_create(KleeProcessTable *pt, KleeSandbox *sb)
 
 void klee_fuse_proc_destroy(KleeFuseProc *fp) { free(fp); }
 const char *klee_fuse_proc_get_path(const KleeFuseProc *fp) { (void)fp; return NULL; }
-int klee_fuse_proc_get_fd(const KleeFuseProc *fp) { (void)fp; return -1; }
-int klee_fuse_proc_process(KleeFuseProc *fp) { (void)fp; return -1; }
 
 #endif /* HAVE_FUSE3 */
 
@@ -765,7 +763,9 @@ void klee_proc_snapshot_refresh(const char *snapshot_path,
     if (!dp)
         return;
 
-    /* Remove stale virtual PID directories */
+    /* Remove stale virtual PID directories and their mount entries.
+     * Leaving the mount entry behind would keep translating
+     * /proc/<vpid> to a dead (and possibly recycled) host PID. */
     struct dirent *de;
     while ((de = readdir(dp)) != NULL) {
         if (!is_all_digits(de->d_name))
@@ -777,6 +777,11 @@ void klee_proc_snapshot_refresh(const char *snapshot_path,
             snprintf(dir_path, sizeof(dir_path), "%s/%s",
                      snapshot_path, de->d_name);
             rmdir(dir_path);
+            if (mt) {
+                char guest[64];
+                snprintf(guest, sizeof(guest), "/proc/%d", vpid);
+                klee_mount_table_remove(mt, guest);
+            }
         }
     }
     closedir(dp);

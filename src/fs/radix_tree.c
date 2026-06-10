@@ -29,10 +29,21 @@ KleeRadixTree *klee_radix_create(KleeArena *arena)
     RadixNode *root;
     if (arena) {
         root = klee_arena_calloc(arena, 1, sizeof(RadixNode));
-        root->component = klee_arena_strdup(arena, "");
     } else {
         root = calloc(1, sizeof(RadixNode));
-        root->component = strdup("");
+    }
+    if (!root) {
+        if (!arena)
+            free(tree);
+        return NULL;
+    }
+    root->component = arena ? klee_arena_strdup(arena, "") : strdup("");
+    if (!root->component) {
+        if (!arena) {
+            free(root);
+            free(tree);
+        }
+        return NULL;
     }
     root->component_len = 0;
     tree->root = root;
@@ -74,13 +85,20 @@ static RadixNode *find_or_create_child(KleeRadixTree *tree, RadixNode *parent,
     RadixNode *node;
     if (tree->arena) {
         node = klee_arena_calloc(tree->arena, 1, sizeof(RadixNode));
-        node->component = klee_arena_strndup(tree->arena, component, len);
     } else {
         node = calloc(1, sizeof(RadixNode));
-        node->component = strndup(component, len);
     }
     if (!node)
         return NULL;
+
+    node->component = tree->arena ?
+        klee_arena_strndup(tree->arena, component, len) :
+        strndup(component, len);
+    if (!node->component) {
+        if (!tree->arena)
+            free(node);
+        return NULL;
+    }
 
     node->component_len = len;
 
@@ -105,8 +123,12 @@ RadixNode *klee_radix_insert(KleeRadixTree *tree, const char *path,
     /* For root path "/" */
     const char *comp = next_component(p, &comp_len);
     if (!comp) {
-        /* Mounting at root */
-        current->mount = mount;
+        /* Mounting at root: stack like any other path */
+        if (mount) {
+            if (current->mount)
+                mount->stacked = current->mount;
+            current->mount = mount;
+        }
         return current;
     }
 

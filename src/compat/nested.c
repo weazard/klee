@@ -140,7 +140,10 @@ static int expand_args_fds(pid_t pid, int argc, char **argv,
             char tmp[4096];
             ssize_t n;
             while ((n = read(local_fd, tmp, sizeof(tmp))) > 0) {
-                char *new_buf = realloc(buf, buf_len + (size_t)n);
+                /* +1 leaves room for a terminating NUL: the strlen-based
+                 * split below must not run past the buffer if the args
+                 * file doesn't end with a NUL byte. */
+                char *new_buf = realloc(buf, buf_len + (size_t)n + 1);
                 if (!new_buf) {
                     free(buf);
                     close(local_fd);
@@ -150,6 +153,7 @@ static int expand_args_fds(pid_t pid, int argc, char **argv,
                 buf = new_buf;
                 memcpy(buf + buf_len, tmp, (size_t)n);
                 buf_len += (size_t)n;
+                buf[buf_len] = '\0';
             }
             close(local_fd);
 

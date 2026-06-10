@@ -113,8 +113,10 @@ static int resolve_components(ResolveState *state, const char *path)
 
             if (strlen(state->guest_path) > strlen(boundary))
                 path_pop(state->guest_path);
-            else if (state->ctx->flags & (KLEE_RESOLVE_BENEATH | KLEE_RESOLVE_IN_ROOT))
+            else if (state->ctx->flags & KLEE_RESOLVE_BENEATH)
                 return -EXDEV;
+            /* RESOLVE_IN_ROOT clamps ".." at the root (chroot
+             * semantics) instead of rejecting it */
             continue;
         }
 
@@ -217,9 +219,9 @@ static int resolve_components(ResolveState *state, const char *path)
 
         /* Check RESOLVE_NO_XDEV - detect mount point crossings */
         if (state->ctx->flags & KLEE_RESOLVE_NO_XDEV) {
-            /* If the component crosses to a different mount, that's
-             * a device boundary in Klee's model. Check if the resolved
-             * host path is on a different device than the parent. */
+            /* Compare host device numbers of the parent and this
+             * component after translation; a change means resolution
+             * crossed onto a different filesystem. */
             char parent_path[PATH_MAX];
             snprintf(parent_path, sizeof(parent_path), "%s", state->guest_path);
             path_pop(parent_path);
@@ -246,6 +248,11 @@ static int resolve_symlink(ResolveState *state, const char *link_target,
     char combined[PATH_MAX * 2];
 
     if (link_target[0] == '/') {
+        /* RESOLVE_BENEATH rejects absolute symlinks outright; they
+         * would restart resolution outside the dirfd subtree. */
+        if (state->ctx->flags & KLEE_RESOLVE_BENEATH)
+            return -EXDEV;
+
         /* RESOLVE_NO_MAGICLINKS: reject magic proc symlinks */
         if (state->ctx->flags & KLEE_RESOLVE_NO_MAGICLINKS) {
             /* Check if the host path is under /proc - magic symlinks */
@@ -283,7 +290,7 @@ int klee_path_resolve(KleeResolveCtx *ctx, const char *guest_path,
         /* Absolute path */
         const char *vroot = ctx->vroot ? ctx->vroot : "/";
         snprintf(state.guest_path, PATH_MAX, "%s", vroot);
-    } else if (dirfd == AT_FDCWD || dirfd == -100) {
+    } else if (dirfd == AT_FDCWD) {
         /* Relative to vcwd */
         if (ctx->vcwd)
             snprintf(state.guest_path, PATH_MAX, "%s", ctx->vcwd);

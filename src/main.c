@@ -209,6 +209,12 @@ int main(int argc, char **argv)
      * terminal foreground process group via tcsetpgrp(). */
     signal(SIGTTOU, SIG_IGN);
 
+    /* Reset SIGCHLD in case the parent ignored it (e.g. Erlang);
+     * an inherited SIG_IGN makes the kernel auto-reap children,
+     * breaking the waitpid()-based child management (upstream
+     * bubblewrap 0.11.1 fix). */
+    signal(SIGCHLD, SIG_DFL);
+
     /* Parse CLI */
     KleeConfig cfg;
     klee_config_init(&cfg);
@@ -323,6 +329,7 @@ int main(int argc, char **argv)
                 if (tmp_path) {
                     klee_mount_table_add(mount_table, MOUNT_TMPFS, tmp_path,
                                           "/tmp", false, 01777);
+                    free(tmp_path);
                     KLEE_INFO("auto-provisioned private /tmp "
                               "(real uid=%d != virtual uid=%d)",
                               real_uid, virt_uid);

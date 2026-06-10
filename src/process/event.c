@@ -216,6 +216,8 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
         proc->seccomp_entered = el->interceptor->backend == INTERCEPT_PTRACE &&
                                  el->interceptor->ptrace.seccomp_filter;
         proc->path_arg_count = 0;
+        proc->path_modified = false;
+        proc->syscall_suppressed = false;
         proc->deny_errno = 0;
         proc->resolved_guest[0] = '\0';
         klee_arena_reset(proc->event_arena);
@@ -225,8 +227,23 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
             /* Deny the syscall: for ptrace, replace with invalid syscall
              * (-1 → kernel returns ENOSYS) and store the real errno to
              * override at the exit stop. */
+            proc->syscall_suppressed = true;
             proc->deny_errno = -rc;
             el->interceptor->respond(el->interceptor, event, -1, -rc);
+            return 0;
+        }
+        if (rc > 0) {
+            /* The handler emulated the syscall: suppress the real one and
+             * make the tracee see success (retval 0). */
+            proc->syscall_suppressed = true;
+            if (el->interceptor->backend == INTERCEPT_SECCOMP_UNOTIFY) {
+                event->emulated = true;
+                el->interceptor->respond(el->interceptor, event, 0, 0);
+            } else {
+                el->interceptor->skip_syscall(el->interceptor, event->pid, 0);
+                el->interceptor->continue_syscall(el->interceptor,
+                                                   event->pid, 0);
+            }
             return 0;
         }
         /* Continue the syscall */
@@ -245,17 +262,26 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
         /* Consolidate all register modifications into a single push */
         bool need_reg_push = false;
 
-        /* If the syscall was denied on enter, override the return value
-         * (kernel returned ENOSYS for the invalid -1 syscall) with the
-         * actual errno we want the tracee to see. */
-        if (proc->deny_errno && el->interceptor->backend == INTERCEPT_PTRACE) {
+        /* If the syscall was suppressed on enter (denied or emulated),
+         * override the return value (kernel returned ENOSYS for the
+         * invalid -1 syscall) with the result the tracee should see,
+         * and restore any rewritten path-arg registers. */
+        if (proc->syscall_suppressed &&
+            el->interceptor->backend == INTERCEPT_PTRACE) {
             klee_regs_fetch(el->interceptor, proc);
             klee_regs_set_result(proc, (long)-proc->deny_errno);
-            need_reg_push = true;
+            if (proc->path_modified) {
+                for (int i = 0; i < proc->path_arg_count; i++) {
+                    int idx = proc->path_arg_idx[i];
+                    klee_regs_set_arg(proc, idx, proc->saved_args[idx]);
+                }
+                proc->path_arg_count = 0;
+                proc->path_modified = false;
+            }
+            klee_regs_push(el->interceptor, proc);
+            proc->syscall_suppressed = false;
             proc->deny_errno = 0;
-            /* Skip normal exit dispatch — syscall was denied */
-            if (need_reg_push)
-                klee_regs_push(el->interceptor, proc);
+            /* Skip normal exit dispatch — the syscall never ran */
             proc->state = PROC_STATE_RUNNING;
             el->interceptor->continue_running(el->interceptor, event->pid, 0);
             break;

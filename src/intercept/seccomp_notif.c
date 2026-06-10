@@ -37,11 +37,30 @@
 #define SECCOMP_ADDFD_FLAG_SETFD (1UL << 0)
 #endif
 
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
+#ifndef SYS_pidfd_getfd
+#define SYS_pidfd_getfd 438
+#endif
+
+/*
+ * Confirm the notification being serviced is still alive.  If the target
+ * died, its PID may have been recycled and /proc/<pid>/mem could belong
+ * to an unrelated process (see seccomp_unotify(2) "Caveats").
+ */
+static int notif_still_valid(KleeInterceptor *self)
+{
+    uint64_t id = self->seccomp.cur_notif_id;
+    if (ioctl(self->seccomp.notif_fd, SECCOMP_IOCTL_NOTIF_ID_VALID, &id) < 0)
+        return -ESRCH;
+    return 0;
+}
+
 /* Read memory from tracee using /proc/pid/mem */
 static int seccomp_read_mem(KleeInterceptor *self, pid_t pid,
                             void *local, const void *remote, size_t len)
 {
-    (void)self;
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/mem", pid);
 
@@ -58,14 +77,13 @@ static int seccomp_read_mem(KleeInterceptor *self, pid_t pid,
         return -errno;
     if ((size_t)n != len)
         return -EIO;
-    return 0;
+    return notif_still_valid(self);
 }
 
 /* Write memory to tracee using /proc/pid/mem */
 static int seccomp_write_mem(KleeInterceptor *self, pid_t pid,
                              const void *remote, const void *local, size_t len)
 {
-    (void)self;
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/mem", pid);
 
@@ -82,34 +100,32 @@ static int seccomp_write_mem(KleeInterceptor *self, pid_t pid,
         return -errno;
     if ((size_t)n != len)
         return -EIO;
-    return 0;
+    return notif_still_valid(self);
 }
 
 /* Wait for a seccomp notification event */
 static int seccomp_wait_event(KleeInterceptor *self, KleeEvent *out)
 {
-    struct seccomp_notif *notif;
-    struct seccomp_notif_sizes sizes;
-
     memset(out, 0, sizeof(*out));
 
-    /* Get notification sizes */
-    if (syscall(SYS_seccomp, SECCOMP_GET_NOTIF_SIZES, 0, &sizes) < 0) {
-        /* Fallback to compile-time size */
-        sizes.seccomp_notif = sizeof(struct seccomp_notif);
+    /* Allocate the kernel-sized notification buffer once and reuse it */
+    if (!self->seccomp.notif_buf) {
+        struct seccomp_notif_sizes sizes;
+        if (syscall(SYS_seccomp, SECCOMP_GET_NOTIF_SIZES, 0, &sizes) < 0)
+            sizes.seccomp_notif = sizeof(struct seccomp_notif);
+        if (sizes.seccomp_notif < sizeof(struct seccomp_notif))
+            sizes.seccomp_notif = sizeof(struct seccomp_notif);
+        self->seccomp.notif_buf = calloc(1, sizes.seccomp_notif);
+        if (!self->seccomp.notif_buf)
+            return -ENOMEM;
+        self->seccomp.notif_buf_size = sizes.seccomp_notif;
     }
 
-    notif = calloc(1, sizes.seccomp_notif);
-    if (!notif)
-        return -ENOMEM;
+    struct seccomp_notif *notif = self->seccomp.notif_buf;
+    memset(notif, 0, self->seccomp.notif_buf_size);
 
-    if (ioctl(self->seccomp.notif_fd, SECCOMP_IOCTL_NOTIF_RECV, notif) < 0) {
-        int err = errno;
-        free(notif);
-        if (err == EINTR)
-            return -EINTR;
-        return -err;
-    }
+    if (ioctl(self->seccomp.notif_fd, SECCOMP_IOCTL_NOTIF_RECV, notif) < 0)
+        return -errno;
 
     out->type = KLEE_EVENT_SYSCALL_ENTER;
     out->pid = notif->pid;
@@ -118,7 +134,7 @@ static int seccomp_wait_event(KleeInterceptor *self, KleeEvent *out)
     for (int i = 0; i < 6; i++)
         out->args[i] = notif->data.args[i];
 
-    free(notif);
+    self->seccomp.cur_notif_id = notif->id;
     return 0;
 }
 
@@ -132,7 +148,8 @@ static int seccomp_respond(KleeInterceptor *self, KleeEvent *event,
     resp.id = event->notif_id;
     resp.val = retval;
     resp.error = err ? -err : 0;
-    resp.flags = (err == 0 && retval == 0) ? SECCOMP_USER_NOTIF_FLAG_CONTINUE : 0;
+    resp.flags = (err == 0 && retval == 0 && !event->emulated)
+                     ? SECCOMP_USER_NOTIF_FLAG_CONTINUE : 0;
 
     if (ioctl(self->seccomp.notif_fd, SECCOMP_IOCTL_NOTIF_SEND, &resp) < 0) {
         if (errno == ENOENT) {
@@ -144,27 +161,20 @@ static int seccomp_respond(KleeInterceptor *self, KleeEvent *event,
     return 0;
 }
 
-/* Continue syscall (let it proceed normally) */
+/*
+ * No-op continuation hooks.  Unlike ptrace, seccomp_unotify has no
+ * per-stop resume step: everything goes through respond() with the
+ * notification id.  These exist only to satisfy the backend interface.
+ */
 static int seccomp_continue(KleeInterceptor *self, pid_t pid, int signal)
 {
-    (void)signal;
-    struct seccomp_notif_resp resp;
-    memset(&resp, 0, sizeof(resp));
-    resp.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
-
-    /* For seccomp_unotify, we need the notif_id to continue.
-     * This is a simplified version - real usage stores the event */
-    (void)self;
-    (void)pid;
+    (void)self; (void)pid; (void)signal;
     return 0;
 }
 
 static int seccomp_skip(KleeInterceptor *self, pid_t pid, long retval)
 {
-    (void)self;
-    (void)pid;
-    (void)retval;
-    /* For seccomp_unotify, skipping is done via respond() with the desired retval */
+    (void)self; (void)pid; (void)retval;
     return 0;
 }
 
@@ -174,13 +184,32 @@ static void seccomp_destroy(KleeInterceptor *self)
         close(self->seccomp.notif_fd);
     if (self->seccomp.listener_fd >= 0)
         close(self->seccomp.listener_fd);
+    if (self->seccomp.fd_pipe[0] >= 0)
+        close(self->seccomp.fd_pipe[0]);
+    if (self->seccomp.fd_pipe[1] >= 0)
+        close(self->seccomp.fd_pipe[1]);
+    free(self->seccomp.notif_buf);
     free(self);
 }
 
 int klee_seccomp_notif_available(void)
 {
     struct seccomp_notif_sizes sizes;
-    return syscall(SYS_seccomp, SECCOMP_GET_NOTIF_SIZES, 0, &sizes) == 0;
+    if (syscall(SYS_seccomp, SECCOMP_GET_NOTIF_SIZES, 0, &sizes) != 0)
+        return 0;
+
+    /* The parent fetches the child's listener fd with pidfd_getfd
+     * (kernel 5.6+); without it we must fall back to ptrace.
+     * Probe by duplicating one of our own fds. */
+    int pidfd = (int)syscall(SYS_pidfd_open, getpid(), 0);
+    if (pidfd < 0)
+        return 0;
+    int fd = (int)syscall(SYS_pidfd_getfd, pidfd, 0, 0);
+    close(pidfd);
+    if (fd < 0)
+        return 0;
+    close(fd);
+    return 1;
 }
 
 KleeInterceptor *klee_seccomp_notif_create(void)
@@ -193,9 +222,16 @@ KleeInterceptor *klee_seccomp_notif_create(void)
     ic->seccomp.notif_fd = -1;
     ic->seccomp.listener_fd = -1;
 
+    /* Channel for the child to publish its listener fd number */
+    if (pipe2(ic->seccomp.fd_pipe, O_CLOEXEC) < 0) {
+        free(ic);
+        return NULL;
+    }
+
     ic->wait_event = seccomp_wait_event;
     ic->respond = seccomp_respond;
     ic->continue_syscall = seccomp_continue;
+    ic->continue_running = seccomp_continue;
     ic->skip_syscall = seccomp_skip;
     ic->read_mem = seccomp_read_mem;
     ic->write_mem = seccomp_write_mem;

@@ -47,6 +47,10 @@ int klee_mount_table_add(KleeMountTable *mt, MountType type,
                           const char *source, const char *dest,
                           bool readonly, int perms);
 
+/* Remove the mount exactly at dest (pops one entry off the shadow stack).
+ * Returns 0 on success, -ENOENT if no mount exists at dest. */
+int klee_mount_table_remove(KleeMountTable *mt, const char *dest);
+
 /* Resolve a guest path to the best matching mount.
  * Returns the mount entry, or NULL if no mount matches. */
 KleeMount *klee_mount_table_resolve(const KleeMountTable *mt,

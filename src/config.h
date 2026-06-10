@@ -61,12 +61,6 @@ typedef struct klee_env_op {
     struct klee_env_op *next;
 } KleeEnvOp;
 
-/* Legacy compat - still used in some places */
-typedef struct klee_setenv_pair {
-    char *key;
-    char *value;
-} KleeSetenvPair;
-
 typedef struct klee_config {
     /* Namespace flags */
     bool unshare_user;
@@ -117,13 +111,6 @@ typedef struct klee_config {
     KleeEnvOp *env_ops;
     KleeEnvOp *env_ops_tail;
 
-    /* Legacy fields kept for compat */
-    KleeSetenvPair *setenv_pairs;
-    int setenv_count;
-    char **unsetenv_keys;
-    int unsetenv_count;
-    bool clearenv;
-
     /* Capabilities */
     char **cap_add;
     int cap_add_count;
@@ -145,11 +132,11 @@ typedef struct klee_config {
     char **argv;
     char *argv0;             /* --argv0 override */
 
-    /* Share net (overrides unshare_net) */
-    bool share_net;
-
     /* Disable userns */
     bool disable_userns;
+
+    /* Treat sandbox setup failures as warnings (upstream bwrap 0.12) */
+    bool not_a_security_boundary;
 
     /* Assert userns disabled */
     bool assert_userns_disabled;

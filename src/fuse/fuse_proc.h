@@ -20,12 +20,6 @@ void klee_fuse_proc_destroy(KleeFuseProc *fp);
 /* Get the FUSE mount path */
 const char *klee_fuse_proc_get_path(const KleeFuseProc *fp);
 
-/* Get the FUSE file descriptor for epoll integration */
-int klee_fuse_proc_get_fd(const KleeFuseProc *fp);
-
-/* Process pending FUSE events */
-int klee_fuse_proc_process(KleeFuseProc *fp);
-
 /* Create a tmpfs-based /proc snapshot with filtered PIDs.
  * Fallback for when FUSE is unavailable. Creates a tmpfs directory
  * for ls listing, plus mount table entries that bind virtual PID

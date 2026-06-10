@@ -34,6 +34,8 @@ typedef struct {
     int signal;
     uint64_t notif_id;     /* seccomp_unotify notification ID */
     pid_t new_child_pid;   /* for fork/clone events */
+    bool emulated;         /* respond(retval=0, err=0) means "emulated success",
+                              not "continue" (seccomp_unotify disambiguation) */
 } KleeEvent;
 
 typedef struct klee_interceptor KleeInterceptor;
@@ -46,6 +48,12 @@ struct klee_interceptor {
         struct {
             int notif_fd;
             int listener_fd;
+            int fd_pipe[2];        /* child writes its listener fd number;
+                                      parent fetches it via pidfd_getfd */
+            uint64_t cur_notif_id; /* notification currently being serviced
+                                      (validated against PID-reuse races) */
+            void *notif_buf;       /* reusable NOTIF_RECV buffer */
+            size_t notif_buf_size;
         } seccomp;
         struct {
             unsigned long options;

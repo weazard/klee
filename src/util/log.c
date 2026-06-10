@@ -64,7 +64,6 @@ static KleeLogLevel parse_file_log_level(void)
     return LOG_DEBUG;
 }
 
-/* Recursive mkdir -p with world-writable base (multi-user safe) */
 static void mkdirp(const char *path)
 {
     char tmp[PATH_MAX];
@@ -72,11 +71,11 @@ static void mkdirp(const char *path)
     for (char *p = tmp + 1; *p; p++) {
         if (*p == '/') {
             *p = '\0';
-            mkdir(tmp, 0777);
+            mkdir(tmp, 0700);
             *p = '/';
         }
     }
-    mkdir(tmp, 0777);
+    mkdir(tmp, 0700);
 }
 
 void klee_log_open_file(const char *app_name, pid_t pid)
@@ -86,8 +85,15 @@ void klee_log_open_file(const char *app_name, pid_t pid)
         return;  /* KLEE_FILE_LOG=off */
 
     const char *log_dir = getenv("KLEE_LOG_DIR");
-    if (!log_dir || !log_dir[0])
-        log_dir = "/tmp/klee-logs";
+    char default_dir[64];
+    if (!log_dir || !log_dir[0]) {
+        /* Per-user directory: a shared world-writable /tmp/klee-logs
+         * would let other users plant entries or race the "latest"
+         * symlink. */
+        snprintf(default_dir, sizeof(default_dir), "/tmp/klee-logs-%d",
+                 (int)getuid());
+        log_dir = default_dir;
+    }
 
     /* Sanitize app name — use only the basename, replace weird chars */
     const char *base = strrchr(app_name, '/');

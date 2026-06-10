@@ -180,6 +180,27 @@ static void get_dev_numbers(const KleeMount *m, int mount_id,
     *minor_out = (unsigned int)(mount_id + 50);
 }
 
+/*
+ * Escape a path for mountinfo the way the kernel does: space, tab,
+ * newline and backslash become octal escapes (\040 etc.) so parsers
+ * can split fields on whitespace.
+ */
+static void escape_path(const char *src, char *dst, size_t dst_size)
+{
+    size_t o = 0;
+    for (const char *p = src; *p && o + 1 < dst_size; p++) {
+        if (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\\') {
+            if (o + 5 > dst_size)
+                break;
+            o += (size_t)snprintf(dst + o, dst_size - o, "\\%03o",
+                                  (unsigned char)*p);
+        } else {
+            dst[o++] = *p;
+        }
+    }
+    dst[o] = '\0';
+}
+
 /* Walk the radix tree and generate mountinfo entries */
 static int walk_node(const RadixNode *node, const char *prefix,
                       int parent_id,
@@ -197,8 +218,10 @@ static int walk_node(const RadixNode *node, const char *prefix,
     if (node->mount) {
         KleeMount *m = node->mount;
         this_id = *mount_id;
-        const char *mount_point = m->dest ? m->dest : path;
-        const char *root_field = get_root_field(m);
+        char mount_point[PATH_MAX], root_field[PATH_MAX];
+        escape_path(m->dest ? m->dest : path, mount_point,
+                    sizeof(mount_point));
+        escape_path(get_root_field(m), root_field, sizeof(root_field));
         const char *fstype = get_fstype(m);
         const char *mount_source = get_mount_source(m);
 

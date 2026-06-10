@@ -3,6 +3,7 @@
  * Pool-based arena allocator implementation
  */
 #include "util/arena.h"
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -80,6 +81,8 @@ void *klee_arena_alloc(KleeArena *arena, size_t size)
 
 void *klee_arena_calloc(KleeArena *arena, size_t count, size_t size)
 {
+    if (size != 0 && count > SIZE_MAX / size)
+        return NULL;
     size_t total = count * size;
     void *ptr = klee_arena_alloc(arena, total);
     if (ptr)
@@ -116,7 +119,7 @@ void klee_arena_reset(KleeArena *arena)
     if (!arena)
         return;
 
-    /* Reset all blocks to unused, keep the first one as current */
+    /* Mark all blocks unused and resume allocating from the list head */
     for (KleeArenaBlock *b = arena->blocks; b; b = b->next)
         b->used = 0;
 

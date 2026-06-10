@@ -29,6 +29,8 @@ static int free_process_iter(uint64_t key, void *value, void *ctx)
     (void)key;
     (void)ctx;
     KleeProcess *proc = value;
+    if (proc->sandbox)
+        klee_sandbox_unref(proc->sandbox);
     if (proc->event_arena)
         klee_arena_destroy(proc->event_arena);
     if (proc->life_arena)
@@ -147,8 +149,13 @@ KleeProcess *klee_process_fork(KleeProcessTable *pt, KleeProcess *parent,
     memcpy(child->vexe, parent->vexe, PATH_MAX);
 
     /* Clone FD table */
+    KleeFdTable *cloned = klee_fd_table_clone(parent->fd_table);
+    if (!cloned) {
+        klee_process_remove(pt, child_real_pid);
+        return NULL;
+    }
     klee_fd_table_destroy(child->fd_table);
-    child->fd_table = klee_fd_table_clone(parent->fd_table);
+    child->fd_table = cloned;
 
     /* Link into process tree */
     child->parent = parent;

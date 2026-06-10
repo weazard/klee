@@ -6,8 +6,9 @@
  * model.  When Zypak uses the "mimic" strategy, it delegates child
  * launches to flatpak-spawn, which spawns children via the Flatpak
  * portal — OUTSIDE KLEE's process supervision.  This module detects
- * Zypak, forces the mimic strategy, intercepts flatpak-spawn execve
- * calls, and runs the target command directly inside KLEE's tree.
+ * Zypak, exposes its binaries/libraries in the sandbox, intercepts
+ * flatpak-spawn execve calls, and runs the target command directly
+ * inside KLEE's tree.
  */
 #ifndef KLEE_ZYPAK_COMPAT_H
 #define KLEE_ZYPAK_COMPAT_H

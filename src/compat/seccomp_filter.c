@@ -8,6 +8,8 @@
  * through to the child's original filter for everything else.
  */
 #include "compat/seccomp_filter.h"
+#include "intercept/filter.h"
+#include "process/regs.h"
 #include "syscall/sysnum.h"
 #include "util/log.h"
 
@@ -39,9 +41,9 @@
 static struct sock_fprog *rewrite_child_filter(const struct sock_fprog *orig)
 {
     /* Get the list of intercepted syscalls */
-    int syscalls[KLEE_INTERCEPTED_SYSCALL_COUNT];
+    int syscalls[KLEE_MAX_INTERCEPTED_SYSCALLS];
     int count = klee_get_intercepted_syscalls(syscalls,
-                                               KLEE_INTERCEPTED_SYSCALL_COUNT);
+                                               KLEE_MAX_INTERCEPTED_SYSCALLS);
     if (count <= 0) {
         KLEE_WARN("seccomp rewrite: no intercepted syscalls");
         return NULL;
@@ -113,8 +115,9 @@ static struct sock_fprog *rewrite_child_filter(const struct sock_fprog *orig)
     return result;
 }
 
-int klee_compat_handle_seccomp_filter(KleeInterceptor *ic, pid_t pid,
-                                       struct sock_fprog *prog)
+int klee_compat_handle_seccomp_filter(KleeProcess *proc, KleeInterceptor *ic,
+                                       KleeEvent *ev,
+                                       const struct sock_fprog *prog)
 {
     if (!prog || !prog->filter || prog->len == 0) {
         KLEE_WARN("child seccomp filter: empty program");
@@ -122,56 +125,68 @@ int klee_compat_handle_seccomp_filter(KleeInterceptor *ic, pid_t pid,
     }
 
     KLEE_DEBUG("child seccomp filter: %d instructions from pid %d",
-               prog->len, pid);
+               prog->len, ev->pid);
 
     /*
      * For seccomp_unotify backend: child filters don't interfere with
      * the supervisor's notification mechanism, as USER_NOTIF takes priority
      * over other actions in the filter chain.
      */
-    if (ic->backend == INTERCEPT_SECCOMP_UNOTIFY)
+    if (ic->backend != INTERCEPT_PTRACE)
         return 0; /* Allow as-is */
 
     /*
      * For ptrace backend: child filters could potentially KILL syscalls
      * before ptrace sees them. Rewrite the child's BPF to exempt klee's
      * intercepted syscalls by prepending SECCOMP_RET_TRACE instructions.
+     *
+     * The combined filter is larger than the child's original, so it must
+     * NOT be written over the child's buffer.  Instead, place both the
+     * instructions and a fresh sock_fprog in scratch memory below the
+     * tracee's stack pointer and repoint the syscall argument at it.
      */
-    if (ic->backend == INTERCEPT_PTRACE) {
-        struct sock_fprog *rewritten = rewrite_child_filter(prog);
-        if (!rewritten) {
-            KLEE_WARN("child installing seccomp filter under ptrace - "
-                       "rewrite failed, allowing original filter");
-            return 0;
-        }
-
-        /* Write the rewritten filter back to tracee memory.
-         * We overwrite the original sock_fprog structure that the child
-         * passed to the seccomp syscall. The child's memory at prog->filter
-         * is reused if large enough, otherwise we write to a new location. */
-
-        /* Write the new filter instructions to tracee */
-        size_t filter_size = rewritten->len * sizeof(struct sock_filter);
-        int rc = ic->write_mem(ic, pid, prog->filter, rewritten->filter,
-                                filter_size);
-        if (rc < 0) {
-            KLEE_WARN("seccomp rewrite: failed to write filter to tracee: %d", rc);
-            free(rewritten->filter);
-            free(rewritten);
-            return 0;
-        }
-
-        /* Update the filter length in the tracee's sock_fprog */
-        unsigned short new_len = rewritten->len;
-        rc = ic->write_mem(ic, pid, &prog->len, &new_len, sizeof(new_len));
-        if (rc < 0)
-            KLEE_WARN("seccomp rewrite: failed to update filter len: %d", rc);
-
-        free(rewritten->filter);
-        free(rewritten);
-        KLEE_INFO("seccomp rewrite: successfully rewrote child filter for pid %d", pid);
+    struct sock_fprog *rewritten = rewrite_child_filter(prog);
+    if (!rewritten) {
+        KLEE_WARN("child installing seccomp filter under ptrace - "
+                   "rewrite failed, allowing original filter");
         return 0;
     }
 
-    return 0; /* Allow */
+    klee_regs_fetch(ic, proc);
+    uint64_t rsp = klee_regs_get_sp(proc);
+
+    size_t filter_size = rewritten->len * sizeof(struct sock_filter);
+    uint64_t fprog_addr = (rsp - 128 - sizeof(struct sock_fprog)) & ~7ULL;
+    uint64_t filter_addr = (fprog_addr - filter_size) & ~7ULL;
+
+    int rc = ic->write_mem(ic, ev->pid, (void *)(uintptr_t)filter_addr,
+                            rewritten->filter, filter_size);
+    if (rc == 0) {
+        struct sock_fprog new_prog = {
+            .len = rewritten->len,
+            .filter = (struct sock_filter *)(uintptr_t)filter_addr,
+        };
+        rc = ic->write_mem(ic, ev->pid, (void *)(uintptr_t)fprog_addr,
+                            &new_prog, sizeof(new_prog));
+    }
+
+    free(rewritten->filter);
+    free(rewritten);
+
+    if (rc < 0) {
+        KLEE_WARN("seccomp rewrite: failed to write filter to tracee: %d", rc);
+        return 0;
+    }
+
+    /* Repoint args[2] (the sock_fprog pointer) at the rewritten program;
+     * the original value is restored at syscall exit. */
+    proc->saved_args[2] = ev->args[2];
+    klee_regs_set_arg(proc, 2, fprog_addr);
+    klee_regs_push(ic, proc);
+    proc->path_arg_idx[proc->path_arg_count++] = 2;
+    proc->path_modified = true;
+
+    KLEE_INFO("seccomp rewrite: successfully rewrote child filter for pid %d",
+              ev->pid);
+    return 0;
 }

@@ -88,7 +88,8 @@ typedef struct klee_process {
 
     /* Current syscall info */
     int current_syscall;
-    int deny_errno;             /* non-zero when syscall was denied on enter */
+    bool syscall_suppressed;    /* syscall was skipped on enter (denied or emulated) */
+    int deny_errno;             /* errno for a suppressed syscall; 0 = fake success */
     bool seccomp_entered;       /* waiting for extra enter-stop after SECCOMP event */
     bool suppress_initial_stop; /* suppress first SIGSTOP after fork (ptrace artifact) */
     uint64_t saved_args[6];
