@@ -21,6 +21,13 @@
 #include <linux/seccomp.h>
 #include <linux/filter.h>
 
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
+#ifndef SYS_pidfd_getfd
+#define SYS_pidfd_getfd 438
+#endif
+
 KleeInterceptor *klee_interceptor_create(void)
 {
 #ifdef HAVE_SECCOMP_UNOTIFY
@@ -47,8 +54,8 @@ int klee_interceptor_install_child(KleeInterceptor *interceptor)
     if (interceptor->backend == INTERCEPT_SECCOMP_UNOTIFY) {
 #ifdef HAVE_SECCOMP_UNOTIFY
         /* Generate BPF filter for USER_NOTIF */
-        int syscalls[KLEE_INTERCEPTED_SYSCALL_COUNT];
-        int count = klee_get_intercepted_syscalls(syscalls, KLEE_INTERCEPTED_SYSCALL_COUNT);
+        int syscalls[KLEE_MAX_INTERCEPTED_SYSCALLS];
+        int count = klee_get_intercepted_syscalls(syscalls, KLEE_MAX_INTERCEPTED_SYSCALLS);
         if (count <= 0) {
             KLEE_ERROR("no syscalls to intercept");
             return -EINVAL;
@@ -78,9 +85,26 @@ int klee_interceptor_install_child(KleeInterceptor *interceptor)
             KLEE_ERROR("seccomp(NEW_LISTENER) failed: %s", strerror(err));
             return -err;
         }
+        klee_bpf_free(&prog);
 
         interceptor->seccomp.listener_fd = fd;
-        klee_bpf_free(&prog);
+
+        /* Publish the fd NUMBER to the parent, which fetches its own
+         * copy via pidfd_getfd.  SCM_RIGHTS can't be used here: sendmsg
+         * is itself an intercepted syscall and would block until the
+         * supervisor services it — which it can't before it has the
+         * listener fd. */
+        if (interceptor->seccomp.fd_pipe[1] >= 0) {
+            if (write(interceptor->seccomp.fd_pipe[1], &fd, sizeof(fd))
+                    != (ssize_t)sizeof(fd))
+                return -EIO;
+            close(interceptor->seccomp.fd_pipe[1]);
+            interceptor->seccomp.fd_pipe[1] = -1;
+        }
+        if (interceptor->seccomp.fd_pipe[0] >= 0) {
+            close(interceptor->seccomp.fd_pipe[0]);
+            interceptor->seccomp.fd_pipe[0] = -1;
+        }
         return 0;
 #else
         return -ENOTSUP;
@@ -136,11 +160,45 @@ int klee_interceptor_install_child(KleeInterceptor *interceptor)
 int klee_interceptor_setup_parent(KleeInterceptor *interceptor, pid_t child_pid)
 {
     if (interceptor->backend == INTERCEPT_SECCOMP_UNOTIFY) {
-        /* The listener fd was obtained in install_child, but it's in the child
-         * process. We need to receive it via SCM_RIGHTS or pidfd_getfd.
-         * For simplicity, we use the listener_fd directly since it was set
-         * before the fork. */
-        interceptor->seccomp.notif_fd = interceptor->seccomp.listener_fd;
+        /* The listener fd exists only in the child (the filter has to be
+         * installed there).  Read its fd number from the pipe and fetch
+         * our own copy with pidfd_getfd. */
+        if (interceptor->seccomp.fd_pipe[1] >= 0) {
+            close(interceptor->seccomp.fd_pipe[1]);
+            interceptor->seccomp.fd_pipe[1] = -1;
+        }
+
+        int child_fd = -1;
+        ssize_t n = -1;
+        if (interceptor->seccomp.fd_pipe[0] >= 0) {
+            do {
+                n = read(interceptor->seccomp.fd_pipe[0],
+                         &child_fd, sizeof(child_fd));
+            } while (n < 0 && errno == EINTR);
+            close(interceptor->seccomp.fd_pipe[0]);
+            interceptor->seccomp.fd_pipe[0] = -1;
+        }
+        if (n != (ssize_t)sizeof(child_fd) || child_fd < 0) {
+            KLEE_ERROR("child did not publish seccomp listener fd");
+            return -EIO;
+        }
+
+        int pidfd = (int)syscall(SYS_pidfd_open, child_pid, 0);
+        if (pidfd < 0) {
+            int err = errno;
+            KLEE_ERROR("pidfd_open(%d) failed: %s",
+                       child_pid, strerror(err));
+            return -err;
+        }
+        int fd = (int)syscall(SYS_pidfd_getfd, pidfd, child_fd, 0);
+        int err = errno;
+        close(pidfd);
+        if (fd < 0) {
+            KLEE_ERROR("pidfd_getfd failed: %s", strerror(err));
+            return -err;
+        }
+
+        interceptor->seccomp.notif_fd = fd;
         return 0;
     } else {
         /* ptrace: wait for child's SIGSTOP, set options (including

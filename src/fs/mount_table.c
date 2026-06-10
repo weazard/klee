@@ -73,6 +73,21 @@ int klee_mount_table_add(KleeMountTable *mt, MountType type,
     return 0;
 }
 
+int klee_mount_table_remove(KleeMountTable *mt, const char *dest)
+{
+    if (!mt || !dest)
+        return -EINVAL;
+
+    RadixNode *node = klee_radix_find_exact(mt->tree, dest);
+    if (!node || !node->mount)
+        return -ENOENT;
+
+    /* Pop the shadow stack; memory is arena-owned, nothing to free */
+    node->mount = node->mount->stacked;
+    mt->num_mounts--;
+    return 0;
+}
+
 int klee_mount_table_populate(KleeMountTable *mt, const KleeConfig *cfg)
 {
     for (KleeMountOp *op = cfg->mount_ops; op; op = op->next) {
@@ -101,6 +116,7 @@ int klee_mount_table_populate(KleeMountTable *mt, const KleeConfig *cfg)
             }
             int rc = klee_mount_table_add(mt, MOUNT_TMPFS, tmpfs_path, dest,
                                            false, op->perms);
+            free(tmpfs_path);
             if (rc < 0)
                 return rc;
             continue;
@@ -164,6 +180,7 @@ int klee_mount_table_populate(KleeMountTable *mt, const KleeConfig *cfg)
             snprintf(sl_path, sizeof(sl_path), "%s/ptmx", dest);
             klee_mount_table_add(mt, MOUNT_SYMLINK, "pts/ptmx", sl_path,
                                   false, 0777);
+            free(dev_path);
             continue;
         }
 
@@ -171,9 +188,11 @@ int klee_mount_table_populate(KleeMountTable *mt, const KleeConfig *cfg)
             /* Create empty directory backed by tmpfs */
         {
             char *dir_path = klee_tmpfs_create(dest);
-            if (dir_path)
+            if (dir_path) {
                 klee_mount_table_add(mt, MOUNT_DIR, dir_path, dest,
                                       false, op->perms);
+                free(dir_path);
+            }
             continue;
         }
 
@@ -190,16 +209,18 @@ int klee_mount_table_populate(KleeMountTable *mt, const KleeConfig *cfg)
                 bool ro = (op->type == MOUNT_RO_BIND_DATA);
                 klee_mount_table_add(mt, op->type, file_path, dest,
                                       ro, op->perms);
+                free(file_path);
             }
             continue;
         }
 
         case MOUNT_REMOUNT_RO:
         {
-            /* Find existing mount and set readonly */
-            KleeMount *existing = klee_mount_table_resolve(mt, dest);
-            if (existing)
-                existing->is_readonly = true;
+            /* Require a mount exactly at dest; a longest-prefix match
+             * would flip an ancestor mount (e.g. /) read-only. */
+            RadixNode *node = klee_radix_find_exact(mt->tree, dest);
+            if (node && node->mount)
+                node->mount->is_readonly = true;
             else
                 KLEE_WARN("remount-ro: no mount at %s", dest);
             continue;
@@ -207,10 +228,12 @@ int klee_mount_table_populate(KleeMountTable *mt, const KleeConfig *cfg)
 
         case MOUNT_CHMOD:
         {
-            /* Change permissions on existing mount */
-            KleeMount *existing = klee_mount_table_resolve(mt, dest);
-            if (existing)
-                existing->perms = op->perms;
+            /* Change permissions on the mount exactly at dest */
+            RadixNode *node = klee_radix_find_exact(mt->tree, dest);
+            if (node && node->mount)
+                node->mount->perms = op->perms;
+            else
+                KLEE_WARN("chmod: no mount at %s", dest);
             continue;
         }
 
@@ -273,9 +296,11 @@ int klee_mount_table_populate(KleeMountTable *mt, const KleeConfig *cfg)
             /* Mount mqueue backed by tmpfs for now */
         {
             char *mq_path = klee_tmpfs_create(dest);
-            if (mq_path)
+            if (mq_path) {
                 klee_mount_table_add(mt, MOUNT_MQUEUE, mq_path, dest,
                                       false, op->perms);
+                free(mq_path);
+            }
             continue;
         }
 
@@ -299,11 +324,31 @@ int klee_mount_table_populate(KleeMountTable *mt, const KleeConfig *cfg)
         }
         }
 
+        /* Plain bind mounts require an existing source like bwrap;
+         * the -try variants silently skip a missing source. */
+        bool is_try = op->type == MOUNT_BIND_TRY ||
+                      op->type == MOUNT_BIND_RO_TRY ||
+                      op->type == MOUNT_DEV_BIND_TRY;
+        if (source && access(source, F_OK) != 0) {
+            if (is_try)
+                continue;
+            if (cfg->not_a_security_boundary) {
+                KLEE_WARN("can't find source path %s, continuing "
+                          "(--not-a-security-boundary)", source);
+                continue;
+            }
+            KLEE_ERROR("can't find source mount path %s", source);
+            return -ENOENT;
+        }
+
         int rc = klee_mount_table_add(mt, op->type, source, dest,
                                        readonly, op->perms);
-        if (rc < 0 && op->type != MOUNT_BIND_TRY &&
-            op->type != MOUNT_BIND_RO_TRY &&
-            op->type != MOUNT_DEV_BIND_TRY) {
+        if (rc < 0 && !is_try) {
+            if (cfg->not_a_security_boundary) {
+                KLEE_WARN("mount of %s failed, continuing "
+                          "(--not-a-security-boundary)", dest);
+                continue;
+            }
             return rc;
         }
     }
@@ -424,15 +469,20 @@ static int translate_depth(const KleeMountTable *mt,
                 *slash = '\0';
             else if (slash)
                 parent[1] = '\0';  /* parent is "/" */
-            snprintf(resolved, PATH_MAX, "%s/%s", parent, target);
+            if (snprintf(resolved, PATH_MAX, "%s/%s", parent, target)
+                    >= PATH_MAX)
+                return -ENAMETOOLONG;
             target = resolved;
         }
         while (*remainder == '/')
             remainder++;
-        if (*remainder)
-            snprintf(new_guest, PATH_MAX, "%s/%s", target, remainder);
-        else
+        if (*remainder) {
+            if (snprintf(new_guest, PATH_MAX, "%s/%s", target, remainder)
+                    >= PATH_MAX)
+                return -ENAMETOOLONG;
+        } else {
             snprintf(new_guest, PATH_MAX, "%s", target);
+        }
         return translate_depth(mt, new_guest, host_path_out, out_size,
                                depth + 1);
     }
@@ -781,7 +831,9 @@ static void gl_merge_subdir(const char *backing_store, const char *host_source,
             continue;
 
         char src_file[PATH_MAX];
-        snprintf(src_file, sizeof(src_file), "%s/%s", src_dir, de->d_name);
+        if (snprintf(src_file, sizeof(src_file), "%s/%s",
+                     src_dir, de->d_name) >= (int)sizeof(src_file))
+            continue;
 
         struct stat st;
         if (lstat(src_file, &st) < 0)
@@ -796,7 +848,9 @@ static void gl_merge_subdir(const char *backing_store, const char *host_source,
             continue;
 
         char dst_link[PATH_MAX];
-        snprintf(dst_link, sizeof(dst_link), "%s/%s", dst_dir, de->d_name);
+        if (snprintf(dst_link, sizeof(dst_link), "%s/%s",
+                     dst_dir, de->d_name) >= (int)sizeof(dst_link))
+            continue;
 
         /* Don't overwrite existing symlinks (another vendor may have
          * already provided this file) */
@@ -876,8 +930,9 @@ static void gl_extension_walker(const char *path, KleeMount *mount, void *ctx)
                 continue;
 
             char host_file[PATH_MAX];
-            snprintf(host_file, sizeof(host_file), "%s/%s",
-                     host_lib_dir, de->d_name);
+            if (snprintf(host_file, sizeof(host_file), "%s/%s",
+                         host_lib_dir, de->d_name) >= (int)sizeof(host_file))
+                continue;
 
             struct stat st;
             if (lstat(host_file, &st) < 0)
@@ -889,13 +944,16 @@ static void gl_extension_walker(const char *path, KleeMount *mount, void *ctx)
 
             /* guest symlink source: the GL extension lib path */
             char guest_src[PATH_MAX];
-            snprintf(guest_src, sizeof(guest_src), "%s/GL/%s/lib/%s",
-                     libdir, vendor, de->d_name);
+            if (snprintf(guest_src, sizeof(guest_src), "%s/GL/%s/lib/%s",
+                         libdir, vendor, de->d_name)
+                    >= (int)sizeof(guest_src))
+                continue;
 
             /* guest symlink dest: the standard library search path */
             char guest_dest[PATH_MAX];
-            snprintf(guest_dest, sizeof(guest_dest), "%s/%s",
-                     libdir, de->d_name);
+            if (snprintf(guest_dest, sizeof(guest_dest), "%s/%s",
+                         libdir, de->d_name) >= (int)sizeof(guest_dest))
+                continue;
 
             klee_mount_table_add(gc->mt, MOUNT_SYMLINK,
                                  guest_src, guest_dest, false, 0777);

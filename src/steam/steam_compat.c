@@ -81,20 +81,18 @@ static int expose_gameoverlayrenderer(KleeMountTable *mt)
     }
 
     if (home) {
-        snprintf(steam_lib, sizeof(steam_lib),
-                 "%s/.steam/ubuntu12_32/gameoverlayrenderer.so", home);
-        struct stat st;
-        if (stat(steam_lib, &st) == 0) {
-            klee_mount_table_add(mt, MOUNT_BIND_RW, steam_lib, steam_lib,
-                                  false, 0755);
-            KLEE_DEBUG("steam: auto-exposed %s", steam_lib);
-        }
-
-        snprintf(steam_lib, sizeof(steam_lib),
-                 "%s/.steam/ubuntu12_64/gameoverlayrenderer.so", home);
-        if (stat(steam_lib, &st) == 0) {
-            klee_mount_table_add(mt, MOUNT_BIND_RW, steam_lib, steam_lib,
-                                  false, 0755);
+        /* ~/.steam/steam is a symlink to the Steam install dir */
+        static const char *arch_dirs[] = { "ubuntu12_32", "ubuntu12_64" };
+        for (size_t i = 0; i < sizeof(arch_dirs) / sizeof(arch_dirs[0]); i++) {
+            snprintf(steam_lib, sizeof(steam_lib),
+                     "%s/.steam/steam/%s/gameoverlayrenderer.so",
+                     home, arch_dirs[i]);
+            struct stat st;
+            if (stat(steam_lib, &st) == 0) {
+                klee_mount_table_add(mt, MOUNT_BIND_RW, steam_lib, steam_lib,
+                                      false, 0755);
+                KLEE_DEBUG("steam: auto-exposed %s", steam_lib);
+            }
         }
     }
 
@@ -118,24 +116,6 @@ int klee_steam_auto_expose(KleeMountTable *mt)
 
     expose_xdg_runtime_steam(mt);
     expose_gameoverlayrenderer(mt);
-
-    return 0;
-}
-
-int klee_steam_is_ipc_path(const char *path)
-{
-    if (!path)
-        return 0;
-
-    /* Check for Steam overlay patterns */
-    if (strstr(path, "steam-overlay-"))
-        return 1;
-    if (strstr(path, "steam-ipc"))
-        return 1;
-    if (strstr(path, "gameoverlayrenderer"))
-        return 1;
-    if (strstr(path, "/dev/shm/") && strstr(path, "Steam"))
-        return 1;
 
     return 0;
 }

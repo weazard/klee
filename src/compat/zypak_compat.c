@@ -109,6 +109,29 @@ bool klee_zypak_detect(void)
     return false;
 }
 
+bool klee_zypak_detect_from_mounts(KleeMountTable *mt)
+{
+    if (!mt)
+        return false;
+
+    /* Check if zypak-helper is visible in the mount table */
+    static const char *zypak_paths[] = {
+        "/app/bin/zypak-helper",
+        "/app/bin/zypak-wrapper.sh",
+        NULL,
+    };
+
+    for (const char **p = zypak_paths; *p; p++) {
+        KleeMount *m = klee_mount_table_resolve(mt, *p);
+        if (m) {
+            KLEE_DEBUG("zypak: detected via mount table: %s", *p);
+            return true;
+        }
+    }
+
+    return false;
+}
+
 /* ------------------------------------------------------------------ */
 /* Auto-expose                                                         */
 /* ------------------------------------------------------------------ */
@@ -167,7 +190,7 @@ int klee_zypak_auto_expose(KleeMountTable *mt)
 }
 
 /* ------------------------------------------------------------------ */
-/* flatpak-spawn basename check                                        */
+/* Basename checks                                                      */
 /* ------------------------------------------------------------------ */
 
 bool klee_zypak_is_flatpak_spawn(const char *exe_path)
@@ -179,6 +202,50 @@ bool klee_zypak_is_flatpak_spawn(const char *exe_path)
     base = base ? base + 1 : exe_path;
 
     return strcmp(base, "flatpak-spawn") == 0;
+}
+
+bool klee_zypak_is_chrome_sandbox(const char *exe_path)
+{
+    if (!exe_path)
+        return false;
+
+    const char *base = strrchr(exe_path, '/');
+    base = base ? base + 1 : exe_path;
+
+    return strcmp(base, "chrome-sandbox") == 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Nullify CHROME_DEVEL_SANDBOX in tracee envp                          */
+/* ------------------------------------------------------------------ */
+
+void klee_zypak_nullify_sandbox_env(KleeInterceptor *ic, pid_t pid,
+                                     uint64_t envp_addr)
+{
+    for (int i = 0; i < MAX_ARGV; i++) {
+        uint64_t env_ptr = 0;
+        int rc = klee_read_mem(ic, pid, &env_ptr,
+                               (const void *)(uintptr_t)(envp_addr + (uint64_t)i * 8),
+                               sizeof(env_ptr));
+        if (rc < 0 || env_ptr == 0)
+            break;
+
+        char prefix[32];
+        rc = klee_read_string(ic, pid, prefix, sizeof(prefix),
+                              (const void *)(uintptr_t)env_ptr);
+        if (rc < 0)
+            continue;
+
+        if (strncmp(prefix, "CHROME_DEVEL_SANDBOX=", 21) == 0 &&
+            prefix[21] != '\0') {
+            char nul = '\0';
+            klee_write_mem(ic, pid,
+                           (void *)(uintptr_t)(env_ptr + 21),
+                           &nul, 1);
+            KLEE_DEBUG("zypak: nullified CHROME_DEVEL_SANDBOX in tracee envp");
+            break;
+        }
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -386,6 +453,10 @@ int klee_zypak_handle_flatpak_spawn(KleeProcess *proc, KleeInterceptor *ic,
     FlatpakSpawnOpts opts;
     int ret = 0;
 
+    /* Initialize before any goto out — fps_opts_destroy must not see
+     * garbage if argv reading fails before the parse step. */
+    fps_opts_init(&opts);
+
     KLEE_INFO("zypak: intercepting flatpak-spawn execve from pid=%d", pid);
 
     /* 1. Read tracee argv from memory */
@@ -422,7 +493,7 @@ int klee_zypak_handle_flatpak_spawn(KleeProcess *proc, KleeInterceptor *ic,
         int cur_envc = 0;
         rc = read_tracee_argv(ic, pid, ev->args[2],
                               &cur_envp, &cur_envc);
-        if (rc == 0 && cur_envc >= 0) {
+        if (rc == 0) {
             rc = apply_fps_env(&opts, cur_envp, cur_envc,
                                &new_envp, &new_envc);
             if (rc == 0) {
@@ -433,6 +504,36 @@ int klee_zypak_handle_flatpak_spawn(KleeProcess *proc, KleeInterceptor *ic,
             free_argv(cur_envp, cur_envc);
         } else {
             KLEE_WARN("zypak: failed to read tracee envp: %d", rc);
+        }
+    }
+
+    /* 3b. Force klee env overrides in the child.  Zypak's --env= may
+     *     set CHROME_DEVEL_SANDBOX to the stub sandbox path, which
+     *     makes Chrome attempt the SUID sandbox and crash. */
+    if (proc->sandbox && proc->sandbox->zypak_detected) {
+        if (!env_modified) {
+            /* No --env= entries, but we still need to override.
+             * Read the tracee's current env to get a mutable copy. */
+            char **cur_envp = NULL;
+            int cur_envc = 0;
+            rc = read_tracee_argv(ic, pid, ev->args[2],
+                                  &cur_envp, &cur_envc);
+            if (rc == 0 && cur_envc >= 0) {
+                new_envp = cur_envp;
+                new_envc = cur_envc;
+                env_modified = true;
+            }
+        }
+        if (env_modified && new_envp) {
+            for (int i = 0; i < new_envc; i++) {
+                if (strncmp(new_envp[i], "CHROME_DEVEL_SANDBOX=", 21) == 0 &&
+                    new_envp[i][21] != '\0') {
+                    free(new_envp[i]);
+                    new_envp[i] = strdup("CHROME_DEVEL_SANDBOX=");
+                    KLEE_DEBUG("zypak: forced CHROME_DEVEL_SANDBOX=\"\" "
+                               "in child env");
+                }
+            }
         }
     }
 
@@ -682,6 +783,9 @@ int klee_zypak_handle_flatpak_spawn(KleeProcess *proc, KleeInterceptor *ic,
 
     /* 7. Set vexe to the target command's resolved guest path */
     snprintf(proc->vexe, PATH_MAX, "%s", target_abs);
+    snprintf(proc->saved_path, PATH_MAX, "%s", target_abs);
+    snprintf(proc->resolved_guest, PATH_MAX, "%s", target_abs);
+    snprintf(proc->translated_path, PATH_MAX, "%s", target_host);
 
 out:
     fps_opts_destroy(&opts);

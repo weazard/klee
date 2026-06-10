@@ -56,7 +56,7 @@ typedef struct klee_sandbox {
     bool unshare_uts;
     bool unshare_net;
     bool unshare_cgroup;
-    bool zypak_detected;       /* true when Zypak environment is active */
+    bool zypak_detected;
     int ref_count;
 } KleeSandbox;
 
@@ -88,9 +88,14 @@ typedef struct klee_process {
 
     /* Current syscall info */
     int current_syscall;
-    int deny_errno;             /* non-zero when syscall was denied on enter */
+    bool syscall_suppressed;    /* syscall was skipped on enter (denied or emulated) */
+    int deny_errno;             /* errno for a suppressed syscall; 0 = fake success */
     bool seccomp_entered;       /* waiting for extra enter-stop after SECCOMP event */
     bool suppress_initial_stop; /* suppress first SIGSTOP after fork (ptrace artifact) */
+    bool skip_uid_virt;         /* skip UID/GID virtualization for this process
+                                 * (returns real uid from getuid/geteuid instead of
+                                 * virtual — used for Chrome main process so D-Bus
+                                 * AUTH EXTERNAL matches SO_PEERCRED) */
     uint64_t saved_args[6];
     char saved_path[PATH_MAX];      /* original guest path */
     char resolved_guest[PATH_MAX];  /* absolute guest path after resolution */

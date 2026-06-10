@@ -143,6 +143,15 @@ static void child_process(KleeInterceptor *interceptor, const KleeConfig *cfg,
     /* Setup environment */
     setup_environment(cfg);
 
+    /* Re-apply forced Zypak overrides.  setup_environment() processes
+     * bwrap --setenv ops (and possibly --clearenv) which may restore
+     * values klee needs to force.  Use the cfg flag since env vars set
+     * in the parent may have been wiped by --clearenv. */
+    if (cfg->zypak_detected) {
+        setenv("CHROME_DEVEL_SANDBOX", "", 1);
+        setenv("ZYPAK_ZYGOTE_STRATEGY_SPAWN", "0", 1);
+    }
+
     /* New session if requested */
     if (cfg->new_session) {
         if (setsid() == (pid_t)-1) {
@@ -209,6 +218,12 @@ int main(int argc, char **argv)
      * terminal foreground process group via tcsetpgrp(). */
     signal(SIGTTOU, SIG_IGN);
 
+    /* Reset SIGCHLD in case the parent ignored it (e.g. Erlang);
+     * an inherited SIG_IGN makes the kernel auto-reap children,
+     * breaking the waitpid()-based child management (upstream
+     * bubblewrap 0.11.1 fix). */
+    signal(SIGCHLD, SIG_DFL);
+
     /* Parse CLI */
     KleeConfig cfg;
     klee_config_init(&cfg);
@@ -250,6 +265,10 @@ int main(int argc, char **argv)
         }
         KLEE_INFO("child command: %s", cmdbuf);
     }
+
+    /* Log namespace and ID config */
+    KLEE_DEBUG("config: unshare_user=%d uid_set=%d uid=%d gid_set=%d gid=%d",
+               cfg.unshare_user, cfg.uid_set, cfg.uid, cfg.gid_set, cfg.gid);
 
     /* Log special FDs */
     if (cfg.info_fd >= 0 || cfg.sync_fd >= 0 || cfg.block_fd >= 0) {
@@ -323,6 +342,7 @@ int main(int argc, char **argv)
                 if (tmp_path) {
                     klee_mount_table_add(mount_table, MOUNT_TMPFS, tmp_path,
                                           "/tmp", false, 01777);
+                    free(tmp_path);
                     KLEE_INFO("auto-provisioned private /tmp "
                               "(real uid=%d != virtual uid=%d)",
                               real_uid, virt_uid);
@@ -331,18 +351,71 @@ int main(int argc, char **argv)
         }
     }
 
+    /* Pre-apply --setenv entries to the parent process so that detection
+     * functions (steam) and syscall handlers (which run in the parent)
+     * can see bwrap's --setenv arguments via getenv().
+     * Only apply SET operations — never CLEAR/UNSET, which would destroy
+     * env vars the parent needs (PATH, HOME, etc.).
+     * The child also applies these in setup_environment() (idempotent). */
+    for (const KleeEnvOp *op = cfg.env_ops; op; op = op->next) {
+        if (op->type == ENV_OP_SET)
+            setenv(op->key, op->value, 1);
+    }
+
     /* Auto-expose Steam paths */
     klee_steam_auto_expose(mount_table);
 
-    /* Detect and configure Zypak (Flatpak Chrome sandbox bridge) */
-    if (klee_zypak_detect()) {
+    /* Detect and configure Zypak (Flatpak Chrome sandbox bridge).
+     * Check both env vars (from bwrap --setenv) and mount table
+     * (zypak-wrapper.sh sets ZYPAK_BIN inside the sandbox). */
+    if (klee_zypak_detect() || klee_zypak_detect_from_mounts(mount_table)) {
         KLEE_INFO("Zypak detected in environment");
         sandbox->zypak_detected = true;
+        cfg.zypak_detected = true;
         klee_zypak_auto_expose(mount_table);
-        /* Force mimic strategy so Zypak uses flatpak-spawn (which KLEE
+        /* Ensure ZYPAK_BIN is set in the parent so syscall handlers
+         * can resolve Zypak paths.  In mount-table detection mode,
+         * ZYPAK_BIN won't be set yet (zypak-wrapper.sh sets it inside
+         * the sandbox). */
+        if (!getenv("ZYPAK_BIN"))
+            setenv("ZYPAK_BIN", "/app/bin", 0);
+        /* Force mimic strategy so Zypak uses flatpak-spawn (which klee
          * intercepts) instead of the spawn strategy (which escapes via
-         * D-Bus portal).  0 = don't overwrite user's explicit choice. */
-        setenv("ZYPAK_ZYGOTE_STRATEGY_SPAWN", "0", 0);
+         * D-Bus portal). */
+        setenv("ZYPAK_ZYGOTE_STRATEGY_SPAWN", "0", 1);
+        /* Disable Chrome's SUID sandbox helper.  Chrome execs
+         * chrome-sandbox via raw syscall, but the Flatpak stub just
+         * does exit(1), killing the zygote.  Setting this empty makes
+         * Chrome use its namespace sandbox instead, which works
+         * natively under klee (clone CLONE_NEWUSER as real root). */
+        setenv("CHROME_DEVEL_SANDBOX", "", 1);
+        /* Force user namespace emulation.  Flatpak doesn't pass
+         * --unshare-user to bwrap, but Chrome fatally refuses to run
+         * as root (geteuid()==0).  Enabling unshare_user activates
+         * UID/GID interception so klee virtualizes to non-root. */
+        if (!cfg.unshare_user) {
+            cfg.unshare_user = true;
+            sandbox->unshare_user = true;
+            KLEE_INFO("zypak: forced unshare_user for Chrome compatibility");
+        }
+        /* Default to uid/gid 1000 if bwrap didn't specify --uid/--gid.
+         * Chrome's root check is geteuid()==0, so the virtual uid must
+         * be non-zero for processes that don't have --no-sandbox. */
+        if (!cfg.uid_set) {
+            cfg.uid = 1000;
+            cfg.uid_set = true;
+        }
+        if (!cfg.gid_set) {
+            cfg.gid = 1000;
+            cfg.gid_set = true;
+        }
+        /* Disable PID namespace virtualization for Chrome/Zypak.
+         * klee assigns virtual PIDs to every clone (including threads),
+         * but clone()/CLONE_CHILD_SETTID return real TIDs while
+         * gettid() returns virtual TIDs — this mismatch breaks
+         * Chrome's Mojo IPC and thread management. */
+        cfg.unshare_pid = false;
+        sandbox->unshare_pid = false;
     }
 
     /* Create host-side mirrors for /run/host mounts so the kernel
@@ -448,12 +521,21 @@ int main(int argc, char **argv)
         init_proc->virtual_ppid = 0;
     }
 
-    /* Set initial ID state */
+    /* Set initial ID state.  When Zypak is detected and no explicit
+     * --uid/--gid was given, default to UID/GID 1000 instead of 0.
+     * Chrome fatally refuses to run as root. */
     if (cfg.unshare_user) {
-        uid_t uid = cfg.uid_set ? cfg.uid : 0;
-        gid_t gid = cfg.gid_set ? cfg.gid : 0;
+        uid_t uid = cfg.uid_set ? cfg.uid : (sandbox->zypak_detected ? 1000 : 0);
+        gid_t gid = cfg.gid_set ? cfg.gid : (sandbox->zypak_detected ? 1000 : 0);
         init_proc->id_state = klee_id_state_create(uid, gid);
     }
+
+    /* In Zypak mode, the initial process (Chrome main, launched with
+     * --no-sandbox) skips UID virtualization so getuid() returns real
+     * uid=0.  This lets D-Bus AUTH EXTERNAL match SO_PEERCRED.
+     * Child processes re-evaluate on exec (see enter.c). */
+    if (cfg.zypak_detected)
+        init_proc->skip_uid_virt = true;
 
     /* Set initial virtual CWD */
     if (cfg.chdir_path)
@@ -506,6 +588,7 @@ int main(int argc, char **argv)
         waitpid(child_pid, NULL, 0);
         goto cleanup;
     }
+    event_loop->initial_child_pid = child_pid;
 
     int exit_status = klee_event_loop_run(event_loop);
 

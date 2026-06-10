@@ -133,6 +133,8 @@
 #define KLEE_SYS_connect         SYS_connect
 #define KLEE_SYS_bind            SYS_bind
 #define KLEE_SYS_sendmsg         SYS_sendmsg
+#define KLEE_SYS_recvmsg         SYS_recvmsg
+#define KLEE_SYS_recvfrom        SYS_recvfrom
 
 /* Terminal/ioctl */
 #define KLEE_SYS_ioctl           SYS_ioctl
@@ -150,10 +152,9 @@
 #define KLEE_SYS_io_uring_enter  SYS_io_uring_enter
 #endif
 
-/* Total number of syscalls we intercept */
-#define KLEE_INTERCEPTED_SYSCALL_COUNT 90
-
-/* Get the list of all syscall numbers to intercept */
+/* Get the list of all syscall numbers to intercept.  Size buffers with
+ * KLEE_MAX_INTERCEPTED_SYSCALLS (intercept/filter.h) and use the return
+ * value as the actual count. */
 int klee_get_intercepted_syscalls(int *out, size_t max_count);
 
 #endif /* KLEE_SYSNUM_H */

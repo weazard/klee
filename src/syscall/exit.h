@@ -49,5 +49,6 @@ int klee_exit_uname(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 /* Misc */
 int klee_exit_prctl(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_exit_getsockopt(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_exit_recvmsg(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 
 #endif /* KLEE_EXIT_H */

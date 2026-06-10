@@ -79,7 +79,7 @@ static KleeFdEntry *find_entry(const KleeFdTable *ft, int fd)
 int klee_fd_table_set(KleeFdTable *ft, int fd, const char *virtual_path,
                        bool cloexec)
 {
-    if (!ft)
+    if (!ft || !virtual_path)
         return -1;
 
     KleeFdEntry *existing = find_entry(ft, fd);
@@ -145,6 +145,9 @@ void klee_fd_table_remove(KleeFdTable *ft, int fd)
 
 int klee_fd_table_dup(KleeFdTable *ft, int old_fd, int new_fd, bool cloexec)
 {
+    if (old_fd == new_fd)
+        return 0; /* dup2(fd, fd) is a no-op */
+
     const char *path = klee_fd_table_get(ft, old_fd);
     if (!path)
         return 0; /* Not tracked, OK */

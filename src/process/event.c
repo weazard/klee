@@ -6,6 +6,7 @@
 #include "process/memory.h"
 #include "process/regs.h"
 #include "syscall/dispatch.h"
+#include "syscall/sysnum.h"
 #include "ns/pid_ns.h"
 #include "ns/user_ns.h"
 #include "fuse/fuse_proc.h"
@@ -17,6 +18,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/epoll.h>
+#include <sys/ptrace.h>
 #include <sys/signalfd.h>
 #include <sys/wait.h>
 
@@ -101,6 +103,17 @@ static void handle_process_exit(KleeEventLoop *el, KleeProcess *proc,
         el->sandbox->pid_map &&
         klee_pid_map_is_init(el->sandbox->pid_map, real_pid)) {
         KLEE_INFO("PID 1 exited, terminating namespace");
+        el->exit_status = exit_status;
+        el->running = false;
+    }
+
+    /* If this is the initial child (the command klee launched), stop the
+     * event loop.  Daemon children like gpg-agent may still be alive —
+     * they will be cleaned up by SIGKILL below.  This matches real
+     * bwrap behavior: bwrap exits when its direct child exits. */
+    if (real_pid == el->initial_child_pid) {
+        KLEE_INFO("initial child exited (pid=%d status=%d), stopping",
+                   real_pid, exit_status);
         el->exit_status = exit_status;
         el->running = false;
     }
@@ -216,6 +229,8 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
         proc->seccomp_entered = el->interceptor->backend == INTERCEPT_PTRACE &&
                                  el->interceptor->ptrace.seccomp_filter;
         proc->path_arg_count = 0;
+        proc->path_modified = false;
+        proc->syscall_suppressed = false;
         proc->deny_errno = 0;
         proc->resolved_guest[0] = '\0';
         klee_arena_reset(proc->event_arena);
@@ -225,15 +240,54 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
             /* Deny the syscall: for ptrace, replace with invalid syscall
              * (-1 → kernel returns ENOSYS) and store the real errno to
              * override at the exit stop. */
+            proc->syscall_suppressed = true;
             proc->deny_errno = -rc;
             el->interceptor->respond(el->interceptor, event, -1, -rc);
+            return 0;
+        }
+        if (rc > 0) {
+            /* The handler emulated the syscall: suppress the real one and
+             * make the tracee see success (retval 0). */
+            proc->syscall_suppressed = true;
+            if (el->interceptor->backend == INTERCEPT_SECCOMP_UNOTIFY) {
+                event->emulated = true;
+                el->interceptor->respond(el->interceptor, event, 0, 0);
+            } else {
+                el->interceptor->skip_syscall(el->interceptor, event->pid, 0);
+                el->interceptor->continue_syscall(el->interceptor,
+                                                   event->pid, 0);
+            }
             return 0;
         }
         /* Continue the syscall */
         if (el->interceptor->backend == INTERCEPT_SECCOMP_UNOTIFY) {
             el->interceptor->respond(el->interceptor, event, 0, 0);
         } else {
-            el->interceptor->continue_syscall(el->interceptor, event->pid, 0);
+            /* Optimization for ptrace+seccomp: when the exit handler will
+             * be a no-op, use PTRACE_CONT to skip the exit-stop (and the
+             * extra enter-stop from seccomp).  This reduces from 3 ptrace
+             * stops to 1, which is critical for Chrome's recvmsg spin
+             * (~600K+ non-blocking calls that monopolize the event loop). */
+            bool need_exit = true;
+            if (!proc->path_modified) {
+                const KleeSyscallHandler *h = klee_dispatch_get(event->syscall_nr);
+                if (!h || !h->exit) {
+                    /* No exit handler -> exit stop is wasted */
+                    need_exit = false;
+                } else if (proc->skip_uid_virt) {
+                    /* UID-only exit handlers are no-ops when skip_uid_virt */
+                    int nr = event->syscall_nr;
+                    if (nr == KLEE_SYS_recvmsg || nr == KLEE_SYS_getsockopt)
+                        need_exit = false;
+                }
+            }
+            if (need_exit) {
+                el->interceptor->continue_syscall(el->interceptor, event->pid, 0);
+            } else {
+                proc->state = PROC_STATE_RUNNING;
+                proc->seccomp_entered = false;
+                el->interceptor->continue_running(el->interceptor, event->pid, 0);
+            }
         }
         break;
 
@@ -245,17 +299,26 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
         /* Consolidate all register modifications into a single push */
         bool need_reg_push = false;
 
-        /* If the syscall was denied on enter, override the return value
-         * (kernel returned ENOSYS for the invalid -1 syscall) with the
-         * actual errno we want the tracee to see. */
-        if (proc->deny_errno && el->interceptor->backend == INTERCEPT_PTRACE) {
+        /* If the syscall was suppressed on enter (denied or emulated),
+         * override the return value (kernel returned ENOSYS for the
+         * invalid -1 syscall) with the result the tracee should see,
+         * and restore any rewritten path-arg registers. */
+        if (proc->syscall_suppressed &&
+            el->interceptor->backend == INTERCEPT_PTRACE) {
             klee_regs_fetch(el->interceptor, proc);
             klee_regs_set_result(proc, (long)-proc->deny_errno);
-            need_reg_push = true;
+            if (proc->path_modified) {
+                for (int i = 0; i < proc->path_arg_count; i++) {
+                    int idx = proc->path_arg_idx[i];
+                    klee_regs_set_arg(proc, idx, proc->saved_args[idx]);
+                }
+                proc->path_arg_count = 0;
+                proc->path_modified = false;
+            }
+            klee_regs_push(el->interceptor, proc);
+            proc->syscall_suppressed = false;
             proc->deny_errno = 0;
-            /* Skip normal exit dispatch — syscall was denied */
-            if (need_reg_push)
-                klee_regs_push(el->interceptor, proc);
+            /* Skip normal exit dispatch — the syscall never ran */
             proc->state = PROC_STATE_RUNNING;
             el->interceptor->continue_running(el->interceptor, event->pid, 0);
             break;
@@ -307,6 +370,14 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
 
     case KLEE_EVENT_EXEC:
         klee_process_exec(proc, proc->vexe);
+        /* After successful exec the old process image is gone — there will
+         * be no syscall-exit-stop for the execve.  Reset state so the next
+         * intercepted syscall from the new program isn't misclassified as
+         * a syscall exit for the old execve. */
+        proc->state = PROC_STATE_RUNNING;
+        proc->path_modified = false;
+        proc->path_arg_count = 0;
+        proc->seccomp_entered = false;
         if (el->interceptor->backend == INTERCEPT_PTRACE)
             el->interceptor->continue_running(el->interceptor, event->pid, 0);
         break;
@@ -420,6 +491,28 @@ int klee_event_loop_run(KleeEventLoop *el)
                 break;
             }
         }
+    }
+
+    /* Kill any remaining traced processes (e.g. daemon children like
+     * gpg-agent that outlived the initial child).  With ptrace, these
+     * processes are still stopped — detach and kill them so they don't
+     * linger as zombies. */
+    if (el->proctable->count > 0) {
+        KLEE_DEBUG("killing %zu remaining processes", el->proctable->count);
+        for (size_t i = 0; i < el->proctable->by_pid->capacity; i++) {
+            KleeHTEntry *ent = &el->proctable->by_pid->entries[i];
+            if (!ent->occupied || ent->deleted)
+                continue;
+            pid_t pid = (pid_t)ent->key;
+            KLEE_DEBUG("killing leftover pid=%d", pid);
+            /* Detach from the ptraced process and deliver SIGKILL.
+             * Without detaching first, the process stays ptrace-stopped
+             * and waitpid returns WIFSTOPPED instead of WIFEXITED. */
+            ptrace(PTRACE_DETACH, pid, 0, SIGKILL);
+        }
+        /* Reap all killed children */
+        while (waitpid(-1, NULL, WNOHANG) > 0)
+            ;
     }
 
     KLEE_INFO("event loop exited with status %d", el->exit_status);

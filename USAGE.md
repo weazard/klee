@@ -151,6 +151,7 @@ These affect the next mount operation only:
 | `--level-prefix`    | 0         | Add log level prefix to output                 |
 | `--exec-label LABEL`| 1         | Set SELinux exec label                         |
 | `--file-label LABEL`| 1         | Set SELinux file label                         |
+| `--not-a-security-boundary` | 0 | Warn instead of failing when sandbox setup steps fail; use only when the sandbox is not a security boundary |
 
 ### File Descriptor Options
 
@@ -458,7 +459,6 @@ src/
     fd_table.c                FD-to-virtual-path tracking
     tmpfs.c                   tmpfs backing directories
     readonly.c                Read-only enforcement
-    pivot.c                   pivot_root simulation
 
   ns/                       Namespace simulation
     pid_ns.c                  PID namespace (bidirectional map)
@@ -482,7 +482,6 @@ src/
   compat/                   Compatibility layer
     seccomp_filter.c          Child seccomp filter handling
     io_uring_block.c          io_uring blocking
-    edge_cases.c              openat2, memfd, handle_at
     nested.c                  Nested bwrap detection
 
   steam/                    Steam-specific support
@@ -492,7 +491,6 @@ src/
     log.c / log.h             Leveled logging
     arena.c / arena.h         Pool-based arena allocator
     hash_table.c              Open-addressing hash table
-    list.h                    Intrusive linked list macros
 
 tests/
   test_cli.c                CLI parsing tests

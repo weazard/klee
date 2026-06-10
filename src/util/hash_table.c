@@ -27,7 +27,9 @@ static size_t next_power_of_2(size_t n)
     n |= n >> 4;
     n |= n >> 8;
     n |= n >> 16;
+#if SIZE_MAX > UINT32_MAX
     n |= n >> 32;
+#endif
     return n + 1;
 }
 

@@ -106,6 +106,8 @@ int klee_get_intercepted_syscalls(int *out, size_t max_count)
         KLEE_SYS_bind,
         KLEE_SYS_connect,
         KLEE_SYS_sendmsg,
+        KLEE_SYS_recvmsg,
+        KLEE_SYS_recvfrom,
 
         /* Terminal/ioctl */
         KLEE_SYS_ioctl,
