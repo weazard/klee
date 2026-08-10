@@ -11,6 +11,8 @@
 #   4. Child exit-code propagation (ptrace_backend.c)
 #   5. Read-only EROFS errno + PID-ns getpid + no false Zypak detection
 #   6. FUSE /proc overlay shutdown does not deadlock klee
+#   7. Flatpak layout (/app mount) must not trigger Zypak; peer creds consistent
+#   8. Genuine Zypak mode virtualizes to the real uid (D-Bus auth compat)
 set -e
 
 KLEE="${KLEE:-./klee}"
@@ -280,6 +282,76 @@ else
     else
         pass "klee terminates with --proc (rc=$rc)"
     fi
+fi
+
+
+# ---------------------------------------------------------------------------
+# Fix 6 (class check): Flatpak-shaped mount layout must NOT trigger Zypak.
+# Every Flatpak app mounts /app; detection that treats mount *coverage* of
+# /app/bin/zypak-helper as evidence flips ALL flatpaks into Chrome/Zypak
+# mode, forcing unshare_user/UID virtualization — which breaks credential-
+# authenticated channels (D-Bus) and cut app-store-type apps (Bazaar) off
+# the network while plain apps kept working.
+# ---------------------------------------------------------------------------
+echo "--- Flatpak-layout: no Zypak misdetection from /app mount ---"
+FAKEAPP=$(mktemp -d /tmp/klee-fakeapp.XXXXXX)
+mkdir -p "$FAKEAPP/bin"
+zlog=$(KLEE_LOG=info $KLEE --ro-bind /usr /usr --ro-bind /bin /bin --ro-bind /lib /lib --ro-bind /lib64 /lib64 --bind "$FAKEAPP" /app -- /bin/true 2>&1 | grep -i "zypak" || true)
+rm -rf "$FAKEAPP"
+if [ -z "$zlog" ]; then
+    pass "no zypak misdetection with /app mount (flatpak layout)"
+else
+    fail "zypak misdetected on flatpak layout (got: $zlog)"
+fi
+
+# ---------------------------------------------------------------------------
+# Class check: UID virtualization must keep peer credentials consistent.
+# D-Bus EXTERNAL auth compares the client-claimed uid (getuid) with
+# SO_PEERCRED; if klee virtualizes one but not the other, bus auth times
+# out and every portal/system-helper consumer looks "offline".
+# ---------------------------------------------------------------------------
+echo "--- SO_PEERCRED consistent with getuid() under --unshare-user ---"
+if command -v python3 >/dev/null 2>&1; then
+    out=$($KLEE --bind / / --unshare-user --uid 0 --gid 0 -- python3 -c '
+import socket, struct, os
+a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+creds = b.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+pid, uid, gid = struct.unpack("3i", creds)
+me = os.getuid()
+print("consistent" if uid == me else f"MISMATCH peercred_uid={uid} getuid={me}")
+' 2>/dev/null || true)
+    if echo "$out" | grep -q "consistent"; then
+        pass "SO_PEERCRED uid matches getuid under uid virtualization"
+    else
+        fail "SO_PEERCRED uid matches getuid (got: $out)"
+    fi
+else
+    echo "  SKIP: python3 not available (peercred test)"
+fi
+
+
+# ---------------------------------------------------------------------------
+# Class check: genuine Zypak mode must virtualize to the REAL uid.
+# A real Electron flatpak ships /app/bin/zypak-helper, so Zypak mode
+# legitimately engages — but defaulting the virtual uid to a hardcoded
+# 1000 breaks D-Bus EXTERNAL auth for every user whose real uid != 1000
+# (root containers included).  Expect: virtual uid == real uid, except
+# real root maps to 1000 (Chrome refuses euid 0).
+# ---------------------------------------------------------------------------
+echo "--- Zypak true-positive: virtual uid tracks real uid ---"
+FAKEAPP=$(mktemp -d /tmp/klee-zypakapp.XXXXXX)
+mkdir -p "$FAKEAPP/bin"
+printf "#!/bin/sh\nexit 0\n" > "$FAKEAPP/bin/zypak-helper"
+chmod +x "$FAKEAPP/bin/zypak-helper"
+real_uid=$(id -u)
+want=$real_uid
+[ "$real_uid" = "0" ] && want=1000
+got=$($KLEE --bind / / --bind "$FAKEAPP" /app -- /usr/bin/id -u 2>/dev/null || true)
+rm -rf "$FAKEAPP"
+if [ "$got" = "$want" ]; then
+    pass "zypak virtual uid == $want (real=$real_uid)"
+else
+    fail "zypak virtual uid (got: '$got', want: $want, real: $real_uid)"
 fi
 
 echo ""
