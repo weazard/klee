@@ -62,9 +62,9 @@ klee --bind / / -- /usr/bin/id
 klee --ro-bind / / --tmpfs /tmp -- /bin/sh
 
 # Full namespace isolation (like pressure-vessel)
-klee --unshare-all --share-net \\
-     --ro-bind / / --tmpfs /tmp --proc /proc --dev /dev \\
-     --uid 0 --gid 0 --hostname sandbox \\
+klee --unshare-all --share-net \
+     --ro-bind / / --tmpfs /tmp --proc /proc --dev /dev \
+     --uid 0 --gid 0 --hostname sandbox \
      -- /usr/bin/id
 ```
 
@@ -156,7 +156,7 @@ These affect the next mount operation only:
 
 | Option                | Arguments | Description                                 |
 |-----------------------|-----------|---------------------------------------------|
-| `--info-fd FD`        | 1         | Write `{ \"child-pid\": N }` JSON to FD      |
+| `--info-fd FD`        | 1         | Write `{ "child-pid": N }` JSON to FD      |
 | `--json-status-fd FD` | 1         | Write JSON status updates to FD             |
 | `--sync-fd FD`        | 1         | Close FD when sandbox setup is complete     |
 | `--block-fd FD`       | 1         | Block startup until FD is closed            |
@@ -300,18 +300,18 @@ klee --ro-bind / / --bind /home /home -- /bin/bash
 This matches the typical command line used by Steam's pressure-vessel:
 
 ```sh
-klee \\
-    --unshare-all --share-net \\
-    --uid 0 --gid 0 \\
-    --hostname steamdeck \\
-    --ro-bind / / \\
-    --tmpfs /tmp \\
-    --proc /proc \\
-    --dev /dev \\
-    --bind /home /home \\
-    --die-with-parent \\
-    --new-session \\
-    --info-fd 3 \\
+klee \
+    --unshare-all --share-net \
+    --uid 0 --gid 0 \
+    --hostname steamdeck \
+    --ro-bind / / \
+    --tmpfs /tmp \
+    --proc /proc \
+    --dev /dev \
+    --bind /home /home \
+    --die-with-parent \
+    --new-session \
+    --info-fd 3 \
     -- /usr/bin/id
 ```
 
@@ -356,10 +356,10 @@ klee --bind / / --unshare-user --uid 0 --gid 0 -- /usr/bin/id
 ### Environment Control
 
 ```sh
-klee --bind / / \\
-    --clearenv \\
-    --setenv PATH /usr/bin:/bin \\
-    --setenv HOME /root \\
+klee --bind / / \
+    --clearenv \
+    --setenv PATH /usr/bin:/bin \
+    --setenv HOME /root \
     -- /usr/bin/env
 ```
 
@@ -416,7 +416,7 @@ Compare Klee output against real bwrap on a system with namespace
 support:
 
 ```sh
-diff <(bwrap --bind / / -- /usr/bin/id) \\
+diff <(bwrap --bind / / -- /usr/bin/id) \
      <(klee --bind / / -- /usr/bin/id)
 ```
 
