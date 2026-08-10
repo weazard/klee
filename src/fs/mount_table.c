@@ -424,15 +424,18 @@ static int translate_depth(const KleeMountTable *mt,
                 *slash = '\0';
             else if (slash)
                 parent[1] = '\0';  /* parent is "/" */
-            snprintf(resolved, PATH_MAX, "%s/%s", parent, target);
+            if (snprintf(resolved, PATH_MAX, "%s/%s", parent, target) >= PATH_MAX)
+                return -ENAMETOOLONG;
             target = resolved;
         }
         while (*remainder == '/')
             remainder++;
-        if (*remainder)
-            snprintf(new_guest, PATH_MAX, "%s/%s", target, remainder);
-        else
+        if (*remainder) {
+            if (snprintf(new_guest, PATH_MAX, "%s/%s", target, remainder) >= PATH_MAX)
+                return -ENAMETOOLONG;
+        } else {
             snprintf(new_guest, PATH_MAX, "%s", target);
+        }
         return translate_depth(mt, new_guest, host_path_out, out_size,
                                depth + 1);
     }
@@ -781,7 +784,8 @@ static void gl_merge_subdir(const char *backing_store, const char *host_source,
             continue;
 
         char src_file[PATH_MAX];
-        snprintf(src_file, sizeof(src_file), "%s/%s", src_dir, de->d_name);
+        if ((size_t)snprintf(src_file, sizeof(src_file), "%s/%s", src_dir, de->d_name) >= sizeof(src_file))
+            continue;
 
         struct stat st;
         if (lstat(src_file, &st) < 0)
@@ -796,7 +800,8 @@ static void gl_merge_subdir(const char *backing_store, const char *host_source,
             continue;
 
         char dst_link[PATH_MAX];
-        snprintf(dst_link, sizeof(dst_link), "%s/%s", dst_dir, de->d_name);
+        if ((size_t)snprintf(dst_link, sizeof(dst_link), "%s/%s", dst_dir, de->d_name) >= sizeof(dst_link))
+            continue;
 
         /* Don't overwrite existing symlinks (another vendor may have
          * already provided this file) */
@@ -876,8 +881,9 @@ static void gl_extension_walker(const char *path, KleeMount *mount, void *ctx)
                 continue;
 
             char host_file[PATH_MAX];
-            snprintf(host_file, sizeof(host_file), "%s/%s",
-                     host_lib_dir, de->d_name);
+            if ((size_t)snprintf(host_file, sizeof(host_file), "%s/%s",
+                     host_lib_dir, de->d_name) >= sizeof(host_file))
+                continue;
 
             struct stat st;
             if (lstat(host_file, &st) < 0)
@@ -889,13 +895,15 @@ static void gl_extension_walker(const char *path, KleeMount *mount, void *ctx)
 
             /* guest symlink source: the GL extension lib path */
             char guest_src[PATH_MAX];
-            snprintf(guest_src, sizeof(guest_src), "%s/GL/%s/lib/%s",
-                     libdir, vendor, de->d_name);
+            if ((size_t)snprintf(guest_src, sizeof(guest_src), "%s/GL/%s/lib/%s",
+                     libdir, vendor, de->d_name) >= sizeof(guest_src))
+                continue;
 
             /* guest symlink dest: the standard library search path */
             char guest_dest[PATH_MAX];
-            snprintf(guest_dest, sizeof(guest_dest), "%s/%s",
-                     libdir, de->d_name);
+            if ((size_t)snprintf(guest_dest, sizeof(guest_dest), "%s/%s",
+                     libdir, de->d_name) >= sizeof(guest_dest))
+                continue;
 
             klee_mount_table_add(gc->mt, MOUNT_SYMLINK,
                                  guest_src, guest_dest, false, 0777);
