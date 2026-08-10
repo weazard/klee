@@ -584,6 +584,15 @@ static int klee_cli_parse_recurse(KleeConfig *cfg, int argc, char **argv,
             cfg->assert_userns_disabled = true;
             i++;
         }
+        else if (strcmp(arg, "--not-a-security-boundary") == 0) {
+            /* bwrap 0.12: do not fail hard when some sandbox setup steps
+             * fail; only valid when the sandbox is not a security boundary.
+             * klee's userspace translation is already largely fail-open
+             * (missing bind sources surface as ENOENT at access time), so
+             * this downgrades the remaining fatal setup errors to warnings. */
+            cfg->not_a_security_boundary = true;
+            i++;
+        }
         /* ==================== Misc ==================== */
         else if (strcmp(arg, "--args") == 0) {
             if (from_args_fd) {
@@ -723,6 +732,7 @@ void klee_cli_usage(const char *progname)
         "  --cap-drop CAP            Drop capability\n"
         "\n"
         "Misc options:\n"
+        "  --not-a-security-boundary Do not fail hard when sandbox setup steps fail\n"
         "  --args FD                 Parse NUL-separated args from FD\n"
         "  --argv0 VALUE             Set argv[0] for child command\n"
         "  --level-prefix            Prepend message level to output\n"
