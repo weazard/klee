@@ -10,6 +10,7 @@
 #   3. AF_UNIX socket bind()/connect() path translation (enter.c)
 #   4. Child exit-code propagation (ptrace_backend.c)
 #   5. Read-only EROFS errno + PID-ns getpid + no false Zypak detection
+#   6. FUSE /proc overlay shutdown does not deadlock klee
 set -e
 
 KLEE="${KLEE:-./klee}"
@@ -260,6 +261,25 @@ if [ -z "$zlog" ]; then
     pass "no false zypak detection on --bind / /"
 else
     fail "no false zypak detection (got: $zlog)"
+fi
+
+
+# ---------------------------------------------------------------------------
+# Fix 5: FUSE /proc overlay must not deadlock klee at shutdown.
+# The FUSE loop thread blocks reading /dev/fuse; fuse_unmount() must run
+# before pthread_join(), otherwise klee hangs on every --proc invocation
+# (i.e. all real Flatpak/Steam use).  No-op on builds without FUSE3.
+# ---------------------------------------------------------------------------
+echo "--- FUSE /proc overlay shutdown (no deadlock) ---"
+if timeout 20 $KLEE --bind / / --proc /proc -- /bin/true 2>/dev/null; then
+    pass "klee terminates with --proc (no FUSE deadlock)"
+else
+    rc=$?
+    if [ "$rc" = "124" ]; then
+        fail "klee hung at shutdown with --proc (FUSE deadlock)"
+    else
+        pass "klee terminates with --proc (rc=$rc)"
+    fi
 fi
 
 echo ""
