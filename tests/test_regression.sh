@@ -8,6 +8,8 @@
 #   1. Exec state reset after successful execve (event.c fix)
 #   2. prctl(PR_SET_DUMPABLE, 0) interception (enter.c fix)
 #   3. AF_UNIX socket bind()/connect() path translation (enter.c)
+#   4. Child exit-code propagation (ptrace_backend.c)
+#   5. Read-only EROFS errno + PID-ns getpid + no false Zypak detection
 set -e
 
 KLEE="${KLEE:-./klee}"
@@ -200,6 +202,64 @@ finally:
     fi
 else
     echo "  SKIP: python3 not available (socket tests)"
+fi
+
+
+# ---------------------------------------------------------------------------
+# Fix 4: Child exit-code propagation (ptrace_backend.c)
+# PTRACE_EVENT_EXIT's GETEVENTMSG is the raw wait status word; it must be
+# decoded with WEXITSTATUS, else exit(N) truncates to 0.
+# ---------------------------------------------------------------------------
+echo "--- Child exit-code propagation ---"
+rc0=0;  $KLEE --bind / / -- /bin/sh -c 'exit 0'  2>/dev/null || rc0=$?
+rc42=0; $KLEE --bind / / -- /bin/sh -c 'exit 42' 2>/dev/null || rc42=$?
+rc1=0;  $KLEE --bind / / -- /bin/sh -c 'exit 1'  2>/dev/null || rc1=$?
+if [ "$rc0" = "0" ] && [ "$rc42" = "42" ] && [ "$rc1" = "1" ]; then
+    pass "child exit status propagated"
+else
+    fail "child exit status propagated (got $rc0/$rc42/$rc1, want 0/42/1)"
+fi
+
+# ---------------------------------------------------------------------------
+# Fix 1: Read-only mounts return EROFS, not ENOSYS (event.c deny-override)
+# ---------------------------------------------------------------------------
+echo "--- Read-only returns EROFS (not ENOSYS) ---"
+if command -v python3 >/dev/null 2>&1; then
+    out=$($KLEE --ro-bind / / -- python3 -c '
+import os, errno
+try:
+    os.open("/klee-roerrno", os.O_WRONLY | os.O_CREAT, 0o644)
+    print("NOERR")
+except OSError as e:
+    print("EROFS" if e.errno == errno.EROFS else os.strerror(e.errno))
+' 2>/dev/null || true)
+    if echo "$out" | grep -q "EROFS"; then
+        pass "ro-bind returns EROFS"
+    else
+        fail "ro-bind returns EROFS (got: $out)"
+    fi
+else
+    echo "  SKIP: python3 not available (EROFS errno test)"
+fi
+
+# ---------------------------------------------------------------------------
+# Fix 2/3: --unshare-pid virtualizes getpid() to 1, and a plain root bind is
+# NOT misdetected as Zypak (which used to force-disable the PID namespace).
+# ---------------------------------------------------------------------------
+echo "--- PID namespace getpid virtualization ---"
+out=$($KLEE --bind / / --unshare-pid -- /bin/sh -c 'echo $$' 2>/dev/null || true)
+if [ "$out" = "1" ]; then
+    pass "unshare-pid getpid()==1"
+else
+    fail "unshare-pid getpid()==1 (got: $out)"
+fi
+
+echo "--- No false Zypak detection on plain root bind ---"
+zlog=$(KLEE_LOG=info $KLEE --bind / / -- /bin/true 2>&1 | grep -i "zypak" || true)
+if [ -z "$zlog" ]; then
+    pass "no false zypak detection on --bind / /"
+else
+    fail "no false zypak detection (got: $zlog)"
 fi
 
 echo ""

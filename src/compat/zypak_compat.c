@@ -122,9 +122,16 @@ bool klee_zypak_detect_from_mounts(KleeMountTable *mt)
     };
 
     for (const char **p = zypak_paths; *p; p++) {
-        KleeMount *m = klee_mount_table_resolve(mt, *p);
-        if (m) {
-            KLEE_DEBUG("zypak: detected via mount table: %s", *p);
+        /* A root bind (`--bind / /`) makes resolve() match every path, so
+         * mount coverage alone is NOT evidence of Zypak — that misdetects
+         * every ordinary sandbox that bind-mounts / as Chrome/Zypak and
+         * silently forces unshare_user / uid=1000 / disables unshare_pid.
+         * Require the helper to actually exist at the translated host path. */
+        char host_path[PATH_MAX];
+        if (klee_mount_table_translate(mt, *p, host_path, sizeof(host_path)) < 0)
+            continue;
+        if (access(host_path, F_OK) == 0) {
+            KLEE_DEBUG("zypak: detected via mount table: %s -> %s", *p, host_path);
             return true;
         }
     }

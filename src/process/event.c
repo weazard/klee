@@ -213,6 +213,18 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
          * enter-stop before the exit-stop.  Skip that extra stop. */
         if (proc->state == PROC_STATE_SYSCALL_ENTER &&
             el->interceptor->backend == INTERCEPT_PTRACE) {
+            if (proc->deny_errno) {
+                /* A syscall denied on enter returns -ENOSYS from the
+                 * injected invalid syscall, so its exit-stop looks like an
+                 * enter-stop.  Route to the exit path so the intended errno
+                 * override runs — this must take priority over the seccomp
+                 * "extra enter-stop" skip below, which would otherwise
+                 * swallow the exit and leak ENOSYS (e.g. EROFS on ro-bind). */
+                proc->seccomp_entered = false;
+                event->type = KLEE_EVENT_SYSCALL_EXIT;
+                event->syscall_nr = proc->current_syscall;
+                goto handle_syscall_exit;
+            }
             if (proc->seccomp_entered) {
                 /* Extra enter-stop after PTRACE_EVENT_SECCOMP — skip it */
                 proc->seccomp_entered = false;

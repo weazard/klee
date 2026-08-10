@@ -196,10 +196,25 @@ static int ptrace_wait_event(KleeInterceptor *self, KleeEvent *out)
     case PTRACE_EVENT_EXEC:
         out->type = KLEE_EVENT_EXEC;
         break;
-    case PTRACE_EVENT_EXIT:
+    case PTRACE_EVENT_EXIT: {
+        /* GETEVENTMSG yields the raw wait(2) status word, not the exit
+         * code.  Decode it the same way the WIFEXITED/WIFSIGNALED paths
+         * above do — otherwise exit(N) stored raw as (N<<8) truncates to
+         * 0 in the process exit code and klee always reports success. */
+        unsigned long msg = 0;
+        ptrace(PTRACE_GETEVENTMSG, pid, 0, &msg);
+        int wstatus = (int)msg;
         out->type = KLEE_EVENT_EXIT;
-        ptrace(PTRACE_GETEVENTMSG, pid, 0, &out->retval);
+        if (WIFEXITED(wstatus)) {
+            out->retval = WEXITSTATUS(wstatus);
+        } else if (WIFSIGNALED(wstatus)) {
+            out->signal = WTERMSIG(wstatus);
+            out->retval = 128 + out->signal;
+        } else {
+            out->retval = wstatus;
+        }
         break;
+    }
     case PTRACE_EVENT_SECCOMP: {
         /* Seccomp pre-filter fired SECCOMP_RET_TRACE — this is a
          * syscall-enter stop for a syscall klee needs to intercept. */
