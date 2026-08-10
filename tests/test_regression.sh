@@ -13,6 +13,7 @@
 #   6. FUSE /proc overlay shutdown does not deadlock klee
 #   7. Flatpak layout (/app mount) must not trigger Zypak; peer creds consistent
 #   8. Genuine Zypak mode virtualizes to the real uid (D-Bus auth compat)
+#   9. bwrap 0.11.1/0.12 parity: SIGCHLD reset; --not-a-security-boundary
 set -e
 
 KLEE="${KLEE:-./klee}"
@@ -352,6 +353,36 @@ if [ "$got" = "$want" ]; then
     pass "zypak virtual uid == $want (real=$real_uid)"
 else
     fail "zypak virtual uid (got: '$got', want: $want, real: $real_uid)"
+fi
+
+
+# ---------------------------------------------------------------------------
+# bwrap 0.12 parity: --not-a-security-boundary is accepted and fail-open.
+# ---------------------------------------------------------------------------
+echo "--- --not-a-security-boundary accepted (bwrap 0.12) ---"
+rcf=0; $KLEE --not-a-security-boundary --bind / / -- /bin/sh -c 'exit 3' 2>/dev/null || rcf=$?
+if [ "$rcf" = "3" ]; then
+    pass "--not-a-security-boundary accepted, exit propagated"
+else
+    fail "--not-a-security-boundary (rc=$rcf, want 3)"
+fi
+
+# ---------------------------------------------------------------------------
+# bwrap 0.11.1 parity: inherited SIGCHLD=SIG_IGN must not break the sandbox.
+# Ptraced children are exempt from auto-reaping, but the seccomp-unotify
+# signalfd path discards ignored signals; klee resets the disposition.
+# ---------------------------------------------------------------------------
+echo "--- SIGCHLD=SIG_IGN parent: exit code still propagates ---"
+if command -v python3 >/dev/null 2>&1; then
+    rcs=0
+    python3 -c "import signal,os; signal.signal(signal.SIGCHLD, signal.SIG_IGN); os.execv(\"$KLEE\",[\"$KLEE\",\"--bind\",\"/\",\"/\",\"--\",\"/bin/sh\",\"-c\",\"exit 7\"])" 2>/dev/null || rcs=$?
+    if [ "$rcs" = "7" ]; then
+        pass "exit code propagates with SIGCHLD ignored"
+    else
+        fail "exit code with SIGCHLD ignored (rc=$rcs, want 7)"
+    fi
+else
+    echo "  SKIP: python3 not available (SIGCHLD test)"
 fi
 
 echo ""
