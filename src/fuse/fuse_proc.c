@@ -592,12 +592,17 @@ void klee_fuse_proc_destroy(KleeFuseProc *fp)
         return;
     if (fp->se)
         fuse_session_exit(fp->se);
+    /* Unmount BEFORE joining: the loop thread is blocked in a read on
+     * /dev/fuse, and fuse_session_exit() only sets a flag.  Unmounting
+     * makes that read return so the thread can observe the exit flag;
+     * joining first deadlocks klee at shutdown on every --proc invocation
+     * (i.e. all real Flatpak/Steam use). */
+    if (fp->fuse)
+        fuse_unmount(fp->fuse);
     if (fp->thread_started)
         pthread_join(fp->fuse_thread, NULL);
-    if (fp->fuse) {
-        fuse_unmount(fp->fuse);
+    if (fp->fuse)
         fuse_destroy(fp->fuse);
-    }
     rmdir(fp->mount_path);
     free(fp);
 }
