@@ -391,15 +391,22 @@ int main(int argc, char **argv)
             sandbox->unshare_user = true;
             KLEE_INFO("zypak: forced unshare_user for Chrome compatibility");
         }
-        /* Default to uid/gid 1000 if bwrap didn't specify --uid/--gid.
-         * Chrome's root check is geteuid()==0, so the virtual uid must
-         * be non-zero for processes that don't have --no-sandbox. */
+        /* Default the virtual uid/gid if bwrap didn't specify --uid/--gid.
+         * Chrome's root check is geteuid()==0, so the virtual uid must be
+         * non-zero — but it must otherwise match the REAL uid: D-Bus
+         * EXTERNAL auth compares the client-claimed uid (getuid) against
+         * SO_PEERCRED on the host daemon, so a fabricated uid (e.g. a
+         * hardcoded 1000 when running as any other user) breaks every
+         * session/system bus connection from the sandbox.  Only fall back
+         * to 1000 when the real uid is 0. */
         if (!cfg.uid_set) {
-            cfg.uid = 1000;
+            uid_t ruid = getuid();
+            cfg.uid = (ruid != 0) ? (int)ruid : 1000;
             cfg.uid_set = true;
         }
         if (!cfg.gid_set) {
-            cfg.gid = 1000;
+            gid_t rgid = getgid();
+            cfg.gid = (rgid != 0) ? (int)rgid : 1000;
             cfg.gid_set = true;
         }
         /* Disable PID namespace virtualization for Chrome/Zypak.
