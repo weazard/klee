@@ -209,6 +209,20 @@ static void child_process(KleeInterceptor *interceptor, const KleeConfig *cfg,
 
 int main(int argc, char **argv)
 {
+    /* Refuse to run setuid/setgid.  klee performs no privileged setup and
+     * gains nothing from elevated ids; running interception machinery with
+     * mismatched real/effective ids only creates attack surface.  This
+     * matches bubblewrap >= 0.11.2, which disables setuid support by
+     * default (CVE-2026-41163). */
+    if (geteuid() != getuid() || getegid() != getgid()) {
+        fprintf(stderr,
+                "klee: refusing to run with elevated privileges "
+                "(euid %d != uid %d or egid %d != gid %d); "
+                "klee must not be installed setuid/setgid\n",
+                (int)geteuid(), (int)getuid(), (int)getegid(), (int)getgid());
+        return 1;
+    }
+
     /* Initialize logging */
     klee_log_init(parse_log_level());
 
@@ -217,6 +231,13 @@ int main(int argc, char **argv)
     /* Ignore SIGTTOU so klee doesn't stop when the child takes the
      * terminal foreground process group via tcsetpgrp(). */
     signal(SIGTTOU, SIG_IGN);
+
+    /* Reset SIGCHLD disposition.  If klee was spawned from a process that
+     * ignores SIGCHLD (Erlang VMs, volumeicon, some daemons), the SIG_IGN
+     * disposition is inherited across exec and the kernel auto-reaps our
+     * children — breaking the waitpid()-driven ptrace event loop and exit
+     * status collection.  Matches bubblewrap 0.11.1 (#705). */
+    signal(SIGCHLD, SIG_DFL);
 
     /* Parse CLI */
     KleeConfig cfg;
@@ -313,8 +334,14 @@ int main(int argc, char **argv)
 
     rc = klee_mount_table_populate(mount_table, &cfg);
     if (rc < 0) {
-        KLEE_ERROR("failed to populate mount table: %d", rc);
-        goto cleanup;
+        if (cfg.not_a_security_boundary) {
+            /* bwrap 0.12 --not-a-security-boundary: fail open */
+            KLEE_WARN("mount table population failed (%d); continuing "
+                      "because --not-a-security-boundary was given", rc);
+        } else {
+            KLEE_ERROR("failed to populate mount table: %d", rc);
+            goto cleanup;
+        }
     }
 
     /* Auto-provision private /tmp when user namespace virtualization is
@@ -391,22 +418,15 @@ int main(int argc, char **argv)
             sandbox->unshare_user = true;
             KLEE_INFO("zypak: forced unshare_user for Chrome compatibility");
         }
-        /* Default the virtual uid/gid if bwrap didn't specify --uid/--gid.
-         * Chrome's root check is geteuid()==0, so the virtual uid must be
-         * non-zero — but it must otherwise match the REAL uid: D-Bus
-         * EXTERNAL auth compares the client-claimed uid (getuid) against
-         * SO_PEERCRED on the host daemon, so a fabricated uid (e.g. a
-         * hardcoded 1000 when running as any other user) breaks every
-         * session/system bus connection from the sandbox.  Only fall back
-         * to 1000 when the real uid is 0. */
+        /* Default to uid/gid 1000 if bwrap didn't specify --uid/--gid.
+         * Chrome's root check is geteuid()==0, so the virtual uid must
+         * be non-zero for processes that don't have --no-sandbox. */
         if (!cfg.uid_set) {
-            uid_t ruid = getuid();
-            cfg.uid = (ruid != 0) ? (int)ruid : 1000;
+            cfg.uid = 1000;
             cfg.uid_set = true;
         }
         if (!cfg.gid_set) {
-            gid_t rgid = getgid();
-            cfg.gid = (rgid != 0) ? (int)rgid : 1000;
+            cfg.gid = 1000;
             cfg.gid_set = true;
         }
         /* Disable PID namespace virtualization for Chrome/Zypak.

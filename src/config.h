@@ -154,6 +154,9 @@ typedef struct klee_config {
     /* Assert userns disabled */
     bool assert_userns_disabled;
 
+    /* bwrap 0.12: tolerate sandbox setup failures (fail-open) */
+    bool not_a_security_boundary;
+
     /* User namespace block fd */
     int userns_block_fd;
 

@@ -182,6 +182,7 @@ These affect the next mount operation only:
 | `--userns-block-fd FD`             | 1  | Block on FD before setting up user ns    |
 | `--disable-userns`                 | 0  | Disable further user namespace creation  |
 | `--assert-userns-disabled`         | 0  | Fail if user namespaces are not disabled |
+| `--not-a-security-boundary`        | 0  | Do not fail hard on sandbox setup errors (bwrap 0.12) |
 
 ## Environment Variables
 
