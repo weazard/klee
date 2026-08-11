@@ -133,7 +133,7 @@ tests/test_fd_table: tests/test_fd_table.c src/fs/fd_table.o $(COMMON_TEST_OBJS)
 tests/test_mount_syscalls: tests/test_mount_syscalls.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-test: $(TEST_BINS)
+test: $(TEST_BINS) tests/test_mount_syscalls
 	@echo "=== Running unit tests ==="
 	@failed=0; \
 	for t in $(TEST_BINS); do \

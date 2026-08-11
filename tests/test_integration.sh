@@ -82,6 +82,35 @@ else
     fail "chdir (got: $output)"
 fi
 
+# Test 9: mount(2)/umount2(2)/chroot(2) emulation (full syscall suite)
+echo "--- mount/umount/chroot syscalls ---"
+if [ -x tests/test_mount_syscalls ]; then
+    if $KLEE --dev-bind / / -- ./tests/test_mount_syscalls >/dev/null 2>&1; then
+        pass "mount/umount/chroot syscall suite"
+    else
+        fail "mount/umount/chroot syscall suite (run manually: $KLEE --dev-bind / / -- ./tests/test_mount_syscalls)"
+    fi
+else
+    fail "tests/test_mount_syscalls not built (run: make tests/test_mount_syscalls)"
+fi
+
+# Test 10: mount from a shell inside the sandbox.
+# util-linux mount(8) checks geteuid()==0 itself before calling mount(2),
+# so run as virtual root (--unshare-user --uid 0) like real bwrap users do.
+echo "--- mount via shell ---"
+output=$($KLEE --dev-bind / / --unshare-user --uid 0 --gid 0 -- /bin/sh -c '
+    d=$(mktemp -d)
+    /bin/mount -t tmpfs tmpfs "$d" 2>/dev/null || exit 1
+    echo hi > "$d/f" && cat "$d/f"
+    /bin/umount "$d" 2>/dev/null || exit 1
+    test ! -e "$d/f" && echo clean
+    rmdir "$d"' 2>/dev/null || true)
+if echo "$output" | grep -q "hi" && echo "$output" | grep -q "clean"; then
+    pass "shell mount/umount tmpfs (as virtual root)"
+else
+    fail "shell mount/umount tmpfs (got: $output)"
+fi
+
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
 exit $FAIL
