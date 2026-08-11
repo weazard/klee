@@ -130,9 +130,16 @@ static int seccomp_respond(KleeInterceptor *self, KleeEvent *event,
     memset(&resp, 0, sizeof(resp));
 
     resp.id = event->notif_id;
-    resp.val = retval;
-    resp.error = err ? -err : 0;
-    resp.flags = (err == 0 && retval == 0) ? SECCOMP_USER_NOTIF_FLAG_CONTINUE : 0;
+    if (err == KLEE_RESPOND_EMULATE) {
+        /* Fully emulated syscall: tracee observes retval as the result */
+        resp.val = retval;
+        resp.error = 0;
+        resp.flags = 0;
+    } else {
+        resp.val = retval;
+        resp.error = err ? -err : 0;
+        resp.flags = (err == 0 && retval == 0) ? SECCOMP_USER_NOTIF_FLAG_CONTINUE : 0;
+    }
 
     if (ioctl(self->seccomp.notif_fd, SECCOMP_IOCTL_NOTIF_SEND, &resp) < 0) {
         if (errno == ENOENT) {

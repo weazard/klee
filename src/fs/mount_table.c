@@ -73,6 +73,254 @@ int klee_mount_table_add(KleeMountTable *mt, MountType type,
     return 0;
 }
 
+/* ==== Runtime mutation APIs (mount(2)/umount2(2) emulation) ==== */
+
+int klee_mount_table_mount(KleeMountTable *mt, MountType type,
+                            const char *source, const char *dest,
+                            bool readonly, int perms, KleeMount **out)
+{
+    if (!mt || !dest)
+        return -EINVAL;
+
+    KleeMount *mount = klee_arena_calloc(mt->arena, 1, sizeof(KleeMount));
+    if (!mount)
+        return -ENOMEM;
+
+    mount->type = type;
+    mount->source = source ? klee_arena_strdup(mt->arena, source) : NULL;
+    mount->dest = klee_arena_strdup(mt->arena, dest);
+    mount->is_readonly = readonly;
+    mount->perms = perms;
+
+    /* klee_radix_insert stacks on top of an existing mount (kernel
+     * shadow-mount semantics) */
+    RadixNode *node = klee_radix_insert(mt->tree, dest, mount);
+    if (!node)
+        return -ENOMEM;
+
+    mt->num_mounts++;
+    if (out)
+        *out = mount;
+    KLEE_DEBUG("runtime mount: type=%d src=%s dest=%s ro=%d",
+               type, source ? source : "(null)", dest, readonly);
+    return 0;
+}
+
+/* Count mounts in a stacked chain */
+static size_t mount_chain_len(const KleeMount *m)
+{
+    size_t n = 0;
+    for (; m; m = m->stacked)
+        n++;
+    return n;
+}
+
+/* Does any node strictly beneath `node` carry a mount? */
+static bool subtree_has_mounts(const RadixNode *node)
+{
+    for (RadixNode *child = node->children; child; child = child->sibling) {
+        if (child->mount)
+            return true;
+        if (subtree_has_mounts(child))
+            return true;
+    }
+    return false;
+}
+
+/* Remove every mount strictly beneath `node`; returns number removed */
+static size_t subtree_clear_mounts(RadixNode *node)
+{
+    size_t n = 0;
+    for (RadixNode *child = node->children; child; child = child->sibling) {
+        if (child->mount) {
+            n += mount_chain_len(child->mount);
+            child->mount = NULL;
+        }
+        n += subtree_clear_mounts(child);
+    }
+    return n;
+}
+
+int klee_mount_table_umount(KleeMountTable *mt, const char *dest,
+                             bool detach_children)
+{
+    if (!mt || !dest)
+        return -EINVAL;
+
+    RadixNode *node = klee_radix_find_exact(mt->tree, dest);
+    if (!node || !node->mount)
+        return -EINVAL;
+
+    if (subtree_has_mounts(node)) {
+        if (!detach_children)
+            return -EBUSY;
+        size_t removed = subtree_clear_mounts(node);
+        mt->num_mounts = (mt->num_mounts > removed)
+                       ? mt->num_mounts - removed : 0;
+    }
+
+    /* Stacked mount: pop, revealing the previous mount underneath */
+    if (node->mount->stacked)
+        node->mount = node->mount->stacked;
+    else
+        node->mount = NULL;
+
+    if (mt->num_mounts > 0)
+        mt->num_mounts--;
+    KLEE_DEBUG("runtime umount: dest=%s detach=%d", dest, detach_children);
+    return 0;
+}
+
+int klee_mount_table_remount(KleeMountTable *mt, const char *dest,
+                              bool readonly)
+{
+    if (!mt || !dest)
+        return -EINVAL;
+
+    RadixNode *node = klee_radix_find_exact(mt->tree, dest);
+    if (!node || !node->mount)
+        return -EINVAL;
+
+    node->mount->is_readonly = readonly;
+    KLEE_DEBUG("runtime remount: dest=%s ro=%d", dest, readonly);
+    return 0;
+}
+
+/* Collected (path, mount) pair for MS_MOVE */
+struct move_ent {
+    char path[PATH_MAX];
+    KleeMount *mount;
+};
+
+static int collect_subtree(RadixNode *node, const char *path,
+                            struct move_ent **ents, size_t *n, size_t *cap)
+{
+    if (node->mount) {
+        if (*n == *cap) {
+            size_t newcap = *cap ? *cap * 2 : 8;
+            struct move_ent *grown = realloc(*ents,
+                                              newcap * sizeof(**ents));
+            if (!grown)
+                return -ENOMEM;
+            *ents = grown;
+            *cap = newcap;
+        }
+        snprintf((*ents)[*n].path, PATH_MAX, "%s", path);
+        (*ents)[*n].mount = node->mount;
+        (*n)++;
+    }
+
+    for (RadixNode *child = node->children; child; child = child->sibling) {
+        char child_path[PATH_MAX];
+        int len = snprintf(child_path, sizeof(child_path), "%s/%.*s",
+                           strcmp(path, "/") == 0 ? "" : path,
+                           (int)child->component_len, child->component);
+        if (len < 0 || (size_t)len >= sizeof(child_path))
+            return -ENAMETOOLONG;
+        int rc = collect_subtree(child, child_path, ents, n, cap);
+        if (rc < 0)
+            return rc;
+    }
+    return 0;
+}
+
+int klee_mount_table_move(KleeMountTable *mt, const char *src,
+                           const char *dest)
+{
+    if (!mt || !src || !dest)
+        return -EINVAL;
+
+    RadixNode *snode = klee_radix_find_exact(mt->tree, src);
+    if (!snode || !snode->mount)
+        return -EINVAL;
+
+    /* Cannot move a mount underneath itself (kernel: -EINVAL) */
+    size_t slen = strlen(src);
+    if (strncmp(dest, src, slen) == 0 &&
+        (dest[slen] == '/' || dest[slen] == '\0'))
+        return -EINVAL;
+
+    /* Collect the mount and everything beneath it */
+    struct move_ent *ents = NULL;
+    size_t n = 0, cap = 0;
+    int rc = collect_subtree(snode, src, &ents, &n, &cap);
+    if (rc < 0) {
+        free(ents);
+        return rc;
+    }
+
+    /* Detach source subtree */
+    snode->mount = NULL;
+    subtree_clear_mounts(snode);
+
+    /* Re-attach at dest, preserving relative structure */
+    for (size_t i = 0; i < n; i++) {
+        char new_path[PATH_MAX];
+        const char *rel = ents[i].path + slen;   /* "" for the root entry */
+        int len;
+        if (*rel)
+            len = snprintf(new_path, sizeof(new_path), "%s%s", dest, rel);
+        else
+            len = snprintf(new_path, sizeof(new_path), "%s", dest);
+        if (len < 0 || (size_t)len >= sizeof(new_path)) {
+            free(ents);
+            return -ENAMETOOLONG;
+        }
+        ents[i].mount->dest = klee_arena_strdup(mt->arena, new_path);
+        if (!klee_radix_insert(mt->tree, new_path, ents[i].mount)) {
+            free(ents);
+            return -ENOMEM;
+        }
+    }
+
+    free(ents);
+    KLEE_DEBUG("runtime move: %s -> %s (%zu entries)", src, dest, n);
+    return 0;
+}
+
+static void set_prop_walk(RadixNode *node, KleePropagation prop, int group)
+{
+    for (RadixNode *child = node->children; child; child = child->sibling) {
+        if (child->mount) {
+            child->mount->propagation = prop;
+            child->mount->peer_group = group;
+        }
+        set_prop_walk(child, prop, group);
+    }
+}
+
+int klee_mount_table_set_propagation(KleeMountTable *mt, const char *dest,
+                                      KleePropagation prop, bool recursive)
+{
+    static int next_peer_group = 1;
+
+    if (!mt || !dest)
+        return -EINVAL;
+
+    RadixNode *node = klee_radix_find_exact(mt->tree, dest);
+    if (!node || !node->mount)
+        return -EINVAL;
+
+    int group = (prop == KLEE_PROP_SHARED) ? next_peer_group++ : 0;
+    node->mount->propagation = prop;
+    node->mount->peer_group = group;
+    if (recursive)
+        set_prop_walk(node, prop, group);
+
+    KLEE_DEBUG("runtime propagation: dest=%s prop=%d rec=%d",
+               dest, prop, recursive);
+    return 0;
+}
+
+KleeMount *klee_mount_table_find_exact(const KleeMountTable *mt,
+                                        const char *dest)
+{
+    if (!mt || !dest)
+        return NULL;
+    RadixNode *node = klee_radix_find_exact(mt->tree, dest);
+    return node ? node->mount : NULL;
+}
+
 int klee_mount_table_populate(KleeMountTable *mt, const KleeConfig *cfg)
 {
     for (KleeMountOp *op = cfg->mount_ops; op; op = op->next) {

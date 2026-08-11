@@ -38,6 +38,14 @@ typedef struct {
 
 typedef struct klee_interceptor KleeInterceptor;
 
+/* Special `err` value for respond(): the syscall's full effect was applied
+ * by the supervisor (e.g. a virtual mount) — suppress the real syscall and
+ * make the tracee observe `retval` as the result.
+ * For seccomp_unotify this responds with val=retval, error=0 immediately.
+ * For ptrace this skips the syscall (orig_rax = -1); the event loop must
+ * override the return value at the exit stop (proc->emulate_pending). */
+#define KLEE_RESPOND_EMULATE (-1)
+
 struct klee_interceptor {
     InterceptBackend backend;
 

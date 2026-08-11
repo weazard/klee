@@ -213,13 +213,15 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
          * enter-stop before the exit-stop.  Skip that extra stop. */
         if (proc->state == PROC_STATE_SYSCALL_ENTER &&
             el->interceptor->backend == INTERCEPT_PTRACE) {
-            if (proc->deny_errno) {
-                /* A syscall denied on enter returns -ENOSYS from the
-                 * injected invalid syscall, so its exit-stop looks like an
-                 * enter-stop.  Route to the exit path so the intended errno
-                 * override runs — this must take priority over the seccomp
-                 * "extra enter-stop" skip below, which would otherwise
-                 * swallow the exit and leak ENOSYS (e.g. EROFS on ro-bind). */
+            if (proc->deny_errno || proc->emulate_pending) {
+                /* A syscall denied or emulated on enter returns -ENOSYS
+                 * from the injected invalid syscall, so its exit-stop looks
+                 * like an enter-stop.  Route to the exit path so the
+                 * intended errno/retval override runs — this must take
+                 * priority over the seccomp "extra enter-stop" skip below,
+                 * which would otherwise swallow the exit and leak ENOSYS
+                 * (e.g. EROFS on ro-bind, or ENOSYS instead of 0 for an
+                 * emulated mount). */
                 proc->seccomp_entered = false;
                 event->type = KLEE_EVENT_SYSCALL_EXIT;
                 event->syscall_nr = proc->current_syscall;
@@ -242,6 +244,8 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
                                  el->interceptor->ptrace.seccomp_filter;
         proc->path_arg_count = 0;
         proc->deny_errno = 0;
+        proc->emulate_pending = false;
+        proc->emulate_retval = 0;
         proc->resolved_guest[0] = '\0';
         klee_arena_reset(proc->event_arena);
 
@@ -251,7 +255,21 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
              * (-1 → kernel returns ENOSYS) and store the real errno to
              * override at the exit stop. */
             proc->deny_errno = -rc;
+            proc->emulate_pending = false;
             el->interceptor->respond(el->interceptor, event, -1, -rc);
+            return 0;
+        }
+        if (proc->emulate_pending) {
+            /* The handler applied the syscall's full effect in klee's
+             * virtual state (mount table, per-process root, ...).
+             * Suppress the real syscall and surface emulate_retval. */
+            el->interceptor->respond(el->interceptor, event,
+                                      proc->emulate_retval,
+                                      KLEE_RESPOND_EMULATE);
+            if (el->interceptor->backend == INTERCEPT_SECCOMP_UNOTIFY)
+                proc->emulate_pending = false;
+            /* ptrace: emulate_pending stays set so the exit stop routes
+             * through the retval-override path below. */
             return 0;
         }
         /* Continue the syscall */
@@ -294,15 +312,20 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
         /* Consolidate all register modifications into a single push */
         bool need_reg_push = false;
 
-        /* If the syscall was denied on enter, override the return value
-         * (kernel returned ENOSYS for the invalid -1 syscall) with the
-         * actual errno we want the tracee to see. */
-        if (proc->deny_errno && el->interceptor->backend == INTERCEPT_PTRACE) {
+        /* If the syscall was denied or emulated on enter, override the
+         * return value (kernel returned ENOSYS for the invalid -1 syscall)
+         * with the errno/retval we want the tracee to see. */
+        if ((proc->deny_errno || proc->emulate_pending) &&
+            el->interceptor->backend == INTERCEPT_PTRACE) {
             klee_regs_fetch(el->interceptor, proc);
-            klee_regs_set_result(proc, (long)-proc->deny_errno);
+            if (proc->emulate_pending)
+                klee_regs_set_result(proc, proc->emulate_retval);
+            else
+                klee_regs_set_result(proc, (long)-proc->deny_errno);
             need_reg_push = true;
             proc->deny_errno = 0;
-            /* Skip normal exit dispatch — syscall was denied */
+            proc->emulate_pending = false;
+            /* Skip normal exit dispatch — syscall was denied/emulated */
             if (need_reg_push)
                 klee_regs_push(el->interceptor, proc);
             proc->state = PROC_STATE_RUNNING;
@@ -364,6 +387,7 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
         proc->path_modified = false;
         proc->path_arg_count = 0;
         proc->seccomp_entered = false;
+        proc->emulate_pending = false;
         if (el->interceptor->backend == INTERCEPT_PTRACE)
             el->interceptor->continue_running(el->interceptor, event->pid, 0);
         break;

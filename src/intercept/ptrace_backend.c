@@ -292,6 +292,9 @@ static int ptrace_respond(KleeInterceptor *self, KleeEvent *event,
 {
     (void)retval;
     if (err) {
+        /* Non-zero err: deny (positive errno) or KLEE_RESPOND_EMULATE.
+         * Both skip the real syscall; the event loop overrides the
+         * return value at the exit stop (deny_errno / emulate_retval). */
         ptrace_skip_syscall(self, event->pid, -err);
     }
     return ptrace_continue(self, event->pid, 0);

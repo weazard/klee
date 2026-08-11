@@ -71,6 +71,9 @@ typedef struct klee_process {
     KleeFdTable *fd_table;
     char vcwd[PATH_MAX];
     char vexe[PATH_MAX];
+    char vroot[PATH_MAX];       /* per-process virtual root (chroot(2)).
+                                 * Empty string = follow the sandbox-global
+                                 * mount-table root (pivot_root semantics). */
 
     KleeIdState *id_state;
     KleeSandbox *sandbox;
@@ -89,6 +92,9 @@ typedef struct klee_process {
     /* Current syscall info */
     int current_syscall;
     int deny_errno;             /* non-zero when syscall was denied on enter */
+    bool emulate_pending;       /* syscall fully emulated on enter: skip the
+                                 * real syscall, tracee sees emulate_retval */
+    long emulate_retval;        /* result value for emulated syscalls */
     bool seccomp_entered;       /* waiting for extra enter-stop after SECCOMP event */
     bool suppress_initial_stop; /* suppress first SIGSTOP after fork (ptrace artifact) */
     bool skip_uid_virt;         /* skip UID/GID virtualization for this process
@@ -130,6 +136,10 @@ KleeProcess *klee_process_fork(KleeProcessTable *pt, KleeProcess *parent,
 
 /* Handle exec: clear cloexec FDs, update vexe */
 void klee_process_exec(KleeProcess *proc, const char *new_exe);
+
+/* Effective virtual root for a process: per-process chroot if set,
+ * otherwise the sandbox-global mount-table root. Never returns NULL. */
+const char *klee_process_vroot(const KleeProcess *proc);
 
 /* Create/destroy sandbox */
 KleeSandbox *klee_sandbox_create(void);

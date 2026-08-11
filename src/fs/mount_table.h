@@ -15,6 +15,15 @@
 /* Forward declaration */
 typedef struct klee_overlay_mount KleeOverlayMount;
 
+/* Mount propagation (recorded for mountinfo faithfulness; semantically a
+ * no-op since klee models a single mount namespace) */
+typedef enum {
+    KLEE_PROP_PRIVATE = 0,
+    KLEE_PROP_SHARED,
+    KLEE_PROP_SLAVE,
+    KLEE_PROP_UNBINDABLE,
+} KleePropagation;
+
 typedef struct klee_mount {
     MountType type;
     char *source;       /* host path (for binds) */
@@ -22,6 +31,9 @@ typedef struct klee_mount {
     unsigned long flags;
     bool is_readonly;
     int perms;
+    KleePropagation propagation;  /* MS_SHARED/PRIVATE/SLAVE/UNBINDABLE */
+    int peer_group;               /* shared:N id for mountinfo */
+    bool expire_pending;          /* MNT_EXPIRE mark (two-phase umount) */
     struct klee_mount *stacked;  /* shadow stack for overlapping mounts */
     KleeOverlayMount *overlay;  /* overlay state (for overlay mounts) */
 } KleeMount;
@@ -46,6 +58,42 @@ int klee_mount_table_populate(KleeMountTable *mt, const KleeConfig *cfg);
 int klee_mount_table_add(KleeMountTable *mt, MountType type,
                           const char *source, const char *dest,
                           bool readonly, int perms);
+
+/* ==== Runtime mutation APIs (mount(2)/umount2(2) emulation) ==== */
+
+/* Runtime mount: like add, but returns the created mount via out (optional).
+ * Mounting over an existing mountpoint stacks (kernel shadow semantics). */
+int klee_mount_table_mount(KleeMountTable *mt, MountType type,
+                            const char *source, const char *dest,
+                            bool readonly, int perms, KleeMount **out);
+
+/* Runtime umount at an exact mountpoint.
+ * - Not a mountpoint → -EINVAL
+ * - Mounts exist beneath it and !detach_children → -EBUSY
+ * - Stacked mount → pop, revealing the previous mount
+ * detach_children (MNT_DETACH) also removes every mount beneath dest. */
+int klee_mount_table_umount(KleeMountTable *mt, const char *dest,
+                             bool detach_children);
+
+/* Runtime remount: toggle read-only flag on an existing mountpoint.
+ * Not a mountpoint → -EINVAL. */
+int klee_mount_table_remount(KleeMountTable *mt, const char *dest,
+                              bool readonly);
+
+/* Runtime MS_MOVE: relocate a mountpoint (and every mount beneath it)
+ * from src to dest.  src not a mountpoint → -EINVAL. */
+int klee_mount_table_move(KleeMountTable *mt, const char *src,
+                           const char *dest);
+
+/* Set propagation type on an existing mountpoint (recursive per MS_REC).
+ * Not a mountpoint → -EINVAL. */
+int klee_mount_table_set_propagation(KleeMountTable *mt, const char *dest,
+                                      KleePropagation prop, bool recursive);
+
+/* Exact-mountpoint lookup (no prefix matching). NULL if dest is not a
+ * mountpoint. */
+KleeMount *klee_mount_table_find_exact(const KleeMountTable *mt,
+                                        const char *dest);
 
 /* Resolve a guest path to the best matching mount.
  * Returns the mount entry, or NULL if no mount matches. */

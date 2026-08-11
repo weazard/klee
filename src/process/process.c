@@ -3,6 +3,7 @@
  * Per-process state management implementation
  */
 #include "process/process.h"
+#include "fs/mount_table.h"
 #include "ns/ipc_ns.h"
 #include "util/log.h"
 
@@ -145,6 +146,7 @@ KleeProcess *klee_process_fork(KleeProcessTable *pt, KleeProcess *parent,
     /* Copy state from parent */
     memcpy(child->vcwd, parent->vcwd, PATH_MAX);
     memcpy(child->vexe, parent->vexe, PATH_MAX);
+    memcpy(child->vroot, parent->vroot, PATH_MAX);
     child->skip_uid_virt = parent->skip_uid_virt;
 
     /* Clone FD table */
@@ -175,6 +177,17 @@ void klee_process_exec(KleeProcess *proc, const char *new_exe)
     klee_arena_reset(proc->event_arena);
 
     KLEE_DEBUG("exec: pid=%d exe=%s", proc->real_pid, proc->vexe);
+}
+
+const char *klee_process_vroot(const KleeProcess *proc)
+{
+    if (!proc)
+        return "/";
+    if (proc->vroot[0] != '\0')
+        return proc->vroot;
+    if (proc->sandbox && proc->sandbox->mount_table)
+        return klee_mount_table_get_root(proc->sandbox->mount_table);
+    return "/";
 }
 
 KleeSandbox *klee_sandbox_create(void)
