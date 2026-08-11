@@ -19,15 +19,28 @@
 #include "util/log.h"
 
 #include <errno.h>
+#include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <linux/seccomp.h>
 #include <linux/openat2.h>
 #include <sys/ioctl.h>
+#include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
+
+#include "fs/pivot.h"
+#include "fs/tmpfs.h"
+
+#ifndef UMOUNT_NOFOLLOW
+#define UMOUNT_NOFOLLOW 8
+#endif
+#ifndef MNT_EXPIRE
+#define MNT_EXPIRE 4
+#endif
 
 /*
  * Helper: translate a path argument at the given register index.
@@ -1161,25 +1174,435 @@ int klee_enter_chdir(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     return translate_path_arg(proc, ic, ev, 0, -1);
 }
 
-int klee_enter_chroot(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+/* ==================== mount(2) / umount2(2) / chroot(2) ====================
+ *
+ * These syscalls are fully emulated: their effect is applied to klee's
+ * virtual mount table (or the process's virtual root), the real syscall is
+ * suppressed, and the tracee observes 0.  Forwarding the real syscall would
+ * either fail with EPERM (unprivileged) or mutate the HOST namespace.
+ * Error codes mirror the kernel (fs/namespace.c, fs/open.c). */
+
+/* Resolve a path argument to an absolute guest path + host path, without
+ * rewriting tracee memory.  Returns 0 or -errno. */
+static int resolve_path_arg(KleeProcess *proc, KleeInterceptor *ic,
+                             KleeEvent *ev, int arg_idx, bool nofollow,
+                             char *guest_out, char *host_out)
 {
-    /* Intercept chroot: update virtual root instead */
-    translate_path_arg(proc, ic, ev, 0, -1);
-    return -EPERM; /* Block real chroot, simulate it */
+    void *path_addr = (void *)(uintptr_t)ev->args[arg_idx];
+    if (!path_addr)
+        return -EFAULT;
+
+    char raw[PATH_MAX];
+    int rc = klee_read_path(ic, ev->pid, raw, sizeof(raw), path_addr);
+    if (rc < 0)
+        return -EFAULT;
+    if (raw[0] == '\0')
+        return -ENOENT;
+
+    if (!proc->sandbox || !proc->sandbox->mount_table)
+        return -EINVAL;
+
+    KleeResolveCtx ctx = {
+        .mount_table = proc->sandbox->mount_table,
+        .fd_table = proc->fd_table,
+        .vcwd = proc->vcwd,
+        .vroot = klee_process_vroot(proc),
+        .flags = 0,
+    };
+
+    if (nofollow)
+        rc = klee_path_resolve_nofollow(&ctx, raw, guest_out, AT_FDCWD);
+    else
+        rc = klee_path_resolve(&ctx, raw, guest_out, AT_FDCWD);
+    if (rc < 0)
+        return rc;
+
+    return klee_mount_table_translate(ctx.mount_table, guest_out,
+                                       host_out, PATH_MAX);
+}
+
+/* stat a host path; classify as dir/nondir/missing with kernel errnos.
+ * want_dir: -ENOENT if missing, -ENOTDIR if not a directory. */
+static int require_host_dir(const char *host)
+{
+    struct stat st;
+    if (stat(host, &st) < 0)
+        return -errno;
+    if (!S_ISDIR(st.st_mode))
+        return -ENOTDIR;
+    return 0;
+}
+
+/* Mark the syscall as fully emulated with the given result */
+static int emulate_ok(KleeProcess *proc)
+{
+    proc->emulate_pending = true;
+    proc->emulate_retval = 0;
+    return 0;
+}
+
+/* Extract "key=value" from mount data ("lowerdir=/a,upperdir=/b,...").
+ * Returns true and copies value into out on success. */
+static bool mount_data_get(const char *data, const char *key,
+                            char *out, size_t out_len)
+{
+    size_t key_len = strlen(key);
+    const char *p = data;
+    while (p && *p) {
+        while (*p == ',')
+            p++;
+        if (strncmp(p, key, key_len) == 0 && p[key_len] == '=') {
+            const char *v = p + key_len + 1;
+            const char *end = strchr(v, ',');
+            size_t len = end ? (size_t)(end - v) : strlen(v);
+            if (len >= out_len)
+                len = out_len - 1;
+            memcpy(out, v, len);
+            out[len] = '\0';
+            return true;
+        }
+        p = strchr(p, ',');
+    }
+    return false;
+}
+
+/* Resolve an option path from mount data through the guest mount table */
+static int resolve_data_path(KleeProcess *proc, const char *guest_in,
+                              char *host_out)
+{
+    KleeResolveCtx ctx = {
+        .mount_table = proc->sandbox->mount_table,
+        .fd_table = proc->fd_table,
+        .vcwd = proc->vcwd,
+        .vroot = klee_process_vroot(proc),
+        .flags = 0,
+    };
+    char guest_abs[PATH_MAX];
+    int rc = klee_path_resolve(&ctx, guest_in, guest_abs, AT_FDCWD);
+    if (rc < 0)
+        return rc;
+    return klee_mount_table_translate(ctx.mount_table, guest_abs,
+                                       host_out, PATH_MAX);
 }
 
 int klee_enter_mount(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    (void)ic; (void)ev;
-    KLEE_DEBUG("mount() intercepted from pid=%d, denying", proc->real_pid);
-    return -EPERM;
+    /* mount(source, target, filesystemtype, mountflags, data) */
+    unsigned long flags = (unsigned long)ev->args[3];
+    KleeMountTable *mt = proc->sandbox ? proc->sandbox->mount_table : NULL;
+    if (!mt)
+        return -EPERM;
+
+    char target_guest[PATH_MAX], target_host[PATH_MAX];
+    int rc = resolve_path_arg(proc, ic, ev, 1, false,
+                               target_guest, target_host);
+    if (rc < 0)
+        return rc;
+
+    /* --- Propagation change: MS_SHARED/PRIVATE/SLAVE/UNBINDABLE ---
+     * Kernel: these are exclusive of other operations; target must be a
+     * mountpoint (fs/namespace.c: do_change_type → -EINVAL). */
+    unsigned long prop_flags =
+        flags & (MS_SHARED | MS_PRIVATE | MS_SLAVE | MS_UNBINDABLE);
+    if (prop_flags) {
+        /* Exactly one propagation type allowed */
+        if (prop_flags & (prop_flags - 1))
+            return -EINVAL;
+        if (flags & ~(MS_SHARED | MS_PRIVATE | MS_SLAVE | MS_UNBINDABLE |
+                      MS_REC | MS_SILENT))
+            return -EINVAL;
+
+        KleePropagation prop =
+            (prop_flags & MS_SHARED)     ? KLEE_PROP_SHARED :
+            (prop_flags & MS_SLAVE)      ? KLEE_PROP_SLAVE :
+            (prop_flags & MS_UNBINDABLE) ? KLEE_PROP_UNBINDABLE :
+                                           KLEE_PROP_PRIVATE;
+
+        rc = klee_mount_table_set_propagation(mt, target_guest, prop,
+                                               !!(flags & MS_REC));
+        if (rc < 0)
+            return rc;
+        KLEE_DEBUG("mount: propagation %lu on %s", prop_flags, target_guest);
+        return emulate_ok(proc);
+    }
+
+    /* --- MS_REMOUNT: change flags on an existing mount --- */
+    if (flags & MS_REMOUNT) {
+        rc = klee_mount_table_remount(mt, target_guest,
+                                       !!(flags & MS_RDONLY));
+        if (rc < 0)
+            return rc;
+        KLEE_DEBUG("mount: remount %s ro=%d", target_guest,
+                   !!(flags & MS_RDONLY));
+        return emulate_ok(proc);
+    }
+
+    /* --- MS_MOVE: relocate a mount --- */
+    if (flags & MS_MOVE) {
+        char src_guest[PATH_MAX], src_host[PATH_MAX];
+        rc = resolve_path_arg(proc, ic, ev, 0, false, src_guest, src_host);
+        if (rc < 0)
+            return rc;
+        rc = require_host_dir(target_host);
+        if (rc < 0)
+            return rc;
+        rc = klee_mount_table_move(mt, src_guest, target_guest);
+        if (rc < 0)
+            return rc;
+        KLEE_DEBUG("mount: move %s -> %s", src_guest, target_guest);
+        return emulate_ok(proc);
+    }
+
+    /* --- MS_BIND: bind mount --- */
+    if (flags & MS_BIND) {
+        char src_guest[PATH_MAX], src_host[PATH_MAX];
+        rc = resolve_path_arg(proc, ic, ev, 0, false, src_guest, src_host);
+        if (rc < 0)
+            return rc;
+
+        struct stat src_st, tgt_st;
+        if (stat(src_host, &src_st) < 0)
+            return -errno;
+        if (stat(target_host, &tgt_st) < 0)
+            return -errno;
+        /* Kernel: bind of dir onto non-dir (or vice versa) → ENOTDIR */
+        if (S_ISDIR(src_st.st_mode) != S_ISDIR(tgt_st.st_mode))
+            return -ENOTDIR;
+
+        bool ro = !!(flags & MS_RDONLY);
+        rc = klee_mount_table_mount(mt, ro ? MOUNT_BIND_RO : MOUNT_BIND_RW,
+                                     src_host, target_guest, ro, 0, NULL);
+        if (rc < 0)
+            return rc;
+        KLEE_DEBUG("mount: bind %s -> %s (host src %s) rec=%d",
+                   src_guest, target_guest, src_host, !!(flags & MS_REC));
+        return emulate_ok(proc);
+    }
+
+    /* --- New mount: dispatch on filesystem type --- */
+    char fstype[64] = "";
+    void *fstype_addr = (void *)(uintptr_t)ev->args[2];
+    if (fstype_addr) {
+        if (klee_read_string(ic, ev->pid, fstype, sizeof(fstype),
+                             fstype_addr) < 0)
+            return -EFAULT;
+    }
+    if (fstype[0] == '\0')
+        return -ENODEV; /* kernel: no fstype for a new mount → ENODEV */
+
+    char data[4096] = "";
+    void *data_addr = (void *)(uintptr_t)ev->args[4];
+    if (data_addr)
+        klee_read_string(ic, ev->pid, data, sizeof(data), data_addr);
+
+    rc = require_host_dir(target_host);
+    if (rc < 0)
+        return rc;
+
+    bool ro = !!(flags & MS_RDONLY);
+
+    if (strcmp(fstype, "tmpfs") == 0 || strcmp(fstype, "ramfs") == 0) {
+        char *backing = klee_tmpfs_create(target_guest);
+        if (!backing)
+            return -ENOMEM;
+        rc = klee_mount_table_mount(mt, MOUNT_TMPFS, backing,
+                                     target_guest, ro, 0755, NULL);
+        free(backing);
+    } else if (strcmp(fstype, "proc") == 0) {
+        rc = klee_mount_table_mount(mt, MOUNT_PROC, "/proc",
+                                     target_guest, ro, 0, NULL);
+    } else if (strcmp(fstype, "devtmpfs") == 0) {
+        rc = klee_mount_table_mount(mt, MOUNT_DEV, "/dev",
+                                     target_guest, ro, 0, NULL);
+    } else if (strcmp(fstype, "devpts") == 0) {
+        rc = klee_mount_table_mount(mt, MOUNT_BIND_RW, "/dev/pts",
+                                     target_guest, ro, 0, NULL);
+    } else if (strcmp(fstype, "sysfs") == 0) {
+        /* bwrap models sysfs as a ro bind of host /sys */
+        rc = klee_mount_table_mount(mt, MOUNT_BIND_RO, "/sys",
+                                     target_guest, true, 0, NULL);
+    } else if (strcmp(fstype, "mqueue") == 0) {
+        rc = klee_mount_table_mount(mt, MOUNT_MQUEUE, "/dev/mqueue",
+                                     target_guest, ro, 0, NULL);
+    } else if (strcmp(fstype, "overlay") == 0) {
+        char lower[PATH_MAX], upper[PATH_MAX], work[PATH_MAX];
+        if (!mount_data_get(data, "lowerdir", lower, sizeof(lower)))
+            return -EINVAL; /* kernel overlayfs: missing lowerdir */
+        bool has_upper = mount_data_get(data, "upperdir", upper,
+                                         sizeof(upper));
+        bool has_work = mount_data_get(data, "workdir", work, sizeof(work));
+        /* Kernel: upperdir requires workdir and vice versa */
+        if (has_upper != has_work)
+            return -EINVAL;
+
+        /* Resolve option paths through the guest mount table.
+         * lowerdir may be colon-separated; resolve each element. */
+        char lower_host[PATH_MAX * 2] = "";
+        char *saveptr = NULL;
+        for (char *tok = strtok_r(lower, ":", &saveptr); tok;
+             tok = strtok_r(NULL, ":", &saveptr)) {
+            char one[PATH_MAX];
+            rc = resolve_data_path(proc, tok, one);
+            if (rc < 0)
+                return rc;
+            if (require_host_dir(one) < 0)
+                return -ENOENT;
+            if (lower_host[0])
+                strncat(lower_host, ":",
+                        sizeof(lower_host) - strlen(lower_host) - 1);
+            strncat(lower_host, one,
+                    sizeof(lower_host) - strlen(lower_host) - 1);
+        }
+        if (!lower_host[0])
+            return -EINVAL;
+
+        char upper_host[PATH_MAX] = "";
+        if (has_upper) {
+            rc = resolve_data_path(proc, upper, upper_host);
+            if (rc < 0)
+                return rc;
+            rc = require_host_dir(upper_host);
+            if (rc < 0)
+                return rc;
+            /* workdir must exist too (kernel checks it's usable) */
+            char work_host[PATH_MAX];
+            rc = resolve_data_path(proc, work, work_host);
+            if (rc < 0)
+                return rc;
+            rc = require_host_dir(work_host);
+            if (rc < 0)
+                return rc;
+        }
+
+        KleeOverlayMount *ov = klee_overlay_create(
+            target_guest, has_upper ? upper_host : NULL, lower_host);
+        if (!ov)
+            return -ENOMEM;
+
+        KleeMount *m = NULL;
+        rc = klee_mount_table_mount(mt,
+                                     has_upper ? MOUNT_OVERLAY
+                                               : MOUNT_RO_OVERLAY,
+                                     NULL, target_guest, !has_upper, 0, &m);
+        if (rc == 0 && m)
+            m->overlay = ov;
+        else if (rc < 0)
+            klee_overlay_destroy(ov);
+    } else {
+        return -ENODEV; /* unsupported filesystem type */
+    }
+
+    if (rc < 0)
+        return rc;
+    KLEE_DEBUG("mount: new %s at %s (pid=%d)", fstype, target_guest,
+               proc->real_pid);
+    return emulate_ok(proc);
 }
 
 int klee_enter_umount(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    (void)ic; (void)ev;
-    KLEE_DEBUG("umount2() intercepted from pid=%d, denying", proc->real_pid);
-    return -EPERM;
+    /* umount2(target, flags) */
+    int flags = (int)ev->args[1];
+    KleeMountTable *mt = proc->sandbox ? proc->sandbox->mount_table : NULL;
+    if (!mt)
+        return -EPERM;
+
+    /* Kernel flag validation (fs/namespace.c: SYSCALL_DEFINE2(umount)) */
+    if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))
+        return -EINVAL;
+    if ((flags & MNT_EXPIRE) && (flags & (MNT_FORCE | MNT_DETACH)))
+        return -EINVAL;
+
+    char guest[PATH_MAX], host[PATH_MAX];
+    int rc = resolve_path_arg(proc, ic, ev, 0,
+                               !!(flags & UMOUNT_NOFOLLOW), guest, host);
+    if (rc < 0)
+        return rc;
+
+    KleeMount *m = klee_mount_table_find_exact(mt, guest);
+    if (!m)
+        return -EINVAL; /* kernel: not a mountpoint → EINVAL */
+
+    /* Cannot unmount the root of the namespace (kernel: EBUSY) */
+    const char *root = klee_mount_table_get_root(mt);
+    if (strcmp(guest, root ? root : "/") == 0 && !m->stacked)
+        return -EBUSY;
+
+    /* MNT_EXPIRE: first call marks, second call (still unused) unmounts */
+    if (flags & MNT_EXPIRE) {
+        if (!m->expire_pending) {
+            m->expire_pending = true;
+            return -EAGAIN;
+        }
+    }
+
+    rc = klee_mount_table_umount(mt, guest, !!(flags & MNT_DETACH));
+    if (rc < 0)
+        return rc;
+
+    KLEE_DEBUG("umount2: %s flags=%d (pid=%d)", guest, flags,
+               proc->real_pid);
+    return emulate_ok(proc);
+}
+
+int klee_enter_chroot(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    /* chroot(path): set the per-process virtual root.  The kernel keeps
+     * cwd untouched (the classic "chroot escape" if cwd is outside), and
+     * so do we — vcwd remains a full guest path. */
+    char guest[PATH_MAX], host[PATH_MAX];
+    int rc = resolve_path_arg(proc, ic, ev, 0, false, guest, host);
+    if (rc < 0)
+        return rc;
+
+    rc = require_host_dir(host);
+    if (rc < 0)
+        return rc;
+
+    snprintf(proc->vroot, PATH_MAX, "%s", guest);
+    KLEE_DEBUG("chroot: pid=%d vroot=%s", proc->real_pid, proc->vroot);
+    return emulate_ok(proc);
+}
+
+int klee_enter_pivot_root(KleeProcess *proc, KleeInterceptor *ic,
+                           KleeEvent *ev)
+{
+    /* pivot_root(new_root, put_old) */
+    KleeMountTable *mt = proc->sandbox ? proc->sandbox->mount_table : NULL;
+    if (!mt)
+        return -EPERM;
+
+    char new_guest[PATH_MAX], new_host[PATH_MAX];
+    int rc = resolve_path_arg(proc, ic, ev, 0, false, new_guest, new_host);
+    if (rc < 0)
+        return rc;
+    rc = require_host_dir(new_host);
+    if (rc < 0)
+        return rc;
+
+    char old_guest[PATH_MAX], old_host[PATH_MAX];
+    rc = resolve_path_arg(proc, ic, ev, 1, false, old_guest, old_host);
+    if (rc < 0)
+        return rc;
+    rc = require_host_dir(old_host);
+    if (rc < 0)
+        return rc;
+
+    /* Kernel: put_old must be at or underneath new_root → else EINVAL */
+    size_t new_len = strlen(new_guest);
+    if (strncmp(old_guest, new_guest, new_len) != 0 ||
+        (old_guest[new_len] != '/' && old_guest[new_len] != '\0'))
+        return -EINVAL;
+
+    rc = klee_pivot_root(mt, new_guest, old_guest);
+    if (rc < 0)
+        return rc;
+
+    /* pivot_root moves the calling process's root and cwd into the new
+     * root; any per-process chroot is superseded */
+    proc->vroot[0] = '\0';
+    KLEE_DEBUG("pivot_root: pid=%d new_root=%s", proc->real_pid, new_guest);
+    return emulate_ok(proc);
 }
 
 int klee_enter_close(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)

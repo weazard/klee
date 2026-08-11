@@ -105,7 +105,9 @@ RadixNode *klee_radix_insert(KleeRadixTree *tree, const char *path,
     /* For root path "/" */
     const char *comp = next_component(p, &comp_len);
     if (!comp) {
-        /* Mounting at root */
+        /* Mounting at root: stack like any other mountpoint */
+        if (mount && current->mount)
+            mount->stacked = current->mount;
         current->mount = mount;
         return current;
     }
