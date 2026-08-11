@@ -251,6 +251,35 @@ paths to host paths. When a syscall references a path:
 Read-only mounts are enforced by checking write-mode syscalls against
 the mount table and returning `-EROFS`.
 
+### Runtime mount(2) / umount2(2) / chroot(2) Emulation
+
+Sandboxed processes can call `mount(2)`, `umount2(2)`, `chroot(2)`, and
+`pivot_root(2)` directly. The syscall's full effect is applied to klee's
+virtual mount table (with real backing storage where needed), the real
+syscall is suppressed, and the tracee observes `0` — the same
+supervisor-applies/return-synthesized model used by gVisor and proot.
+Error codes mirror the kernel (`EPERM`, `EINVAL`, `ENOENT`, `ENOTDIR`,
+`ENODEV`, `EBUSY`, ...).
+
+Supported `mount(2)` operations:
+
+| Operation                     | Behavior                                          |
+|-------------------------------|---------------------------------------------------|
+| `MS_BIND` (+`MS_REC`)         | Bind mount through the virtual mount table        |
+| `MS_REMOUNT` (+`MS_RDONLY`)   | Toggle read-only on an existing mount             |
+| `MS_MOVE`                     | Relocate a mount and everything beneath it        |
+| `MS_SHARED/PRIVATE/SLAVE/UNBINDABLE` | Propagation recorded, shown in mountinfo  |
+| New `tmpfs` / `ramfs`         | Backed by a fresh host tmpfs directory            |
+| New `proc`, `devtmpfs`, `devpts`, `sysfs`, `mqueue` | Mapped to virtualized/host equivalents |
+| New `overlay`                 | Parses `lowerdir`/`upperdir`/`workdir` mount data |
+
+Mounting over an existing mountpoint stacks (kernel shadow semantics);
+`umount2` pops the stack or reveals passthrough, returns `-EBUSY` when
+child mounts exist (unless `MNT_DETACH`), and honors `UMOUNT_NOFOLLOW`
+and `MNT_EXPIRE`. `chroot(2)` sets a per-process virtual root inherited
+across fork/exec; `pivot_root(2)` rebases the whole sandbox mount
+namespace. All mutations are reflected in `/proc/self/mountinfo`.
+
 ### Namespace Simulation
 
 - **PID namespace**: Bidirectional hash map translates between real and

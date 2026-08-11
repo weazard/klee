@@ -139,9 +139,17 @@ void klee_process_remove(KleeProcessTable *pt, pid_t real_pid)
 KleeProcess *klee_process_fork(KleeProcessTable *pt, KleeProcess *parent,
                                 pid_t child_real_pid)
 {
-    KleeProcess *child = klee_process_create(pt, child_real_pid, parent->sandbox);
-    if (!child)
-        return NULL;
+    /* The child's first ptrace stop can arrive BEFORE the parent's
+     * fork event, in which case the event loop already created a bare
+     * entry for it.  Reuse that entry instead of creating a duplicate,
+     * and back-fill the inherited state. */
+    KleeProcess *child = klee_process_find(pt, child_real_pid);
+    bool existed = (child != NULL);
+    if (!child) {
+        child = klee_process_create(pt, child_real_pid, parent->sandbox);
+        if (!child)
+            return NULL;
+    }
 
     /* Copy state from parent */
     memcpy(child->vcwd, parent->vcwd, PATH_MAX);
@@ -153,13 +161,16 @@ KleeProcess *klee_process_fork(KleeProcessTable *pt, KleeProcess *parent,
     klee_fd_table_destroy(child->fd_table);
     child->fd_table = klee_fd_table_clone(parent->fd_table);
 
-    /* Link into process tree */
-    child->parent = parent;
+    /* Link into process tree (only once) */
+    if (child->parent != parent) {
+        child->parent = parent;
+        child->next_sibling = parent->first_child;
+        parent->first_child = child;
+    }
     child->virtual_ppid = parent->virtual_pid;
-    child->next_sibling = parent->first_child;
-    parent->first_child = child;
 
-    KLEE_DEBUG("forked: parent=%d child=%d", parent->real_pid, child_real_pid);
+    KLEE_DEBUG("forked: parent=%d child=%d%s", parent->real_pid,
+               child_real_pid, existed ? " (entry existed)" : "");
     return child;
 }
 
