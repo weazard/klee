@@ -47,6 +47,7 @@
 #define KLEE_SYS_chroot          SYS_chroot
 #define KLEE_SYS_mount           SYS_mount
 #define KLEE_SYS_umount2         SYS_umount2
+#define KLEE_SYS_pivot_root      SYS_pivot_root
 #define KLEE_SYS_mknod           SYS_mknod
 #define KLEE_SYS_mknodat         SYS_mknodat
 #define KLEE_SYS_getdents64      SYS_getdents64
@@ -153,7 +154,7 @@
 #endif
 
 /* Total number of syscalls we intercept */
-#define KLEE_INTERCEPTED_SYSCALL_COUNT 90
+#define KLEE_INTERCEPTED_SYSCALL_COUNT 91
 
 /* Get the list of all syscall numbers to intercept */
 int klee_get_intercepted_syscalls(int *out, size_t max_count);

@@ -129,6 +129,10 @@ tests/test_user_ns: tests/test_user_ns.c src/ns/user_ns.o $(COMMON_TEST_OBJS)
 tests/test_fd_table: tests/test_fd_table.c src/fs/fd_table.o $(COMMON_TEST_OBJS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
+# Standalone tracee binary run INSIDE klee by test_integration.sh
+tests/test_mount_syscalls: tests/test_mount_syscalls.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
 test: $(TEST_BINS)
 	@echo "=== Running unit tests ==="
 	@failed=0; \

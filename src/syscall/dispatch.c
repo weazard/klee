@@ -88,6 +88,7 @@ void klee_dispatch_init(void)
     register_handler(KLEE_SYS_chroot,    "chroot",    klee_enter_chroot, NULL);
     register_handler(KLEE_SYS_mount,     "mount",     klee_enter_mount, NULL);
     register_handler(KLEE_SYS_umount2,   "umount2",   klee_enter_umount, NULL);
+    register_handler(KLEE_SYS_pivot_root, "pivot_root", klee_enter_pivot_root, NULL);
 
     /* FD tracking */
     register_handler(KLEE_SYS_close,     "close",     klee_enter_close, NULL);

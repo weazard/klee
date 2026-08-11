@@ -215,13 +215,24 @@ static int walk_node(const RadixNode *node, const char *prefix,
          * Format: mount_id parent_id major:minor root mount_point \
          *   mount_options optional_fields - fs_type mount_source super_options
          *
-         * No optional_fields for our virtual mounts (no propagation).
-         * The ` - ` separator is critical for libmount parsers.
+         * optional_fields reflect propagation set via mount(2)
+         * (shared:N / master:N / unbindable).  The ` - ` separator is
+         * critical for libmount parsers.
          */
+        char opt_fields[64] = "";
+        if (m->propagation == KLEE_PROP_SHARED)
+            snprintf(opt_fields, sizeof(opt_fields), "shared:%d ",
+                     m->peer_group > 0 ? m->peer_group : this_id);
+        else if (m->propagation == KLEE_PROP_SLAVE)
+            snprintf(opt_fields, sizeof(opt_fields), "master:%d ",
+                     m->peer_group > 0 ? m->peer_group : this_id);
+        else if (m->propagation == KLEE_PROP_UNBINDABLE)
+            snprintf(opt_fields, sizeof(opt_fields), "unbindable ");
+
         int n = snprintf(buf + *pos, buf_size - *pos,
-                         "%d %d %u:%u %s %s %s - %s %s %s\n",
+                         "%d %d %u:%u %s %s %s %s- %s %s %s\n",
                          *mount_id, parent_id, dev_major, dev_minor,
-                         root_field, mount_point, mount_opts,
+                         root_field, mount_point, mount_opts, opt_fields,
                          fstype, mount_source, super_opts);
         if (n > 0 && *pos + (size_t)n < buf_size)
             *pos += (size_t)n;

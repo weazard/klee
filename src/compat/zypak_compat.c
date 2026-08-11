@@ -581,8 +581,7 @@ int klee_zypak_handle_flatpak_spawn(KleeProcess *proc, KleeInterceptor *ic,
                     .mount_table = proc->sandbox->mount_table,
                     .fd_table = proc->fd_table,
                     .vcwd = proc->vcwd,
-                    .vroot = klee_mount_table_get_root(
-                                 proc->sandbox->mount_table),
+                    .vroot = klee_process_vroot(proc),
                     .flags = 0,
                 };
                 rc = klee_path_guest_to_host(&ctx, target_abs,
@@ -623,8 +622,7 @@ int klee_zypak_handle_flatpak_spawn(KleeProcess *proc, KleeInterceptor *ic,
                 .mount_table = proc->sandbox->mount_table,
                 .fd_table = proc->fd_table,
                 .vcwd = proc->vcwd,
-                .vroot = klee_mount_table_get_root(
-                             proc->sandbox->mount_table),
+                .vroot = klee_process_vroot(proc),
                 .flags = 0,
             };
             rc = klee_path_guest_to_host(&ctx, target_guest,

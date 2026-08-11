@@ -42,6 +42,7 @@ int klee_get_intercepted_syscalls(int *out, size_t max_count)
         KLEE_SYS_chroot,
         KLEE_SYS_mount,
         KLEE_SYS_umount2,
+        KLEE_SYS_pivot_root,
         KLEE_SYS_mknod,
         KLEE_SYS_mknodat,
         KLEE_SYS_truncate,

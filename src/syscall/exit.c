@@ -230,15 +230,31 @@ int klee_exit_getcwd(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     if (ev->retval <= 0)
         return 0;
 
-    /* Overwrite the returned CWD with our virtual CWD */
+    /* Overwrite the returned CWD with our virtual CWD.  If the process
+     * has a chroot(2) vroot, express the cwd relative to it — kernel
+     * getcwd prints "(unreachable)/..." when cwd is outside the root. */
     void *buf = (void *)(uintptr_t)ev->args[0];
     size_t buf_len = (size_t)ev->args[1];
 
-    size_t vcwd_len = strlen(proc->vcwd) + 1;
-    if (vcwd_len > buf_len)
+    char shown[PATH_MAX + 16]; /* room for "(unreachable)" prefix */
+    if (proc->vroot[0] != '\0' && strcmp(proc->vroot, "/") != 0) {
+        size_t rlen = strlen(proc->vroot);
+        if (strncmp(proc->vcwd, proc->vroot, rlen) == 0 &&
+            (proc->vcwd[rlen] == '/' || proc->vcwd[rlen] == '\0')) {
+            snprintf(shown, sizeof(shown), "%s",
+                     proc->vcwd[rlen] ? proc->vcwd + rlen : "/");
+        } else {
+            snprintf(shown, sizeof(shown), "(unreachable)%s", proc->vcwd);
+        }
+    } else {
+        snprintf(shown, sizeof(shown), "%s", proc->vcwd);
+    }
+
+    size_t shown_len = strlen(shown) + 1;
+    if (shown_len > buf_len)
         return 0; /* Buffer too small */
 
-    ic->write_mem(ic, ev->pid, buf, proc->vcwd, vcwd_len);
+    ic->write_mem(ic, ev->pid, buf, shown, shown_len);
     return 0;
 }
 

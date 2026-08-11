@@ -32,6 +32,7 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 
+#include "fs/overlay.h"
 #include "fs/pivot.h"
 #include "fs/tmpfs.h"
 
@@ -164,7 +165,7 @@ static int translate_path_arg_ex(KleeProcess *proc, KleeInterceptor *ic,
         .mount_table = proc->sandbox ? proc->sandbox->mount_table : NULL,
         .fd_table = proc->fd_table,
         .vcwd = proc->vcwd,
-        .vroot = proc->sandbox ? klee_mount_table_get_root(proc->sandbox->mount_table) : "/",
+        .vroot = klee_process_vroot(proc),
         .flags = 0,
     };
 
@@ -355,7 +356,7 @@ int klee_enter_openat2(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
         .mount_table = proc->sandbox ? proc->sandbox->mount_table : NULL,
         .fd_table = proc->fd_table,
         .vcwd = proc->vcwd,
-        .vroot = proc->sandbox ? klee_mount_table_get_root(proc->sandbox->mount_table) : "/",
+        .vroot = klee_process_vroot(proc),
         .dirfd_path = dirfd_path_str,
         .flags = resolve_flags,
     };
@@ -593,7 +594,7 @@ static int handle_exec_interp(KleeProcess *proc, KleeInterceptor *ic,
         .mount_table = proc->sandbox->mount_table,
         .fd_table = proc->fd_table,
         .vcwd = proc->vcwd,
-        .vroot = klee_mount_table_get_root(proc->sandbox->mount_table),
+        .vroot = klee_process_vroot(proc),
         .flags = 0,
     };
 
@@ -865,7 +866,7 @@ int klee_enter_execve(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
             .mount_table = proc->sandbox->mount_table,
             .fd_table = proc->fd_table,
             .vcwd = proc->vcwd,
-            .vroot = klee_mount_table_get_root(proc->sandbox->mount_table),
+            .vroot = klee_process_vroot(proc),
             .flags = 0,
         };
 
@@ -934,8 +935,7 @@ int klee_enter_execve(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
                         .mount_table = proc->sandbox->mount_table,
                         .fd_table = proc->fd_table,
                         .vcwd = proc->vcwd,
-                        .vroot = klee_mount_table_get_root(
-                                     proc->sandbox->mount_table),
+                        .vroot = klee_process_vroot(proc),
                         .flags = 0,
                     };
                     if (klee_path_guest_to_host(&ctx, target_guest,
@@ -1436,25 +1436,29 @@ int klee_enter_mount(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
             return -EINVAL;
 
         /* Resolve option paths through the guest mount table.
-         * lowerdir may be colon-separated; resolve each element. */
-        char lower_host[PATH_MAX * 2] = "";
+         * lowerdir may be colon-separated; the kernel lists layers
+         * top-to-bottom, klee_overlay_create wants bottom-to-top. */
+        enum { MAX_LOWERS = 16 };
+        char lower_bufs[MAX_LOWERS][PATH_MAX];
+        int lower_count = 0;
         char *saveptr = NULL;
         for (char *tok = strtok_r(lower, ":", &saveptr); tok;
              tok = strtok_r(NULL, ":", &saveptr)) {
-            char one[PATH_MAX];
-            rc = resolve_data_path(proc, tok, one);
+            if (lower_count >= MAX_LOWERS)
+                return -EINVAL;
+            rc = resolve_data_path(proc, tok, lower_bufs[lower_count]);
             if (rc < 0)
                 return rc;
-            if (require_host_dir(one) < 0)
+            if (require_host_dir(lower_bufs[lower_count]) < 0)
                 return -ENOENT;
-            if (lower_host[0])
-                strncat(lower_host, ":",
-                        sizeof(lower_host) - strlen(lower_host) - 1);
-            strncat(lower_host, one,
-                    sizeof(lower_host) - strlen(lower_host) - 1);
+            lower_count++;
         }
-        if (!lower_host[0])
+        if (lower_count == 0)
             return -EINVAL;
+
+        char *lowers[MAX_LOWERS];
+        for (int i = 0; i < lower_count; i++)
+            lowers[i] = lower_bufs[lower_count - 1 - i]; /* reverse */
 
         char upper_host[PATH_MAX] = "";
         if (has_upper) {
@@ -1475,7 +1479,8 @@ int klee_enter_mount(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
         }
 
         KleeOverlayMount *ov = klee_overlay_create(
-            target_guest, has_upper ? upper_host : NULL, lower_host);
+            target_guest, has_upper ? upper_host : NULL,
+            lowers, lower_count, !has_upper);
         if (!ov)
             return -ENOMEM;
 
@@ -2188,7 +2193,7 @@ static int translate_sockaddr_arg(KleeProcess *proc, KleeInterceptor *ic,
         .mount_table = proc->sandbox->mount_table,
         .fd_table = proc->fd_table,
         .vcwd = proc->vcwd,
-        .vroot = klee_mount_table_get_root(proc->sandbox->mount_table),
+        .vroot = klee_process_vroot(proc),
         .flags = 0,
     };
 

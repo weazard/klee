@@ -47,7 +47,7 @@ int klee_compat_handle_name_to_handle(KleeProcess *proc, KleeInterceptor *ic,
         .mount_table = proc->sandbox->mount_table,
         .fd_table = proc->fd_table,
         .vcwd = proc->vcwd,
-        .vroot = klee_mount_table_get_root(proc->sandbox->mount_table),
+        .vroot = klee_process_vroot(proc),
         .flags = 0,
     };
 

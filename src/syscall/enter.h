@@ -48,6 +48,7 @@ int klee_enter_chdir(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_chroot(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_mount(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_umount(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_pivot_root(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_close(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 
 /* PID namespace */
