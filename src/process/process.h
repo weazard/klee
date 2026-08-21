@@ -102,6 +102,14 @@ typedef struct klee_process {
     bool path_modified;
     int path_arg_count;             /* number of path args rewritten via scratch */
     int path_arg_idx[3];            /* which arg indices were rewritten */
+
+    /* Post-exec comm fixup: when execve is rewritten to invoke ld-linux
+     * (or a shebang interpreter) directly, the kernel sets the task comm
+     * to the loader's basename.  pending_comm holds the native comm to
+     * restore via an injected prctl(PR_SET_NAME) at the exec stop. */
+    char pending_comm[16];
+    bool comm_inject_active;        /* injected prctl in flight */
+    struct user_regs_struct inject_saved_regs; /* regs of hijacked syscall */
 } KleeProcess;
 
 /* Process table (hash table real_pid → KleeProcess) */
