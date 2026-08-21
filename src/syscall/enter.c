@@ -27,6 +27,7 @@
 #include <sys/ioctl.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 
 /*
@@ -484,6 +485,54 @@ int klee_enter_readlinkat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 
 #include <elf.h>
 
+/* Check whether two host paths refer to the same underlying file.
+ * Used to skip execve interpreter rewriting when the translated
+ * interpreter is the file the kernel would load anyway (e.g. identity
+ * binds like --bind / /, or /lib64 → /usr/lib64 symlink resolution).
+ * Returns false on stat failure so callers fall back to rewriting. */
+static bool same_host_file(const char *a, const char *b)
+{
+    struct stat sa, sb;
+    if (stat(a, &sa) != 0 || stat(b, &sb) != 0)
+        return false;
+    return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+}
+
+/* Check whether the dynamic loader at ldso_path supports the --argv0
+ * option (glibc >= 2.33) by scanning the binary for the option string.
+ * Caches the result for the last queried path. */
+static bool ldso_supports_argv0(const char *ldso_path)
+{
+    static char cached_path[PATH_MAX];
+    static int cached_result = -1;
+
+    if (cached_result >= 0 && strcmp(cached_path, ldso_path) == 0)
+        return cached_result != 0;
+
+    bool found = false;
+    int fd = open(ldso_path, O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        static const char needle[] = "--argv0";
+        const size_t nlen = sizeof(needle) - 1;
+        char buf[65536];
+        size_t keep = 0;
+        ssize_t n;
+        while (!found &&
+               (n = read(fd, buf + keep, sizeof(buf) - keep)) > 0) {
+            size_t total = keep + (size_t)n;
+            if (memmem(buf, total, needle, nlen))
+                found = true;
+            keep = total >= nlen - 1 ? nlen - 1 : total;
+            memmove(buf, buf + total - keep, keep);
+        }
+        close(fd);
+    }
+
+    snprintf(cached_path, sizeof(cached_path), "%s", ldso_path);
+    cached_result = found ? 1 : 0;
+    return found;
+}
+
 /*
  * Parse a shebang line from a file buffer.
  * Returns the interpreter path in interp_out and optional arg in optarg_out.
@@ -612,6 +661,7 @@ static int handle_exec_interp(KleeProcess *proc, KleeInterceptor *ic,
     char shebang_arg[PATH_MAX] = {0};   /* Shebang optional argument */
     char ldlinux_host[PATH_MAX] = {0};  /* ELF PT_INTERP (host path) */
     char ldlinux_guest[PATH_MAX] = {0}; /* ELF PT_INTERP (guest path) */
+    bool shebang_rewrite = false;       /* shebang interp maps to a different file */
 
     /* Step 1: Resolve shebang chain (scripts pointing to scripts) */
     for (int depth = 0; depth < 5; depth++) {
@@ -638,8 +688,12 @@ static int handle_exec_interp(KleeProcess *proc, KleeInterceptor *ic,
             snprintf(interp_host, sizeof(interp_host), "%s", sb_translated);
             snprintf(interp_guest, sizeof(interp_guest), "%s", sb_interp);
             snprintf(shebang_arg, sizeof(shebang_arg), "%s", sb_arg);
-            KLEE_TRACE("shebang: interpreter %s -> %s (script=%s)",
-                       sb_interp, sb_translated, current_host);
+            /* If the translated interpreter is the same file the kernel
+             * would resolve natively, the kernel's own shebang handling
+             * is correct — no rewrite needed for the shebang itself. */
+            shebang_rewrite = !same_host_file(sb_interp, sb_translated);
+            KLEE_TRACE("shebang: interpreter %s -> %s (script=%s, rewrite=%d)",
+                       sb_interp, sb_translated, current_host, shebang_rewrite);
         }
 
         snprintf(current_host, sizeof(current_host), "%s", sb_translated);
@@ -650,7 +704,8 @@ static int handle_exec_interp(KleeProcess *proc, KleeInterceptor *ic,
     if (read_elf_interp(current_host, pt_interp, sizeof(pt_interp)) == 0) {
         char pt_translated[PATH_MAX];
         int rc = klee_path_guest_to_host(&ctx, pt_interp, pt_translated, AT_FDCWD);
-        if (rc == 0 && strcmp(pt_interp, pt_translated) != 0) {
+        if (rc == 0 && strcmp(pt_interp, pt_translated) != 0 &&
+            !same_host_file(pt_interp, pt_translated)) {
             snprintf(ldlinux_host, sizeof(ldlinux_host), "%s", pt_translated);
             snprintf(ldlinux_guest, sizeof(ldlinux_guest), "%s", pt_interp);
             KLEE_TRACE("elf: PT_INTERP %s -> %s (binary=%s)",
@@ -658,8 +713,11 @@ static int handle_exec_interp(KleeProcess *proc, KleeInterceptor *ic,
         }
     }
 
-    /* Step 3: If nothing needs rewriting, return */
-    if (!interp_host[0] && !ldlinux_host[0])
+    /* Step 3: If nothing needs rewriting, return.  A shebang whose
+     * interpreter resolves to the same host file is handled natively by
+     * the kernel, so it only forces a rewrite when the final binary's
+     * PT_INTERP needs translation too. */
+    if (!ldlinux_host[0] && (!interp_host[0] || !shebang_rewrite))
         return 0;
 
     /* Step 4: Build the final execve command.
@@ -724,9 +782,10 @@ static int handle_exec_interp(KleeProcess *proc, KleeInterceptor *ic,
     /* Write GUEST paths for argv entries.  The spawned interpreter runs
      * under klee's interception, so paths it opens will be translated
      * through the mount table — they must be guest-relative. */
-    uint64_t scratch = rsp - 128 - PATH_MAX * 5;
+    uint64_t scratch = rsp - 128 - PATH_MAX * 6;
 
     uint64_t addr_ldlinux = 0;
+    uint64_t addr_argv0_flag = 0;
     uint64_t addr_interp = 0;
     uint64_t addr_shebang_arg = 0;
     uint64_t addr_script = 0;
@@ -734,6 +793,20 @@ static int handle_exec_interp(KleeProcess *proc, KleeInterceptor *ic,
     if (ldlinux_guest[0]) {
         addr_ldlinux = scratch;
         rc = klee_write_string(ic, ev->pid, (void *)(uintptr_t)addr_ldlinux, ldlinux_guest);
+        if (rc < 0) return 0;
+        scratch -= PATH_MAX;
+    }
+
+    /* When ld-linux directly loads the target binary (no shebang), pass
+     * --argv0 so the program keeps its original argv[0] instead of seeing
+     * the resolved script path.  With a shebang, ld-linux's default
+     * (argv[0] = the program it loads, i.e. the interpreter path) already
+     * matches native kernel shebang behavior. */
+    if (ldlinux_guest[0] && !interp_guest[0] && argc > 0 &&
+        ldso_supports_argv0(ldlinux_host)) {
+        addr_argv0_flag = scratch;
+        rc = klee_write_string(ic, ev->pid, (void *)(uintptr_t)addr_argv0_flag,
+                               "--argv0");
         if (rc < 0) return 0;
         scratch -= PATH_MAX;
     }
@@ -766,6 +839,10 @@ static int handle_exec_interp(KleeProcess *proc, KleeInterceptor *ic,
 
     if (addr_ldlinux)
         new_argv[new_argc++] = addr_ldlinux;
+    if (addr_argv0_flag) {
+        new_argv[new_argc++] = addr_argv0_flag;
+        new_argv[new_argc++] = argv_ptrs[0]; /* original argv[0] */
+    }
     if (addr_interp)
         new_argv[new_argc++] = addr_interp;
     if (addr_shebang_arg)
@@ -791,6 +868,18 @@ static int handle_exec_interp(KleeProcess *proc, KleeInterceptor *ic,
     /* Save original argv pointer for exit-time restore (exec failure case) */
     proc->saved_args[1] = ev->args[1];
     proc->path_arg_idx[proc->path_arg_count++] = 1;
+
+    /* The kernel will set the task comm to the basename of the file we
+     * exec (ld-linux or the interpreter), not the program the user ran.
+     * Native execve sets comm from the filename passed to execve, even
+     * for shebang scripts.  Schedule a prctl(PR_SET_NAME) injection at
+     * the post-exec stop to restore the native comm so process trackers
+     * (ps, top, drivers) see the real program name. */
+    const char *comm_base = strrchr(proc->saved_path, '/');
+    comm_base = comm_base ? comm_base + 1 : proc->saved_path;
+    strncpy(proc->pending_comm, comm_base, sizeof(proc->pending_comm) - 1);
+    proc->pending_comm[sizeof(proc->pending_comm) - 1] = '\0';
+
 
     KLEE_TRACE("exec interp: filename=%s argv=[%s%s%s %s ...]",
                filename_host,
@@ -831,6 +920,7 @@ static bool tracee_argv_has_no_sandbox(KleeInterceptor *ic, pid_t pid,
 
 int klee_enter_execve(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
+    proc->pending_comm[0] = '\0';
     int rc = translate_path_arg(proc, ic, ev, 0, -1);
     if (rc < 0) return rc;
 
@@ -1004,6 +1094,7 @@ int klee_enter_execve(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 
 int klee_enter_execveat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
+    proc->pending_comm[0] = '\0';
     int rc = translate_path_arg(proc, ic, ev, 1, 0);
     if (rc < 0) return rc;
     snprintf(proc->vexe, PATH_MAX, "%s", proc->saved_path);

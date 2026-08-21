@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <signal.h>
+#include <sys/prctl.h>
 #include <sys/epoll.h>
 #include <sys/ptrace.h>
 #include <sys/signalfd.h>
@@ -176,6 +177,63 @@ static void handle_fork(KleeEventLoop *el, KleeProcess *parent,
                parent->real_pid, child_pid, child->virtual_pid);
 }
 
+/* Hijack the current syscall-enter stop into prctl(PR_SET_NAME,
+ * proc->pending_comm).  The exec-interp rewrite makes the kernel set the
+ * task comm to the loader's basename (e.g. "ld-linux-x86-64"); this
+ * restores the name native execve would have set, so ps/top and other
+ * process trackers see the real program.  The hijacked syscall is
+ * replayed afterwards by rewinding rip past the syscall instruction.
+ * Returns true if the hijack was installed. */
+static bool hijack_comm_fixup(KleeInterceptor *ic, KleeProcess *proc)
+{
+    if (klee_regs_fetch(ic, proc) < 0)
+        goto abort;
+
+    memcpy(&proc->inject_saved_regs, &proc->regs[REG_CURRENT],
+           sizeof(proc->inject_saved_regs));
+
+    uint64_t sp = klee_regs_get_sp(proc);
+    if (!sp)
+        goto abort;
+
+    /* Scratch area below the stack pointer (past the red zone). */
+    uint64_t str_addr = (sp - 128 - 64) & ~7ULL;
+    if (klee_write_mem(ic, proc->real_pid, (void *)(uintptr_t)str_addr,
+                       proc->pending_comm,
+                       strlen(proc->pending_comm) + 1) < 0)
+        goto abort;
+
+    struct user_regs_struct *r = &proc->regs[REG_CURRENT];
+    r->orig_rax = KLEE_SYS_prctl;
+    r->rdi = PR_SET_NAME;
+    r->rsi = str_addr;
+    if (klee_regs_push(ic, proc) < 0)
+        goto abort;
+
+    proc->comm_inject_active = true;
+    KLEE_DEBUG("comm fixup: pid=%d name=%s", proc->real_pid,
+               proc->pending_comm);
+    return true;
+
+abort:
+    proc->pending_comm[0] = '\0';
+    return false;
+}
+
+/* After the injected prctl returns: restore the saved registers and
+ * rewind rip past the syscall instruction so the hijacked syscall
+ * re-executes and gets handled normally. */
+static void replay_hijacked_syscall(KleeInterceptor *ic, KleeProcess *proc)
+{
+    struct user_regs_struct *r = &proc->regs[REG_CURRENT];
+    memcpy(r, &proc->inject_saved_regs, sizeof(*r));
+    r->rax = proc->inject_saved_regs.orig_rax;
+    r->rip -= 2; /* size of the syscall instruction */
+    klee_regs_push(ic, proc);
+    proc->comm_inject_active = false;
+    proc->pending_comm[0] = '\0';
+}
+
 int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
 {
     KleeProcess *proc = klee_process_find(el->proctable, event->pid);
@@ -245,6 +303,16 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
         proc->resolved_guest[0] = '\0';
         klee_arena_reset(proc->event_arena);
 
+        /* First syscall of a rewritten exec image: hijack it into a
+         * prctl(PR_SET_NAME) to restore the native comm, then replay it. */
+        if (proc->pending_comm[0] && !proc->comm_inject_active &&
+            el->interceptor->backend == INTERCEPT_PTRACE &&
+            hijack_comm_fixup(el->interceptor, proc)) {
+            proc->current_syscall = KLEE_SYS_prctl;
+            el->interceptor->continue_syscall(el->interceptor, event->pid, 0);
+            break;
+        }
+
         int rc = klee_dispatch_enter(proc, el->interceptor, event);
         if (rc < 0) {
             /* Deny the syscall: for ptrace, replace with invalid syscall
@@ -290,6 +358,25 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
     case KLEE_EVENT_SYSCALL_EXIT: {
         proc->state = PROC_STATE_SYSCALL_EXIT;
         event->syscall_nr = proc->current_syscall;
+
+        /* Injected comm-fixup prctl completed — restore registers and
+         * replay the hijacked syscall. */
+        if (proc->comm_inject_active &&
+            el->interceptor->backend == INTERCEPT_PTRACE) {
+            klee_regs_fetch(el->interceptor, proc);
+            replay_hijacked_syscall(el->interceptor, proc);
+            proc->state = PROC_STATE_RUNNING;
+            proc->seccomp_entered = false;
+            el->interceptor->continue_running(el->interceptor, event->pid, 0);
+            break;
+        }
+
+        /* execve reached its exit stop — it failed, so any scheduled
+         * post-exec comm fixup no longer applies. */
+        if (proc->pending_comm[0] &&
+            (event->syscall_nr == KLEE_SYS_execve ||
+             event->syscall_nr == KLEE_SYS_execveat))
+            proc->pending_comm[0] = '\0';
 
         /* Consolidate all register modifications into a single push */
         bool need_reg_push = false;
