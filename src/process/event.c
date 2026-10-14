@@ -139,13 +139,18 @@ static void handle_process_exit(KleeEventLoop *el, KleeProcess *proc,
 }
 
 static void handle_fork(KleeEventLoop *el, KleeProcess *parent,
-                         KleeEvent *event)
+                         pid_t child_pid)
 {
-    pid_t child_pid = event->new_child_pid;
     if (child_pid <= 0) {
         KLEE_WARN("fork event with invalid child pid");
         return;
     }
+
+    /* Already set up because the child's initial stop was reported before
+     * this fork event.  Re-creating it would throw away state the child has
+     * built up since it was resumed. */
+    if (klee_process_find(el->proctable, child_pid))
+        return;
 
     KleeProcess *child = klee_process_fork(el->proctable, parent, child_pid);
     if (!child) {
@@ -176,11 +181,33 @@ static void handle_fork(KleeEventLoop *el, KleeProcess *parent,
                parent->real_pid, child_pid, child->virtual_pid);
 }
 
+/* Find the tracee a brand-new task inherits from: its thread group for a
+ * thread, otherwise its parent process. */
+static KleeProcess *find_creator(KleeProcessTable *pt, pid_t pid)
+{
+    pid_t tgid, ppid;
+    if (klee_proc_status_ids(pid, &tgid, &ppid) < 0)
+        return NULL;
+    pid_t creator = tgid != pid ? tgid : ppid;
+    return creator > 0 ? klee_process_find(pt, creator) : NULL;
+}
+
 int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
 {
     KleeProcess *proc = klee_process_find(el->proctable, event->pid);
 
     /* New process we haven't seen yet */
+    if (!proc && event->type != KLEE_EVENT_EXIT) {
+        /* A new tracee's initial SIGSTOP can be reported before its
+         * creator's PTRACE_EVENT_FORK/CLONE.  Inherit from the creator now
+         * so the child never runs with blank state (no id_state, empty fd
+         * table, cwd "/"); the fork event later finds the entry in place. */
+        KleeProcess *creator = find_creator(el->proctable, event->pid);
+        if (creator) {
+            handle_fork(el, creator, event->pid);
+            proc = klee_process_find(el->proctable, event->pid);
+        }
+    }
     if (!proc && event->type != KLEE_EVENT_EXIT) {
         proc = klee_process_create(el->proctable, event->pid, el->sandbox);
         if (!proc) {
@@ -344,14 +371,13 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
 
     case KLEE_EVENT_FORK:
     case KLEE_EVENT_CLONE:
-        handle_fork(el, proc, event);
-        if (el->interceptor->backend == INTERCEPT_PTRACE) {
+        handle_fork(el, proc, event->new_child_pid);
+        /* Resume only the creator.  The child is resumed when its own
+         * initial SIGSTOP is reported (KLEE_EVENT_SIGNAL below).  Resuming
+         * it from here could release a syscall stop klee has not processed
+         * yet, letting e.g. execve or connect run untranslated. */
+        if (el->interceptor->backend == INTERCEPT_PTRACE)
             el->interceptor->continue_syscall(el->interceptor, event->pid, 0);
-            /* Also continue the child */
-            if (event->new_child_pid > 0)
-                el->interceptor->continue_running(el->interceptor,
-                                                   event->new_child_pid, 0);
-        }
         break;
 
     case KLEE_EVENT_EXEC:
@@ -479,27 +505,21 @@ int klee_event_loop_run(KleeEventLoop *el)
         }
     }
 
-    /* Kill any remaining traced processes (e.g. daemon children like
-     * gpg-agent that outlived the initial child).  With ptrace, these
-     * processes are still stopped — detach and kill them so they don't
-     * linger as zombies. */
-    if (el->proctable->count > 0) {
-        KLEE_DEBUG("killing %zu remaining processes", el->proctable->count);
-        for (size_t i = 0; i < el->proctable->by_pid->capacity; i++) {
-            KleeHTEntry *ent = &el->proctable->by_pid->entries[i];
-            if (!ent->occupied || ent->deleted)
-                continue;
-            pid_t pid = (pid_t)ent->key;
-            KLEE_DEBUG("killing leftover pid=%d", pid);
-            /* Detach from the ptraced process and deliver SIGKILL.
-             * Without detaching first, the process stays ptrace-stopped
-             * and waitpid returns WIFSTOPPED instead of WIFEXITED. */
-            ptrace(PTRACE_DETACH, pid, 0, SIGKILL);
-        }
-        /* Reap all killed children */
-        while (waitpid(-1, NULL, WNOHANG) > 0)
-            ;
-    }
+    /* Tracees that outlived the sandbox's main process (daemons like
+     * gpg-agent, orphans) are deliberately left attached: every tracee
+     * inherits PTRACE_O_EXITKILL, so the kernel SIGKILLs all of them when
+     * klee exits, the way a PID namespace dies with its init.
+     *
+     * They used to be PTRACE_DETACHed with SIGKILL as the restart signal,
+     * but that signal is dropped at event-stops (seccomp, fork, exec) and
+     * DETACH fails on running tracees.  The survivors lost EXITKILL, kept
+     * klee's SECCOMP_RET_TRACE filter and got ENOSYS from every trapped
+     * syscall (open, connect, wait4, ...) once klee was gone. */
+    if (el->proctable->count > 0)
+        KLEE_DEBUG("%zu traced processes remain; they die with klee",
+                   el->proctable->count);
+    while (waitpid(-1, NULL, WNOHANG) > 0)
+        ;
 
     KLEE_INFO("event loop exited with status %d", el->exit_status);
     return el->exit_status;

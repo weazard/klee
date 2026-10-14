@@ -6,6 +6,7 @@
 #include "util/hash_table.h"
 #include "util/log.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 
@@ -138,4 +139,31 @@ pid_t klee_pid_map_get_init(const KleePidMap *pm)
 size_t klee_pid_map_count(const KleePidMap *pm)
 {
     return pm ? klee_ht_size(pm->real_to_virtual) : 0;
+}
+
+int klee_proc_status_ids(pid_t pid, pid_t *tgid, pid_t *ppid)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/status", pid);
+    FILE *f = fopen(path, "re");
+    if (!f)
+        return -1;
+
+    pid_t t = 0, p = -1;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "Tgid: %d", &t) == 1)
+            continue;
+        if (sscanf(line, "PPid: %d", &p) == 1)
+            break;
+    }
+    fclose(f);
+
+    if (t <= 0 || p < 0)
+        return -1;
+    if (tgid)
+        *tgid = t;
+    if (ppid)
+        *ppid = p;
+    return 0;
 }

@@ -3,8 +3,9 @@
  * IPC namespace implementation
  *
  * Provides key-space isolation for SysV IPC (shmget, msgget, semget).
- * Each sandbox gets unique base keys to prevent inter-sandbox collision.
- * Tracks created segments for cleanup on sandbox exit.
+ * Each virtual key maps to a random real key private to the sandbox, and
+ * objects created inside the sandbox are removed when it exits, as they
+ * would be when a real IPC namespace is torn down.
  */
 #include "ns/ipc_ns.h"
 #include "util/log.h"
@@ -12,15 +13,19 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 #include <sys/ipc.h>
+#include <sys/random.h>
 #include <sys/shm.h>
 #include <sys/msg.h>
 #include <sys/sem.h>
 
-/* IPC segment types for cleanup */
-#define IPC_TYPE_SHM 0
-#define IPC_TYPE_MSG 1
-#define IPC_TYPE_SEM 2
+union klee_semun {
+    int val;
+    struct semid_ds *buf;
+    unsigned short *array;
+};
 
 /* Pack type + id for segment tracking */
 static uint64_t pack_seg(int type, int id)
@@ -28,7 +33,15 @@ static uint64_t pack_seg(int type, int id)
     return ((uint64_t)(unsigned int)type << 32) | (uint64_t)(unsigned int)id;
 }
 
-static KleeIpcNs *ipc_ns_create_with_base(unsigned int base_key)
+static uint64_t splitmix64(uint64_t *state)
+{
+    uint64_t z = (*state += 0x9E3779B97F4A7C15ULL);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+
+static KleeIpcNs *ipc_ns_create_with_seed(uint64_t seed)
 {
     KleeIpcNs *ipc = calloc(1, sizeof(KleeIpcNs));
     if (!ipc)
@@ -55,62 +68,92 @@ static KleeIpcNs *ipc_ns_create_with_base(unsigned int base_key)
         return NULL;
     }
 
-    ipc->next_key = base_key;
+    ipc->rng_state = seed;
     return ipc;
 }
 
 KleeIpcNs *klee_ipc_ns_create(void)
 {
-    return ipc_ns_create_with_base(0x4B4C4545); /* "KLEE" in hex */
+    return ipc_ns_create_with_seed(0x4B4C4545); /* "KLEE" in hex */
 }
 
 KleeIpcNs *klee_ipc_ns_create_unique(unsigned long sandbox_id)
 {
-    /* Generate a unique base key by mixing sandbox identity.
-     * Use a simple hash to spread values across key space. */
-    unsigned int hash = (unsigned int)sandbox_id;
-    hash ^= hash >> 16;
-    hash *= 0x45d9f3b;
-    hash ^= hash >> 16;
-
-    /* Keep in a range that avoids common application keys (0-0xFFFF)
-     * and kernel-reserved keys */
-    unsigned int base = 0x4B4C0000 | (hash & 0xFFFF);
-    return ipc_ns_create_with_base(base);
+    uint64_t seed = 0;
+    if (getrandom(&seed, sizeof(seed), GRND_NONBLOCK) != (ssize_t)sizeof(seed)) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        seed = ((uint64_t)getpid() << 32) ^ (uint64_t)ts.tv_nsec ^
+               (uint64_t)ts.tv_sec;
+    }
+    seed ^= (uint64_t)sandbox_id * 0x9E3779B97F4A7C15ULL;
+    return ipc_ns_create_with_seed(seed);
 }
 
-static int cleanup_segment(uint64_t key, void *val, void *ctx)
+/* Current key of an IPC object, or -errno if it can't be inspected. */
+static int ipc_object_key(int type, int id, key_t *key)
 {
-    (void)val; (void)ctx;
-    int type = (int)(key >> 32);
-    int id = (int)(key & 0xFFFFFFFF);
-    int rc;
     switch (type) {
-    case IPC_TYPE_SHM:
-        rc = shmctl(id, IPC_RMID, NULL);
-        if (rc == 0)
-            KLEE_DEBUG("ipc cleanup: removed shm %d", id);
-        else
-            KLEE_WARN("ipc cleanup: failed to remove shm %d: %s",
-                      id, strerror(errno));
-        break;
-    case IPC_TYPE_MSG:
-        rc = msgctl(id, IPC_RMID, NULL);
-        if (rc == 0)
-            KLEE_DEBUG("ipc cleanup: removed msg %d", id);
-        else
-            KLEE_WARN("ipc cleanup: failed to remove msg %d: %s",
-                      id, strerror(errno));
-        break;
-    case IPC_TYPE_SEM:
-        rc = semctl(id, 0, IPC_RMID);
-        if (rc == 0)
-            KLEE_DEBUG("ipc cleanup: removed sem %d", id);
-        else
-            KLEE_WARN("ipc cleanup: failed to remove sem %d: %s",
-                      id, strerror(errno));
-        break;
+    case KLEE_IPC_SHM: {
+        struct shmid_ds ds;
+        if (shmctl(id, IPC_STAT, &ds) < 0)
+            return -errno;
+        *key = ds.shm_perm.__key;
+        return 0;
     }
+    case KLEE_IPC_MSG: {
+        struct msqid_ds ds;
+        if (msgctl(id, IPC_STAT, &ds) < 0)
+            return -errno;
+        *key = ds.msg_perm.__key;
+        return 0;
+    }
+    case KLEE_IPC_SEM: {
+        struct semid_ds ds;
+        union klee_semun arg = { .buf = &ds };
+        if (semctl(id, 0, IPC_STAT, arg) < 0)
+            return -errno;
+        *key = ds.sem_perm.__key;
+        return 0;
+    }
+    }
+    return -EINVAL;
+}
+
+static int cleanup_segment(uint64_t packed, void *val, void *ctx)
+{
+    (void)ctx;
+    int type = (int)(packed >> 32);
+    int id = (int)(packed & 0xFFFFFFFF);
+    key_t created_key = (key_t)(uint32_t)(uintptr_t)val;
+
+    /* Only remove the object if it is still the one created here: the
+     * sandbox may have removed it already and the id been reused. */
+    key_t cur_key = created_key;
+    int rc = ipc_object_key(type, id, &cur_key);
+    if (rc < 0 && rc != -EACCES)
+        return 0; /* already gone */
+    if (cur_key != created_key)
+        return 0;
+
+    switch (type) {
+    case KLEE_IPC_SHM:
+        rc = shmctl(id, IPC_RMID, NULL);
+        break;
+    case KLEE_IPC_MSG:
+        rc = msgctl(id, IPC_RMID, NULL);
+        break;
+    case KLEE_IPC_SEM:
+        rc = semctl(id, 0, IPC_RMID);
+        break;
+    default:
+        return 0;
+    }
+    if (rc == 0)
+        KLEE_DEBUG("ipc cleanup: removed type=%d id=%d", type, id);
+    else
+        KLEE_WARN("ipc cleanup: failed to remove type=%d id=%d: %s",
+                  type, id, strerror(errno));
     return 0;
 }
 
@@ -119,7 +162,6 @@ void klee_ipc_ns_destroy(KleeIpcNs *ipc)
     if (!ipc)
         return;
 
-    /* Clean up tracked IPC segments to prevent orphans */
     if (ipc->seg_ids) {
         klee_ht_foreach(ipc->seg_ids, cleanup_segment, NULL);
         klee_ht_destroy(ipc->seg_ids);
@@ -144,20 +186,22 @@ key_t klee_ipc_ns_translate_key(KleeIpcNs *ipc, key_t virtual_key)
     if (val)
         return (key_t)(uintptr_t)val;
 
-    /* Create new mapping using a private key.
-     * Guard against wraparound: if next_key wraps back to the base range
-     * or into common application key space, log a warning. */
-    key_t real_key = (key_t)ipc->next_key++;
-    if (ipc->next_key == 0) {
-        KLEE_WARN("ipc: key counter wrapped to 0 — potential key collisions");
-        ipc->next_key = 0x4B4C0000; /* reset to safe range */
-    }
+    /* Random real keys keep sandboxes (and the host) apart except with
+     * negligible probability; a per-sandbox base plus counter overlapped
+     * whenever two bases were close. */
+    key_t real_key;
+    do {
+        real_key = (key_t)(uint32_t)splitmix64(&ipc->rng_state);
+    } while (real_key == IPC_PRIVATE ||
+             klee_ht_get(ipc->rev_map, (uint64_t)(unsigned int)real_key));
+
     klee_ht_put(ipc->key_map, (uint64_t)(unsigned int)virtual_key,
                 (void *)(uintptr_t)real_key);
     klee_ht_put(ipc->rev_map, (uint64_t)(unsigned int)real_key,
                 (void *)(uintptr_t)virtual_key);
 
-    KLEE_DEBUG("ipc: mapped key %d -> %d", virtual_key, real_key);
+    KLEE_DEBUG("ipc: mapped key %#x -> %#x", (unsigned)virtual_key,
+               (unsigned)real_key);
     return real_key;
 }
 
@@ -171,17 +215,19 @@ key_t klee_ipc_ns_reverse_key(const KleeIpcNs *ipc, key_t real_key)
         return (key_t)(uintptr_t)val;
 
     /* No reverse mapping found — this real key did not originate from this
-     * sandbox's key translation.  Log a warning rather than silently
-     * returning the raw host key, which could leak cross-sandbox state. */
+     * sandbox's key translation. */
     KLEE_DEBUG("ipc: reverse key %d not in map, returning as-is", real_key);
     return real_key;
 }
 
-void klee_ipc_ns_track_segment(KleeIpcNs *ipc, int type, int seg_id)
+void klee_ipc_ns_track_segment(KleeIpcNs *ipc, KleeIpcType type, int seg_id,
+                               key_t real_key)
 {
-    if (!ipc || !ipc->seg_ids)
+    if (!ipc || !ipc->seg_ids || seg_id < 0)
         return;
-    uint64_t packed = pack_seg(type, seg_id);
-    klee_ht_put(ipc->seg_ids, packed, (void *)1);
-    KLEE_DEBUG("ipc: tracking segment type=%d id=%d", type, seg_id);
+    /* Bit 32 keeps the stored value non-NULL for IPC_PRIVATE (key 0). */
+    uint64_t val = (1ULL << 32) | (uint32_t)real_key;
+    klee_ht_put(ipc->seg_ids, pack_seg(type, seg_id), (void *)(uintptr_t)val);
+    KLEE_DEBUG("ipc: tracking type=%d id=%d key=%#x", type, seg_id,
+               (unsigned)real_key);
 }

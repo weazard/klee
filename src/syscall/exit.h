@@ -46,6 +46,11 @@ int klee_exit_getgroups(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 /* UTS namespace */
 int klee_exit_uname(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 
+/* IPC namespace */
+int klee_exit_shmget(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_exit_msgget(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_exit_semget(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+
 /* Misc */
 int klee_exit_prctl(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_exit_getsockopt(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);

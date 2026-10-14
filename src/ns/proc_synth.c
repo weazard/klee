@@ -92,6 +92,14 @@ static pid_t xlat(const KleePidMap *pm, pid_t real_pid)
     return v > 0 ? v : 0;
 }
 
+/* Virtual parent of a process whose real parent is outside the namespace:
+ * 0 for init, as the kernel reports, and 1 for orphans, which klee (the
+ * subreaper) has adopted in init's place. */
+static pid_t outside_parent_vpid(const KleePidMap *pm, pid_t real_pid)
+{
+    return klee_pid_map_is_init(pm, real_pid) ? 0 : 1;
+}
+
 /*
  * Rewrite /proc/<pid>/stat content.
  *
@@ -156,6 +164,8 @@ int klee_proc_synth_stat(pid_t real_pid, const KleePidMap *pid_map,
         vpid = orig_pid;
 
     pid_t vppid = xlat(pid_map, ppid);
+    if (vppid <= 0 && ppid > 0)
+        vppid = outside_parent_vpid(pid_map, real_pid);
 
     pid_t vpgrp = xlat(pid_map, pgrp);
     if (vpgrp <= 0)
@@ -236,10 +246,10 @@ int klee_proc_synth_status(pid_t real_pid, const KleePidMap *pid_map,
             }
         } else if (sscanf(line, "PPid:\t%d", &val) == 1 && val > 0) {
             pid_t v = xlat(pid_map, val);
-            if (v > 0) {
-                snprintf(rewritten, sizeof(rewritten), "PPid:\t%d\n", v);
-                to_write = rewritten;
-            }
+            if (v <= 0)
+                v = outside_parent_vpid(pid_map, real_pid);
+            snprintf(rewritten, sizeof(rewritten), "PPid:\t%d\n", v);
+            to_write = rewritten;
         } else if (sscanf(line, "Tgid:\t%d", &val) == 1 && val > 0) {
             pid_t v = xlat(pid_map, val);
             if (v > 0) {

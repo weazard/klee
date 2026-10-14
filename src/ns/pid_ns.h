@@ -49,4 +49,8 @@ pid_t klee_pid_map_get_init(const KleePidMap *pm);
 /* Get count of processes in namespace */
 size_t klee_pid_map_count(const KleePidMap *pm);
 
+/* Read the thread-group id and parent pid of a host task from
+ * /proc/<pid>/status.  Either output may be NULL.  Returns 0 on success. */
+int klee_proc_status_ids(pid_t pid, pid_t *tgid, pid_t *ppid);
+
 #endif /* KLEE_PID_NS_H */

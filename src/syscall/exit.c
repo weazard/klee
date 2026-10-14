@@ -10,6 +10,7 @@
 #include "ns/pid_ns.h"
 #include "ns/user_ns.h"
 #include "ns/uts_ns.h"
+#include "ns/ipc_ns.h"
 #include "compat/zypak_compat.h"
 #include "util/log.h"
 
@@ -19,6 +20,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/ipc.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
@@ -342,7 +344,13 @@ int klee_exit_getppid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
         }
     }
 
-    ev->retval = proc->virtual_ppid;
+    /* The parent is outside the namespace.  For init (any of its threads)
+     * that is expected and reads as 0; any other process has been orphaned
+     * and reparented to klee, the subreaper, which in a real namespace
+     * makes it init's. */
+    pid_t tgid = proc->real_pid;
+    klee_proc_status_ids(proc->real_pid, &tgid, NULL);
+    ev->retval = klee_pid_map_is_init(proc->sandbox->pid_map, tgid) ? 0 : 1;
     return 1;
 }
 
@@ -665,6 +673,43 @@ int klee_exit_uname(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 
     ic->write_mem(ic, ev->pid, buf, &uts, sizeof(uts));
     return 0;
+}
+
+/* ==================== IPC Namespace Exit Handlers ==================== */
+
+/* Record SysV objects created inside the sandbox so they are removed when
+ * it exits.  arg0 still holds the real key written by the enter handler. */
+static int track_ipc_object(KleeProcess *proc, KleeEvent *ev,
+                            KleeIpcType type, int flags_arg)
+{
+    if (ev->retval < 0 || !proc->sandbox || !proc->sandbox->unshare_ipc ||
+        !proc->sandbox->ipc_ns)
+        return 0;
+
+    key_t real_key = (key_t)ev->args[0];
+    int flags = (int)ev->args[flags_arg];
+    if (real_key == IPC_PRIVATE || (flags & IPC_CREAT))
+        klee_ipc_ns_track_segment(proc->sandbox->ipc_ns, type,
+                                  (int)ev->retval, real_key);
+    return 0;
+}
+
+int klee_exit_shmget(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    (void)ic;
+    return track_ipc_object(proc, ev, KLEE_IPC_SHM, 2);
+}
+
+int klee_exit_msgget(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    (void)ic;
+    return track_ipc_object(proc, ev, KLEE_IPC_MSG, 1);
+}
+
+int klee_exit_semget(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    (void)ic;
+    return track_ipc_object(proc, ev, KLEE_IPC_SEM, 2);
 }
 
 /* ==================== Misc Exit Handlers ==================== */

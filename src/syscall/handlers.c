@@ -136,6 +136,14 @@ int klee_get_intercepted_syscalls(int *out, size_t max_count)
 #ifdef KLEE_SYS_io_uring_setup
         KLEE_SYS_io_uring_setup,
 #endif
+
+        /* PID-targeting signal/pidfd calls.  Appended last so earlier
+         * entries keep their place in the compat child-filter prefix. */
+        KLEE_SYS_rt_sigqueueinfo,
+        KLEE_SYS_rt_tgsigqueueinfo,
+#ifdef KLEE_SYS_pidfd_open
+        KLEE_SYS_pidfd_open,
+#endif
     };
 
     size_t count = sizeof(syscalls) / sizeof(syscalls[0]);

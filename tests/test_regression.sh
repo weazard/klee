@@ -14,6 +14,12 @@
 #   7. Flatpak layout (/app mount) must not trigger Zypak; peer creds consistent
 #   8. Genuine Zypak mode virtualizes to the real uid (D-Bus auth compat)
 #   9. bwrap 0.11.1/0.12 parity: SIGCHLD reset; --not-a-security-boundary
+#  10. Exec translation holds under fork load (fork-event race, event.c)
+#  11. --unshare-ipc: private SysV keys, objects removed on exit (ipc_ns.c)
+#  12. --unshare-pid: kill/sigqueue/pidfd_open confined to the sandbox
+#  13. --unshare-pid: orphans adopted by init, init's parent reads 0
+#  14. Processes outliving the main command die with klee
+#  15. Processes keep their own name under identity mounts (no ld.so hop)
 set -e
 
 KLEE="${KLEE:-./klee}"
@@ -383,6 +389,211 @@ if command -v python3 >/dev/null 2>&1; then
     fi
 else
     echo "  SKIP: python3 not available (SIGCHLD test)"
+fi
+
+# ---------------------------------------------------------------------------
+# Fix 10: fork-event race.  A new tracee's initial stop can be reported
+# before its creator's fork event; resuming the child from the fork event
+# released syscall stops klee had not processed yet, so execve/connect/open
+# ran untranslated (~20% of execs in a busy fork loop).  Exec a binary that
+# only exists at a sandbox path: any untranslated exec fails with ENOENT.
+# ---------------------------------------------------------------------------
+echo "--- Exec translation holds under fork load (fork-event race) ---"
+if [ -e /opt/klee-forkrace ]; then
+    echo "  SKIP: /opt/klee-forkrace exists on the host"
+else
+    KT=$(mktemp -d /tmp/klee-forkrace.XXXXXX)
+    cp /bin/true "$KT/marker"
+    cat > "$KT/run.sh" <<'SCRIPT'
+#!/bin/sh
+for w in 1 2 3 4; do
+    ( i=0; bad=0
+      while [ $i -lt 25 ]; do
+          /opt/klee-forkrace/marker 2>/dev/null || bad=$((bad + 1))
+          i=$((i + 1))
+      done
+      echo $bad > "$1/w$w" ) &
+done
+wait
+cat "$1"/w* | awk '{ s += $1 } END { print "untranslated=" s + 0 }'
+SCRIPT
+    chmod +x "$KT/run.sh"
+    out=$($KLEE --bind / / --bind "$KT" /opt/klee-forkrace -- "$KT/run.sh" "$KT" 2>/dev/null || true)
+    rm -rf "$KT"
+    if [ "$out" = "untranslated=0" ]; then
+        pass "all 100 execs translated under fork load"
+    else
+        fail "execs escaped translation under fork load (got: $out)"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Fix 11: --unshare-ipc.  The translated SysV key was only written to klee's
+# copy of the syscall arguments, never to the tracee's registers, so every
+# sandbox used raw host keys, and nothing was removed when it exited.
+# ---------------------------------------------------------------------------
+echo "--- --unshare-ipc: private SysV keys, objects removed on exit ---"
+if command -v python3 >/dev/null 2>&1; then
+    IPCPY=$(mktemp /tmp/klee-ipc.XXXXXX)
+    cat > "$IPCPY" <<'PY'
+import ctypes, sys
+libc = ctypes.CDLL(None, use_errno=True)
+IPC_CREAT, IPC_EXCL, IPC_RMID, IPC_STAT = 0o1000, 0o2000, 0, 2
+op, arg = sys.argv[1], sys.argv[2]
+if op == "create":
+    print(libc.shmget(int(arg, 16), 4096, IPC_CREAT | IPC_EXCL | 0o600))
+elif op == "lookup":
+    print(libc.shmget(int(arg, 16), 0, 0))
+elif op == "alive":
+    buf = ctypes.create_string_buffer(256)
+    print(1 if libc.shmctl(int(arg), IPC_STAT, buf) == 0 else 0)
+elif op == "rm":
+    shmid = libc.shmget(int(arg, 16), 0, 0)
+    if shmid >= 0:
+        libc.shmctl(shmid, IPC_RMID, None)
+PY
+    K=0x4b1e5eed
+    python3 "$IPCPY" rm $K
+    id_a=$($KLEE --bind / / --unshare-ipc -- python3 "$IPCPY" create $K 2>/dev/null || echo -1)
+    host_sees=$(python3 "$IPCPY" lookup $K)
+    a_alive=0
+    [ "$id_a" -ge 0 ] 2>/dev/null && a_alive=$(python3 "$IPCPY" alive "$id_a")
+    id_b=$($KLEE --bind / / --unshare-ipc -- python3 "$IPCPY" create $K 2>/dev/null || echo -1)
+    python3 "$IPCPY" rm $K
+    python3 "$IPCPY" create $K >/dev/null
+    in_sees=$($KLEE --bind / / --unshare-ipc -- python3 "$IPCPY" lookup $K 2>/dev/null || echo err)
+    python3 "$IPCPY" rm $K
+    rm -f "$IPCPY"
+    if [ "$id_a" -ge 0 ] 2>/dev/null && [ "$host_sees" = "-1" ] &&
+       [ "$a_alive" = "0" ] && [ "$id_b" -ge 0 ] 2>/dev/null &&
+       [ "$in_sees" = "-1" ]; then
+        pass "SysV keys private per sandbox; objects removed on exit"
+    else
+        fail "--unshare-ipc (create=$id_a host_lookup=$host_sees alive_after_exit=$a_alive second_sandbox=$id_b host_key_inside=$in_sees)"
+    fi
+else
+    echo "  SKIP: python3 not available (IPC namespace test)"
+fi
+
+# ---------------------------------------------------------------------------
+# Fix 12: --unshare-pid containment.  PIDs outside the sandbox were passed
+# straight to the kernel (kill) or never translated (sigqueue, pidfd_open),
+# so a sandboxed process could signal host processes by number.  The same
+# calls must still reach the sandbox's own processes by virtual PID.
+# ---------------------------------------------------------------------------
+echo "--- --unshare-pid: signals and pidfds stay inside the sandbox ---"
+if command -v python3 >/dev/null 2>&1; then
+    out=$($KLEE --bind / / --unshare-pid -- python3 -c '
+import ctypes, os, signal, struct, sys, time
+host = int(sys.argv[1])          # the test harness: a host process
+libc = ctypes.CDLL(None, use_errno=True)
+class sigval(ctypes.Union):
+    _fields_ = [("i", ctypes.c_int), ("p", ctypes.c_void_p)]
+libc.sigqueue.argtypes = [ctypes.c_int, ctypes.c_int, sigval]
+def sq(pid):
+    if libc.sigqueue(pid, 0, sigval(0)) != 0:
+        raise OSError(ctypes.get_errno(), "sigqueue")
+res = []
+def outside(name, fn):
+    try:
+        fn()
+        res.append(name + "=reached-host")
+    except OSError as e:
+        res.append(name + ("=ok" if e.errno == 3 else "=" + str(e.errno)))
+outside("kill", lambda: os.kill(host, 0))
+outside("sigqueue", lambda: sq(host))
+outside("pidfd_open", lambda: os.close(os.pidfd_open(host)))
+r, w = os.pipe()
+pid = os.fork()
+if pid == 0:
+    os.write(w, struct.pack("i", os.getpid()))
+    time.sleep(5)
+    os._exit(0)
+vpid = struct.unpack("i", os.read(r, 4))[0]
+fd = os.pidfd_open(vpid)
+real = int(open("/proc/self/fdinfo/%d" % fd).read().split("Pid:")[1].split()[0])
+sq(vpid)
+res.append("child=ok" if real == pid else "child=wrong")
+os.kill(vpid, signal.SIGKILL)
+os.waitpid(pid, 0)
+print(" ".join(res))
+' $$ 2>/dev/null || true)
+    if [ "$out" = "kill=ok sigqueue=ok pidfd_open=ok child=ok" ]; then
+        pass "kill/sigqueue/pidfd_open confined to the PID namespace"
+    else
+        fail "PID namespace signal containment (got: $out)"
+    fi
+else
+    echo "  SKIP: python3 not available (signal containment test)"
+fi
+
+# ---------------------------------------------------------------------------
+# Fix 13: --unshare-pid orphans.  klee is the subreaper, so orphans stay in
+# the sandbox (and get reaped instead of piling up under the host's init).
+# As in a real PID namespace they report init (vpid 1) as their parent, and
+# init reports 0 rather than klee's host PID.
+# ---------------------------------------------------------------------------
+echo "--- --unshare-pid: orphans are adopted by init ---"
+if command -v python3 >/dev/null 2>&1; then
+    out=$($KLEE --bind / / --unshare-pid -- python3 -c '
+import os, time
+r, w = os.pipe()
+if os.fork() == 0:
+    if os.fork() == 0:
+        time.sleep(0.3)          # outlive the intermediate parent
+        os.write(w, b"%d" % os.getppid())
+        os._exit(0)
+    os._exit(0)
+os.wait()
+orphan = os.read(r, 16).decode()
+init = [l.split()[1] for l in open("/proc/self/status") if l.startswith("PPid:")][0]
+print("orphan=%s init=%s getppid=%d" % (orphan, init, os.getppid()))
+' 2>/dev/null || true)
+    if [ "$out" = "orphan=1 init=0 getppid=0" ]; then
+        pass "orphan reparented to vpid 1; init reports parent 0"
+    else
+        fail "orphan/init parent pids (got: $out)"
+    fi
+else
+    echo "  SKIP: python3 not available (orphan test)"
+fi
+
+# ---------------------------------------------------------------------------
+# Fix 14: processes that outlive the main command used to be detached; at
+# event-stops that drops the SIGKILL, so survivors kept running with klee's
+# seccomp filter and got ENOSYS from every trapped syscall (a forking loop
+# then spins on "fork: Function not implemented").  They now stay attached
+# and PTRACE_O_EXITKILL kills them when klee exits.
+# ---------------------------------------------------------------------------
+echo "--- Processes outliving the main command die with klee ---"
+marker=$(( 600000 + $$ % 100000 ))
+tag="klee-survivor-$$"
+# The stat() loops keep tracees parked at seccomp stops, where the old
+# detach dropped its SIGKILL.
+$KLEE --bind / / -- /bin/sh -c "for i in 1 2 3 4; do sh -c 'while :; do [ -e / ]; done' $tag & done; sh -c 'sleep $marker & exit 0'; sleep 0.5" >/dev/null 2>&1 || true
+sleep 1
+# [k] keeps the grep from matching its own command line.
+left=$(ps -eo args | grep -cE "^(/usr/bin/)?sleep $marker\$|[k]lee-survivor-$$\$" || true)
+if [ "$left" = "0" ]; then
+    pass "no processes survive klee"
+else
+    fail "$left process(es) survived klee"
+    pkill -f "^(/usr/bin/)?sleep $marker\$" 2>/dev/null || true
+    pkill -f "[k]lee-survivor-$$\$" 2>/dev/null || true
+fi
+
+# ---------------------------------------------------------------------------
+# Fix 15: process names.  klee re-executed dynamic binaries through ld.so
+# even when the kernel would load the very same loader, so comm, cmdline and
+# /proc/<pid>/exe all said ld-linux, breaking ps/pgrep/pidof/killall and
+# peers that identify processes by name.
+# ---------------------------------------------------------------------------
+echo "--- Processes keep their own name under identity mounts ---"
+comm=$($KLEE --bind / / -- /bin/cat /proc/self/comm 2>/dev/null || true)
+if [ "$comm" = "cat" ]; then
+    pass "comm is the program, not ld-linux"
+else
+    fail "comm under --bind / / (got: $comm)"
 fi
 
 echo ""

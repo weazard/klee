@@ -90,6 +90,11 @@
 #define KLEE_SYS_kill            SYS_kill
 #define KLEE_SYS_tgkill          SYS_tgkill
 #define KLEE_SYS_tkill           SYS_tkill
+#define KLEE_SYS_rt_sigqueueinfo   SYS_rt_sigqueueinfo
+#define KLEE_SYS_rt_tgsigqueueinfo SYS_rt_tgsigqueueinfo
+#ifdef SYS_pidfd_open
+#define KLEE_SYS_pidfd_open      SYS_pidfd_open
+#endif
 #define KLEE_SYS_setpgid         SYS_setpgid
 #define KLEE_SYS_getpgid         SYS_getpgid
 #define KLEE_SYS_getpgrp         SYS_getpgrp

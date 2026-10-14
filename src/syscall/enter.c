@@ -19,6 +19,8 @@
 #include "util/log.h"
 
 #include <errno.h>
+#include <limits.h>
+#include <signal.h>
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -27,6 +29,7 @@
 #include <sys/ioctl.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 
 /*
@@ -573,6 +576,18 @@ static int read_elf_interp(const char *host_path, char *interp_out, size_t size)
     return found;
 }
 
+/* True when both host paths name the same file.  If the kernel's own
+ * PT_INTERP lookup would load the very loader the sandbox maps there, the
+ * ld.so indirection buys nothing, and skipping it keeps comm, cmdline and
+ * /proc/<pid>/exe (what ps, pgrep, pidof and IPC peers go by) pointing at
+ * the real program instead of ld-linux. */
+static bool same_host_file(const char *a, const char *b)
+{
+    struct stat sa, sb;
+    return stat(a, &sa) == 0 && stat(b, &sb) == 0 &&
+           sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+}
+
 static int handle_exec_interp(KleeProcess *proc, KleeInterceptor *ic,
                                 KleeEvent *ev)
 {
@@ -650,7 +665,8 @@ static int handle_exec_interp(KleeProcess *proc, KleeInterceptor *ic,
     if (read_elf_interp(current_host, pt_interp, sizeof(pt_interp)) == 0) {
         char pt_translated[PATH_MAX];
         int rc = klee_path_guest_to_host(&ctx, pt_interp, pt_translated, AT_FDCWD);
-        if (rc == 0 && strcmp(pt_interp, pt_translated) != 0) {
+        if (rc == 0 && strcmp(pt_interp, pt_translated) != 0 &&
+            !same_host_file(pt_interp, pt_translated)) {
             snprintf(ldlinux_host, sizeof(ldlinux_host), "%s", pt_translated);
             snprintf(ldlinux_guest, sizeof(ldlinux_guest), "%s", pt_interp);
             KLEE_TRACE("elf: PT_INTERP %s -> %s (binary=%s)",
@@ -1210,23 +1226,169 @@ static pid_t translate_pid(KleePidMap *pm, pid_t pid)
     return 0;
 }
 
+/* Resolve the target of a signal or pidfd syscall to a real PID, or 0 if it
+ * names nothing in this namespace.  Unknown PIDs must not be passed through:
+ * the kernel would deliver to whichever host process owns that number. */
+static pid_t resolve_target_pid(KleeProcess *proc, pid_t pid)
+{
+    if (pid <= 0)
+        return 0;
+    KleePidMap *pm = proc->sandbox->pid_map;
+    pid_t real = translate_pid(pm, pid);
+    if (real > 0)
+        return real;
+    /* klee forgets a process when it exits, but until reaped it is still a
+     * valid target.  Such a zombie's parent is a sandbox process, or klee
+     * itself as subreaper. */
+    pid_t ppid;
+    if (klee_proc_status_ids(pid, NULL, &ppid) == 0 &&
+        (klee_pid_map_r2v(pm, ppid) > 0 || ppid == getpid()))
+        return pid;
+    return 0;
+}
+
+/* Does any process in this namespace belong to process group pgid? */
+static bool pgrp_in_namespace(const KleePidMap *pm, pid_t pgid)
+{
+    const KleeHashTable *ht = pm->real_to_virtual;
+    for (size_t i = 0; i < ht->capacity; i++) {
+        const KleeHTEntry *e = &ht->entries[i];
+        if (e->occupied && !e->deleted && getpgid((pid_t)e->key) == pgid)
+            return true;
+    }
+    return false;
+}
+
+/* kill(-1, sig) in a PID namespace reaches every process in it except init
+ * and the caller's own thread group.  Deliver it to exactly those, then turn
+ * the syscall into a harmless kill(self, 0) so the caller still sees 0. */
+static int kill_namespace_broadcast(KleeProcess *proc, KleeInterceptor *ic,
+                                    int sig)
+{
+    KleePidMap *pm = proc->sandbox->pid_map;
+    pid_t self_tgid = proc->real_pid;
+    klee_proc_status_ids(proc->real_pid, &self_tgid, NULL);
+
+    int count = 0, result = 0;
+    const KleeHashTable *ht = pm->real_to_virtual;
+    for (size_t i = 0; i < ht->capacity; i++) {
+        const KleeHTEntry *e = &ht->entries[i];
+        if (!e->occupied || e->deleted)
+            continue;
+        pid_t real = (pid_t)e->key;
+        pid_t tgid;
+        /* The map holds threads too: signal each thread group once. */
+        if (real <= 0 || klee_proc_status_ids(real, &tgid, NULL) < 0 ||
+            tgid != real)
+            continue;
+        if (real == self_tgid || klee_pid_map_is_init(pm, real))
+            continue;
+        count++;
+        /* Same error folding as the kernel: EPERM alone is not reported. */
+        if (kill(real, sig) < 0 && errno != EPERM)
+            result = -errno;
+    }
+    if (count == 0)
+        return -ESRCH;
+    if (result < 0)
+        return result;
+
+    klee_regs_fetch(ic, proc);
+    klee_regs_set_arg(proc, 0, (uint64_t)proc->real_pid);
+    klee_regs_set_arg(proc, 1, 0);
+    klee_regs_push(ic, proc);
+    return 0;
+}
+
 int klee_enter_kill(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    if (!proc->sandbox || !proc->sandbox->unshare_pid)
+    if (!proc->sandbox || !proc->sandbox->unshare_pid || !proc->sandbox->pid_map)
+        return 0;
+
+    pid_t target = (pid_t)ev->args[0];
+    if (target == 0)
+        return 0; /* caller's own process group */
+    if (target == -1)
+        return kill_namespace_broadcast(proc, ic, (int)ev->args[1]);
+    if (target == INT_MIN)
+        return -ESRCH;
+
+    pid_t real;
+    if (target > 0) {
+        real = resolve_target_pid(proc, target);
+    } else {
+        /* Process groups: shells hold the real pgid (fork() returns real
+         * PIDs), possibly of a leader that has already exited, so check
+         * membership first; getpgrp() hands out virtual ones. */
+        pid_t pgid = -target;
+        KleePidMap *pm = proc->sandbox->pid_map;
+        real = 0;
+        if (pgrp_in_namespace(pm, pgid)) {
+            real = target;
+        } else {
+            pid_t leader = klee_pid_map_v2r(pm, pgid);
+            if (leader > 0 && pgrp_in_namespace(pm, leader))
+                real = -leader;
+        }
+    }
+
+    if (real == 0) {
+        KLEE_TRACE("kill: pid=%d target=%d not in namespace -> ESRCH",
+                   proc->real_pid, target);
+        return -ESRCH;
+    }
+    if (real != target) {
+        klee_regs_fetch(ic, proc);
+        klee_regs_set_arg(proc, 0, (uint64_t)(unsigned int)real);
+        klee_regs_push(ic, proc);
+    }
+    return 0;
+}
+
+/* Shared by tgkill and rt_tgsigqueueinfo: (tgid, tid) in arg0/arg1. */
+static int translate_tgid_tid(KleeProcess *proc, KleeInterceptor *ic,
+                              KleeEvent *ev, const char *name)
+{
+    if (!proc->sandbox || !proc->sandbox->unshare_pid || !proc->sandbox->pid_map)
+        return 0;
+
+    pid_t vtgid = (pid_t)ev->args[0];
+    pid_t vtid = (pid_t)ev->args[1];
+    if (vtgid <= 0 || vtid <= 0)
+        return 0; /* the kernel rejects these itself */
+    pid_t real_tgid = resolve_target_pid(proc, vtgid);
+    pid_t real_tid = resolve_target_pid(proc, vtid);
+
+    if (real_tgid <= 0 || real_tid <= 0) {
+        KLEE_TRACE("%s: pid=%d tgid=%d tid=%d not in namespace -> ESRCH",
+                   name, proc->real_pid, vtgid, vtid);
+        return -ESRCH;
+    }
+
+    if (real_tgid != vtgid || real_tid != vtid) {
+        klee_regs_fetch(ic, proc);
+        klee_regs_set_arg(proc, 0, (uint64_t)real_tgid);
+        klee_regs_set_arg(proc, 1, (uint64_t)real_tid);
+        klee_regs_push(ic, proc);
+    }
+    return 0;
+}
+
+/* Shared by tkill, rt_sigqueueinfo and pidfd_open: a single PID in arg0. */
+static int translate_target_arg0(KleeProcess *proc, KleeInterceptor *ic,
+                                 KleeEvent *ev, const char *name)
+{
+    if (!proc->sandbox || !proc->sandbox->unshare_pid || !proc->sandbox->pid_map)
         return 0;
 
     pid_t vpid = (pid_t)ev->args[0];
     if (vpid <= 0)
-        return 0; /* Process group or special PIDs pass through */
-
-    pid_t real = translate_pid(proc->sandbox->pid_map, vpid);
+        return 0; /* never a process-group form here; kernel rejects it */
+    pid_t real = resolve_target_pid(proc, vpid);
     if (real <= 0) {
-        /* PID not in the map — likely an exited process or a real PID
-         * cached by glibc.  Pass through and let the kernel decide
-         * (returns ESRCH for truly dead processes). */
-        KLEE_TRACE("kill: pid=%d target vpid=%d not in map, passthrough",
-                    proc->real_pid, vpid);
-        return 0;
+        KLEE_TRACE("%s: pid=%d target=%d not in namespace -> ESRCH", name,
+                   proc->real_pid, vpid);
+        return -ESRCH;
     }
 
     if (real != vpid) {
@@ -1239,52 +1401,30 @@ int klee_enter_kill(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 
 int klee_enter_tgkill(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    if (!proc->sandbox || !proc->sandbox->unshare_pid)
-        return 0;
-
-    pid_t vtgid = (pid_t)ev->args[0];
-    pid_t vtid = (pid_t)ev->args[1];
-
-    pid_t real_tgid = translate_pid(proc->sandbox->pid_map, vtgid);
-    pid_t real_tid = translate_pid(proc->sandbox->pid_map, vtid);
-
-    if (real_tgid <= 0 || real_tid <= 0) {
-        /* PID/TID not in the map.  Pass through to kernel rather than
-         * denying — handles glibc-cached real TIDs (raise/abort pattern)
-         * and already-exited threads (crashpad cleanup). */
-        KLEE_TRACE("tgkill: pid=%d tgid=%d tid=%d not fully mapped, passthrough",
-                    proc->real_pid, vtgid, vtid);
-        return 0;
-    }
-
-    if (real_tgid != vtgid || real_tid != vtid) {
-        klee_regs_fetch(ic, proc);
-        klee_regs_set_arg(proc, 0, (uint64_t)real_tgid);
-        klee_regs_set_arg(proc, 1, (uint64_t)real_tid);
-        klee_regs_push(ic, proc);
-    }
-    return 0;
+    return translate_tgid_tid(proc, ic, ev, "tgkill");
 }
 
 int klee_enter_tkill(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    if (!proc->sandbox || !proc->sandbox->unshare_pid)
-        return 0;
+    return translate_target_arg0(proc, ic, ev, "tkill");
+}
 
-    pid_t vpid = (pid_t)ev->args[0];
-    pid_t real = translate_pid(proc->sandbox->pid_map, vpid);
-    if (real <= 0) {
-        KLEE_TRACE("tkill: pid=%d target=%d not in map, passthrough",
-                    proc->real_pid, vpid);
-        return 0;
-    }
+int klee_enter_rt_sigqueueinfo(KleeProcess *proc, KleeInterceptor *ic,
+                               KleeEvent *ev)
+{
+    return translate_target_arg0(proc, ic, ev, "rt_sigqueueinfo");
+}
 
-    if (real != vpid) {
-        klee_regs_fetch(ic, proc);
-        klee_regs_set_arg(proc, 0, (uint64_t)real);
-        klee_regs_push(ic, proc);
-    }
-    return 0;
+int klee_enter_rt_tgsigqueueinfo(KleeProcess *proc, KleeInterceptor *ic,
+                                 KleeEvent *ev)
+{
+    return translate_tgid_tid(proc, ic, ev, "rt_tgsigqueueinfo");
+}
+
+int klee_enter_pidfd_open(KleeProcess *proc, KleeInterceptor *ic,
+                          KleeEvent *ev)
+{
+    return translate_target_arg0(proc, ic, ev, "pidfd_open");
 }
 
 /* ==================== Process Group Enter Handlers ==================== */
@@ -1505,43 +1645,40 @@ int klee_enter_sethostname(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev
     return -0;
 }
 
-int klee_enter_shmget(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+/* SysV shmget/msgget/semget: point the key argument at this sandbox's
+ * private real key.  The kernel only sees the register, so it has to be
+ * written back; updating ev->args alone changes nothing but klee's copy. */
+static int translate_ipc_key(KleeProcess *proc, KleeInterceptor *ic,
+                             KleeEvent *ev, const char *name)
 {
-    (void)ic;
     if (!proc->sandbox || !proc->sandbox->unshare_ipc || !proc->sandbox->ipc_ns)
         return 0;
 
     key_t key = (key_t)ev->args[0];
     key_t real_key = klee_ipc_ns_translate_key(proc->sandbox->ipc_ns, key);
-    ev->args[0] = (uint64_t)(unsigned int)real_key;
-    KLEE_TRACE("shmget: translated key %d -> %d", key, real_key);
+    if (real_key != key) {
+        klee_regs_fetch(ic, proc);
+        klee_regs_set_arg(proc, 0, (uint64_t)(unsigned int)real_key);
+        klee_regs_push(ic, proc);
+        ev->args[0] = (uint64_t)(unsigned int)real_key;
+    }
+    KLEE_TRACE("%s: translated key %d -> %d", name, key, real_key);
     return 0;
+}
+
+int klee_enter_shmget(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    return translate_ipc_key(proc, ic, ev, "shmget");
 }
 
 int klee_enter_msgget(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    (void)ic;
-    if (!proc->sandbox || !proc->sandbox->unshare_ipc || !proc->sandbox->ipc_ns)
-        return 0;
-
-    key_t key = (key_t)ev->args[0];
-    key_t real_key = klee_ipc_ns_translate_key(proc->sandbox->ipc_ns, key);
-    ev->args[0] = (uint64_t)(unsigned int)real_key;
-    KLEE_TRACE("msgget: translated key %d -> %d", key, real_key);
-    return 0;
+    return translate_ipc_key(proc, ic, ev, "msgget");
 }
 
 int klee_enter_semget(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    (void)ic;
-    if (!proc->sandbox || !proc->sandbox->unshare_ipc || !proc->sandbox->ipc_ns)
-        return 0;
-
-    key_t key = (key_t)ev->args[0];
-    key_t real_key = klee_ipc_ns_translate_key(proc->sandbox->ipc_ns, key);
-    ev->args[0] = (uint64_t)(unsigned int)real_key;
-    KLEE_TRACE("semget: translated key %d -> %d", key, real_key);
-    return 0;
+    return translate_ipc_key(proc, ic, ev, "semget");
 }
 
 /* ==================== Misc Enter Handlers ==================== */

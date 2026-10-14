@@ -104,6 +104,14 @@ void klee_dispatch_init(void)
     register_handler(KLEE_SYS_kill,      "kill",      klee_enter_kill, NULL);
     register_handler(KLEE_SYS_tgkill,    "tgkill",    klee_enter_tgkill, NULL);
     register_handler(KLEE_SYS_tkill,     "tkill",     klee_enter_tkill, NULL);
+    register_handler(KLEE_SYS_rt_sigqueueinfo, "rt_sigqueueinfo",
+                     klee_enter_rt_sigqueueinfo, NULL);
+    register_handler(KLEE_SYS_rt_tgsigqueueinfo, "rt_tgsigqueueinfo",
+                     klee_enter_rt_tgsigqueueinfo, NULL);
+#ifdef KLEE_SYS_pidfd_open
+    register_handler(KLEE_SYS_pidfd_open, "pidfd_open",
+                     klee_enter_pidfd_open, NULL);
+#endif
     register_handler(KLEE_SYS_setpgid,   "setpgid",   klee_enter_setpgid, NULL);
     register_handler(KLEE_SYS_getpgid,   "getpgid",   klee_enter_getpgid, klee_exit_getpgid);
     register_handler(KLEE_SYS_getpgrp,   "getpgrp",   NULL, klee_exit_getpgrp);
@@ -134,9 +142,9 @@ void klee_dispatch_init(void)
     register_handler(KLEE_SYS_sethostname,"sethostname", klee_enter_sethostname, NULL);
 
     /* IPC namespace */
-    register_handler(KLEE_SYS_shmget,    "shmget",    klee_enter_shmget, NULL);
-    register_handler(KLEE_SYS_msgget,    "msgget",    klee_enter_msgget, NULL);
-    register_handler(KLEE_SYS_semget,    "semget",    klee_enter_semget, NULL);
+    register_handler(KLEE_SYS_shmget,    "shmget",    klee_enter_shmget, klee_exit_shmget);
+    register_handler(KLEE_SYS_msgget,    "msgget",    klee_enter_msgget, klee_exit_msgget);
+    register_handler(KLEE_SYS_semget,    "semget",    klee_enter_semget, klee_exit_semget);
 
     /* Socket AF_UNIX path translation */
     register_handler(KLEE_SYS_bind,      "bind",      klee_enter_bind, NULL);

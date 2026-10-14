@@ -486,6 +486,13 @@ int main(int argc, char **argv)
     /* Wait on block fd if specified (bwrap does this after setup, before exec) */
     wait_block_fd(&cfg);
 
+    /* Under a simulated PID namespace klee stands in for the namespace's
+     * init: orphaned sandbox processes are reparented to klee and reaped by
+     * its wait loop, rather than escaping to the host's init (where they
+     * pile up as zombies if that init never reaps, as in many containers). */
+    if (cfg.unshare_pid && prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) < 0)
+        KLEE_WARN("PR_SET_CHILD_SUBREAPER failed: %s", strerror(errno));
+
     /* Fork child */
     pid_t child_pid = fork();
     if (child_pid < 0) {
