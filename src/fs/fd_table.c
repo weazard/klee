@@ -16,6 +16,8 @@ static inline int fd_hash(int fd)
 KleeFdTable *klee_fd_table_create(void)
 {
     KleeFdTable *ft = calloc(1, sizeof(KleeFdTable));
+    if (!ft)
+        return NULL;
     ft->refs = 1;
     return ft;
 }
@@ -116,18 +118,27 @@ int klee_fd_table_set(KleeFdTable *ft, int fd, const char *virtual_path,
 
 const char *klee_fd_table_get(const KleeFdTable *ft, int fd)
 {
+    if (!ft)
+        return NULL;
+
     KleeFdEntry *e = find_entry(ft, fd);
     return e ? e->virtual_path : NULL;
 }
 
 bool klee_fd_table_is_cloexec(const KleeFdTable *ft, int fd)
 {
+    if (!ft)
+        return false;
+
     KleeFdEntry *e = find_entry(ft, fd);
     return e ? e->cloexec : false;
 }
 
 void klee_fd_table_set_cloexec(KleeFdTable *ft, int fd, bool cloexec)
 {
+    if (!ft)
+        return;
+
     KleeFdEntry *e = find_entry(ft, fd);
     if (e)
         e->cloexec = cloexec;
@@ -155,12 +166,20 @@ void klee_fd_table_remove(KleeFdTable *ft, int fd)
 
 int klee_fd_table_dup(KleeFdTable *ft, int old_fd, int new_fd, bool cloexec)
 {
-    const char *path = klee_fd_table_get(ft, old_fd);
-    if (!path)
-        return 0; /* Not tracked, OK */
+    /* dup2(fd, fd) changes nothing (the kernel keeps FD_CLOEXEC too).  Going
+     * on would free the entry that old_fd's path points into. */
+    if (old_fd == new_fd)
+        return 0;
 
-    /* Remove new_fd if it exists (dup2 semantics) */
-    klee_fd_table_remove(ft, new_fd);
+    const char *path = klee_fd_table_get(ft, old_fd);
+    if (!path) {
+        /* new_fd now refers to a file klee does not track: forget the path
+         * it had, or *at() calls on it would resolve against that one. */
+        klee_fd_table_remove(ft, new_fd);
+        return 0;
+    }
+
+    /* old_fd != new_fd, so updating new_fd's entry leaves path intact */
     return klee_fd_table_set(ft, new_fd, path, cloexec);
 }
 

@@ -145,7 +145,9 @@ void klee_process_remove(KleeProcessTable *pt, pid_t real_pid);
 
 /* Clone process state for fork/clone.  clone_flags decides what the new
  * task shares with its creator (CLONE_FILES, CLONE_FS) and what it gets
- * copies of. */
+ * copies of.  Returns NULL when out of memory; then no child is created and
+ * the parent and its FD table are left as they were.  A returned child
+ * always has an FD table. */
 KleeProcess *klee_process_fork(KleeProcessTable *pt, KleeProcess *parent,
                                 pid_t child_real_pid,
                                 unsigned long clone_flags);

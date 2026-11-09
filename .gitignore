@@ -18,6 +18,7 @@ tests/test_pid_ns
 tests/test_user_ns
 tests/test_fd_table
 tests/test_filter32
+tests/test_process
 
 # Editor/IDE
 .claude/

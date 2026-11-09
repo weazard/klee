@@ -329,7 +329,7 @@ KleeMount *klee_mount_table_resolve(const KleeMountTable *mt,
 static int translate_depth(const KleeMountTable *mt,
                             const char *guest_path,
                             char *host_path_out, size_t out_size,
-                            int depth)
+                            int depth, KleeOvAccess access)
 {
     if (!mt || !guest_path || !host_path_out)
         return -EINVAL;
@@ -437,16 +437,19 @@ static int translate_depth(const KleeMountTable *mt,
             snprintf(new_guest, PATH_MAX, "%s", target);
         }
         return translate_depth(mt, new_guest, host_path_out, out_size,
-                               depth + 1);
+                               depth + 1, access);
     }
 
     case MOUNT_OVERLAY:
     case MOUNT_TMP_OVERLAY:
     case MOUNT_RO_OVERLAY:
         if (mount->overlay) {
-            bool for_write = false; /* translate is read-only lookup */
+            /* A remounted read-only overlay must not be changed either */
+            if (mount->is_readonly && access != KLEE_OV_LOOKUP &&
+                access != KLEE_OV_LIST)
+                access = KLEE_OV_READ;
             return klee_overlay_resolve(mount->overlay, remainder,
-                                         host_path_out, out_size, for_write);
+                                         host_path_out, out_size, access);
         }
         /* Fallback: use source as merged dir */
         if (mount->source) {
@@ -477,7 +480,24 @@ int klee_mount_table_translate(const KleeMountTable *mt,
                                 const char *guest_path,
                                 char *host_path_out, size_t out_size)
 {
-    return translate_depth(mt, guest_path, host_path_out, out_size, 0);
+    return translate_depth(mt, guest_path, host_path_out, out_size, 0,
+                           KLEE_OV_LOOKUP);
+}
+
+int klee_mount_table_translate_access(const KleeMountTable *mt,
+                                       const char *guest_path,
+                                       char *host_path_out, size_t out_size,
+                                       KleeOvAccess access)
+{
+    return translate_depth(mt, guest_path, host_path_out, out_size, 0,
+                           access);
+}
+
+KleeOverlayMount *klee_mount_table_overlay_at(const KleeMountTable *mt,
+                                               const char *guest_path)
+{
+    KleeMount *mount = klee_mount_table_resolve(mt, guest_path);
+    return mount ? mount->overlay : NULL;
 }
 
 bool klee_mount_table_is_readonly(const KleeMountTable *mt,

@@ -27,6 +27,9 @@
 #  20. --unshare-pid: one consistent PID numbering, host PIDs out of reach
 #  21. Threads share the virtual cwd and fd table (CLONE_FS/CLONE_FILES)
 #  22. execveat/fexecve and /proc/self/fd/N execs get the sandbox's loader
+#  23. statx shows the virtual owner
+#  24. dup2(fd, fd) and dup2 of an untracked fd keep descriptor paths right
+#  25. Writable overlays never modify their lower layers
 set -e
 
 KLEE="${KLEE:-./klee}"
@@ -928,6 +931,82 @@ os.execve(fd, ["sh", "-c", cmd], {})                                     # fexec
 else
     echo "  SKIP: python3 or x86_64 loader not available (exec by fd test)"
 fi
+
+# ---------------------------------------------------------------------------
+# Fix 23: statx showed the real owner.  uid/gid were read and written at the
+# offsets struct stat uses, which in struct statx hold the mode and inode.
+# ---------------------------------------------------------------------------
+echo "--- statx shows the virtual owner ---"
+SX=$(mktemp /tmp/klee-statx.XXXXXX)
+out=$($KLEE --bind / / --unshare-user --uid 4321 --gid 4321 -- stat -c '%u:%g %a %i' "$SX" 2>/dev/null || true)
+want="4321:4321 $(stat -c '%a %i' "$SX")"
+if [ "$out" = "$want" ]; then
+    pass "statx: virtual uid/gid, mode and inode intact"
+else
+    fail "statx (got: $out, want: $want)"
+fi
+rm -f "$SX"
+
+# ---------------------------------------------------------------------------
+# Fix 24: dup2(fd, fd) freed the descriptor's path and then copied it from
+# the freed entry; dup2 of an untracked fd over a tracked one kept the old
+# path, so *at() calls on it resolved against a directory it no longer is.
+# ---------------------------------------------------------------------------
+echo "--- dup2 keeps descriptor paths right ---"
+if command -v python3 >/dev/null 2>&1; then
+    out=$($KLEE --bind / / -- python3 -c '
+import os
+d = os.open("/etc", os.O_RDONLY | os.O_DIRECTORY)
+os.dup2(d, d)
+os.fchdir(d)
+print(os.getcwd())
+r, w = os.pipe()
+os.dup2(r, d)
+try:
+    os.open("hostname", os.O_RDONLY, dir_fd=d)
+    print("opened")
+except NotADirectoryError:
+    print("ENOTDIR")' 2>/dev/null | tr '\n' ' ' || true)
+    if [ "$out" = "/etc ENOTDIR " ]; then
+        pass "dup2(fd, fd) and dup2 of an untracked fd"
+    else
+        fail "dup2 (got: $out)"
+    fi
+else
+    echo "  SKIP: python3 not available (dup2 test)"
+fi
+
+# ---------------------------------------------------------------------------
+# Fix 25: writable overlays wrote through to their lower layers: writes and
+# deletions hit the lower files, new names were lost.  Only the upper layer
+# may change.
+# ---------------------------------------------------------------------------
+echo "--- Writable overlays leave the lower layers alone ---"
+OV=$(mktemp -d /tmp/klee-ov.XXXXXX)
+mkdir -p "$OV/lower/dir" "$OV/upper" "$OV/work"
+echo original > "$OV/lower/file"
+echo keep > "$OV/lower/victim"
+echo inner > "$OV/lower/dir/inner"
+out=$($KLEE --bind / / --overlay-src "$OV/lower" --tmp-overlay /mnt/klee-ov -- /bin/sh -c '
+cd /mnt/klee-ov && echo changed > file && rm victim && echo new > new &&
+mkdir dir/sub && mv dir dir2 &&
+echo "$(cat file) $(ls | tr "\n" " ")$(ls dir2 | tr "\n" " ")"' 2>/dev/null || true)
+lower="$(cat "$OV/lower/file" "$OV/lower/victim" "$OV/lower/dir/inner" | tr '\n' ' ')$(ls "$OV/lower" | tr '\n' ' ')"
+if [ "$out" = "changed dir2 file new inner sub " ] &&
+   [ "$lower" = "original keep inner dir file victim " ]; then
+    pass "--tmp-overlay: copy-up, whiteouts and new names stay in the upper layer"
+else
+    fail "--tmp-overlay (got: $out | lower: $lower)"
+fi
+$KLEE --bind / / --overlay-src "$OV/lower" --overlay "$OV/upper" "$OV/work" /mnt/klee-ov -- \
+    /bin/sh -c 'echo changed > /mnt/klee-ov/file && echo new > /mnt/klee-ov/new' >/dev/null 2>&1 || true
+out=$(cat "$OV/upper/file" "$OV/upper/new" "$OV/lower/file" 2>/dev/null | tr '\n' ' ')
+if [ "$out" = "changed new original " ]; then
+    pass "--overlay: changes land in the upper directory"
+else
+    fail "--overlay (got: $out)"
+fi
+rm -rf "$OV"
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

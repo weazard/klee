@@ -33,6 +33,7 @@ typedef struct klee_resolve_ctx {
     const char *dirfd_path;  /* resolved dirfd path for RESOLVE_BENEATH */
     unsigned int flags;
     int symlink_depth;
+    KleeOvAccess ov_access;  /* what the call does with the final path */
 } KleeResolveCtx;
 
 /* Canonicalize a guest path.
@@ -43,7 +44,8 @@ typedef struct klee_resolve_ctx {
  * resolved: output buffer (PATH_MAX)
  * dirfd: AT_FDCWD or an open directory FD
  *
- * Returns 0 on success, negative errno on failure. */
+ * Returns 0 on success, negative errno on failure: -EBADF for a relative
+ * path when klee does not know what dirfd refers to. */
 int klee_path_resolve(KleeResolveCtx *ctx, const char *guest_path,
                        char *resolved, int dirfd);
 

@@ -18,6 +18,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -50,13 +51,40 @@ int klee_exit_open(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
         cloexec = !!(flags & O_CLOEXEC);
 
         /* Use the resolved absolute guest path so that fchdir() and
-         * other lookups get a proper absolute path, not a relative one. */
-        klee_fd_table_set(proc->fd_table, fd,
-                          proc->resolved_guest[0] ? proc->resolved_guest
-                                                   : proc->saved_path,
-                          cloexec);
+         * other lookups get a proper absolute path, not a relative one.
+         * Without one (the path was not resolved) the descriptor is left
+         * untracked: *at() calls on it then go to the kernel as they are. */
+        const char *vpath = proc->resolved_guest[0] ? proc->resolved_guest
+                                                    : proc->saved_path;
+        if (vpath[0] == '/')
+            klee_fd_table_set(proc->fd_table, fd, vpath, cloexec);
+        else
+            klee_fd_table_remove(proc->fd_table, fd);
     }
     return 0;
+}
+
+/* Owner and mode klee shows for a file the kernel reported with these
+ * values; shared by stat and statx. */
+static void virt_file_ids(KleeProcess *proc, uint32_t *mode, uint32_t *uid,
+                          uint32_t *gid)
+{
+    /* If the file is owned by us in reality, show it as owned by virtual uid */
+    if (*uid == (uint32_t)getuid())
+        *uid = proc->id_state->euid;
+    if (*gid == (uint32_t)getgid())
+        *gid = proc->id_state->egid;
+
+    /* Fake SUID ownership for chrome-sandbox when zypak is active.
+     * Chrome stat()s the sandbox helper before exec and requires
+     * root ownership + setuid bit. */
+    if (proc->sandbox->zypak_detected &&
+        klee_zypak_is_chrome_sandbox(proc->saved_path)) {
+        *uid = 0;
+        *mode |= S_ISUID | S_IXUSR | S_IXGRP | S_IXOTH;
+        KLEE_DEBUG("stat: faked SUID for chrome-sandbox: %s",
+                   proc->saved_path);
+    }
 }
 
 int klee_exit_stat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
@@ -95,23 +123,7 @@ int klee_exit_stat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
         return 0;
 
     uint32_t new_mode = mode, new_uid = uid, new_gid = gid;
-
-    /* If the file is owned by us in reality, show it as owned by virtual uid */
-    if (uid == (uint32_t)getuid())
-        new_uid = proc->id_state->euid;
-    if (gid == (uint32_t)getgid())
-        new_gid = proc->id_state->egid;
-
-    /* Fake SUID ownership for chrome-sandbox when zypak is active.
-     * Chrome stat()s the sandbox helper before exec and requires
-     * root ownership + setuid bit. */
-    if (proc->sandbox->zypak_detected &&
-        klee_zypak_is_chrome_sandbox(proc->saved_path)) {
-        new_uid = 0;
-        new_mode |= S_ISUID | S_IXUSR | S_IXGRP | S_IXOTH;
-        KLEE_DEBUG("stat: faked SUID for chrome-sandbox: %s",
-                   proc->saved_path);
-    }
+    virt_file_ids(proc, &new_mode, &new_uid, &new_gid);
 
     if (new_mode != mode)
         ic->write_mem(ic, ev->pid, (void *)(uintptr_t)(stat_addr + mode_off), &new_mode, sizeof(new_mode));
@@ -122,6 +134,23 @@ int klee_exit_stat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     return 0;
 }
 
+/* struct statx has one layout for every ABI (include/uapi/linux/stat.h).
+ * Its uid/gid are not where struct stat keeps them on x86_64. */
+#define KLEE_STATX_MASK_OFF 0
+#define KLEE_STATX_UID_OFF  20
+#define KLEE_STATX_GID_OFF  24
+#define KLEE_STATX_MODE_OFF 28   /* __u16 */
+#ifndef STATX_MODE
+#define STATX_MODE 0x00000002U
+#define STATX_UID  0x00000008U
+#define STATX_GID  0x00000010U
+#else
+_Static_assert(offsetof(struct statx, stx_mask) == KLEE_STATX_MASK_OFF, "statx layout");
+_Static_assert(offsetof(struct statx, stx_uid) == KLEE_STATX_UID_OFF, "statx layout");
+_Static_assert(offsetof(struct statx, stx_gid) == KLEE_STATX_GID_OFF, "statx layout");
+_Static_assert(offsetof(struct statx, stx_mode) == KLEE_STATX_MODE_OFF, "statx layout");
+#endif
+
 int klee_exit_statx(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
     if (ev->retval < 0)
@@ -130,35 +159,35 @@ int klee_exit_statx(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     if (!proc->sandbox || !proc->sandbox->unshare_user || !proc->id_state)
         return 0;
 
-    /* statx struct has uid/gid at known offsets */
-    /* struct statx { ... uint32_t stx_uid; uint32_t stx_gid; ... } */
-    /* We'll read the whole struct and rewrite */
-    void *statx_addr = (void *)(uintptr_t)ev->args[4];
+    /* statx(dirfd, pathname, flags, mask, statxbuf) */
+    char *statx_addr = (char *)(uintptr_t)ev->args[4];
 
-    /* statx uid is at offset 0x1c (28), gid at 0x20 (32) */
-    uint32_t uid_val, gid_val;
-    const size_t uid_off = 28;
-    const size_t gid_off = 32;
+    uint8_t head[KLEE_STATX_MODE_OFF + 2];
+    if (klee_read_mem(ic, ev->pid, head, statx_addr, sizeof(head)) < 0)
+        return 0;
 
-    int rc = klee_read_mem(ic, ev->pid, &uid_val,
-                           (char *)statx_addr + uid_off, sizeof(uid_val));
-    if (rc < 0) return 0;
+    uint32_t mask, uid, gid;
+    uint16_t mode16;
+    memcpy(&mask, head + KLEE_STATX_MASK_OFF, sizeof(mask));
+    memcpy(&uid, head + KLEE_STATX_UID_OFF, sizeof(uid));
+    memcpy(&gid, head + KLEE_STATX_GID_OFF, sizeof(gid));
+    memcpy(&mode16, head + KLEE_STATX_MODE_OFF, sizeof(mode16));
 
-    rc = klee_read_mem(ic, ev->pid, &gid_val,
-                       (char *)statx_addr + gid_off, sizeof(gid_val));
-    if (rc < 0) return 0;
+    uint32_t mode = mode16, new_mode = mode, new_uid = uid, new_gid = gid;
+    virt_file_ids(proc, &new_mode, &new_uid, &new_gid);
 
-    uid_t real_uid = getuid();
-    gid_t real_gid = getgid();
-
-    if (uid_val == (uint32_t)real_uid)
-        uid_val = proc->id_state->euid;
-    if (gid_val == (uint32_t)real_gid)
-        gid_val = proc->id_state->egid;
-
-    ic->write_mem(ic, ev->pid, (char *)statx_addr + uid_off, &uid_val, sizeof(uid_val));
-    ic->write_mem(ic, ev->pid, (char *)statx_addr + gid_off, &gid_val, sizeof(gid_val));
-
+    /* Only fields the kernel reported as filled in */
+    if ((mask & STATX_UID) && new_uid != uid)
+        ic->write_mem(ic, ev->pid, statx_addr + KLEE_STATX_UID_OFF,
+                      &new_uid, sizeof(new_uid));
+    if ((mask & STATX_GID) && new_gid != gid)
+        ic->write_mem(ic, ev->pid, statx_addr + KLEE_STATX_GID_OFF,
+                      &new_gid, sizeof(new_gid));
+    if ((mask & STATX_MODE) && new_mode != mode) {
+        uint16_t m = (uint16_t)new_mode;
+        ic->write_mem(ic, ev->pid, statx_addr + KLEE_STATX_MODE_OFF,
+                      &m, sizeof(m));
+    }
     return 0;
 }
 

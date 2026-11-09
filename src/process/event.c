@@ -384,11 +384,22 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
         if (proc->deny_errno && el->interceptor->backend == INTERCEPT_PTRACE) {
             klee_regs_fetch(el->interceptor, proc);
             klee_regs_set_result(proc, (long)-proc->deny_errno);
-            need_reg_push = true;
             proc->deny_errno = 0;
+            /* A handler may have rewritten path arguments before refusing
+             * the call (the second path of a rename, a read-only open):
+             * the tracee keeps its own registers either way. */
+            if (proc->path_modified) {
+                for (int i = 0; i < proc->path_arg_count; i++) {
+                    int idx = proc->path_arg_idx[i];
+                    klee_regs_set_arg(proc, idx, proc->saved_args[idx]);
+                }
+                proc->path_arg_count = 0;
+                proc->path_modified = false;
+            }
+            if (proc->demux_mem && proc->demux_dirty)
+                klee_abi_demux_restore(proc);
             /* Skip normal exit dispatch — syscall was denied */
-            if (need_reg_push)
-                klee_regs_push(el->interceptor, proc);
+            klee_regs_push(el->interceptor, proc);
             proc->state = PROC_STATE_RUNNING;
             el->interceptor->continue_running(el->interceptor, event->pid, 0);
             break;

@@ -6,14 +6,12 @@
 #define KLEE_MOUNT_TABLE_H
 
 #include "fs/radix_tree.h"
+#include "fs/overlay.h"
 #include "config.h"
 #include "util/arena.h"
 #include <stdbool.h>
 #include <sys/types.h>
 #include <linux/limits.h>
-
-/* Forward declaration */
-typedef struct klee_overlay_mount KleeOverlayMount;
 
 typedef struct klee_mount {
     MountType type;
@@ -59,6 +57,18 @@ KleeMount *klee_mount_table_resolve(const KleeMountTable *mt,
 int klee_mount_table_translate(const KleeMountTable *mt,
                                 const char *guest_path,
                                 char *host_path_out, size_t out_size);
+
+/* Translate the path a syscall works on.  access says what the call does
+ * with it, which an overlay mount prepares for (copy-up, whiteouts).
+ * klee_mount_table_translate is KLEE_OV_LOOKUP, for path walks. */
+int klee_mount_table_translate_access(const KleeMountTable *mt,
+                                       const char *guest_path,
+                                       char *host_path_out, size_t out_size,
+                                       KleeOvAccess access);
+
+/* The overlay a guest path is in, or NULL */
+KleeOverlayMount *klee_mount_table_overlay_at(const KleeMountTable *mt,
+                                               const char *guest_path);
 
 /* Check if a guest path is on a read-only mount */
 bool klee_mount_table_is_readonly(const KleeMountTable *mt,

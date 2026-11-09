@@ -493,7 +493,14 @@ diff <(bwrap --bind / / -- /usr/bin/id) \
 ## Limitations
 
 - **Overlay mounts** (`--overlay`, `--tmp-overlay`, `--ro-overlay`) are
-  not yet fully implemented (logged as warnings).
+  emulated without overlayfs. Changes copy a file up to the upper layer
+  and deletions are recorded as whiteouts, so lower layers are not
+  modified. Whiteouts are kept in memory only: with `--overlay`, a lower
+  file deleted in one run is back in the next. Renaming a directory that a
+  lower layer has fails with `EXDEV`, as on overlayfs without
+  `redirect_dir`; `mv` copies it instead. `fchmod`, `fchown` and
+  `fsetxattr` on a read-only descriptor of a lower-layer file still reach
+  that file.
 - **ptrace inside the sandbox** is not available: klee is already the
   tracer, so `strace`, `gdb`, crash handlers that attach to their own
   process, and `winedbg` get `EPERM` from `PTRACE_TRACEME`/`ATTACH`.

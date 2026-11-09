@@ -67,7 +67,7 @@ ALL_OBJS  = $(ALL_SRCS:.c=.o)
 # Test sources
 TEST_SRCS = tests/test_cli.c tests/test_radix_tree.c tests/test_mount_table.c \
             tests/test_path_resolve.c tests/test_pid_ns.c tests/test_user_ns.c \
-            tests/test_fd_table.c tests/test_filter32.c
+            tests/test_fd_table.c tests/test_filter32.c tests/test_process.c
 TEST_BINS = $(TEST_SRCS:.c=)
 
 # Build targets
@@ -135,6 +135,10 @@ tests/test_user_ns: tests/test_user_ns.c src/ns/user_ns.o $(COMMON_TEST_OBJS)
 
 tests/test_fd_table: tests/test_fd_table.c src/fs/fd_table.o $(COMMON_TEST_OBJS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+# --wrap lets the test make malloc/calloc fail
+tests/test_process: tests/test_process.c src/process/process.o src/fs/fd_table.o $(COMMON_TEST_OBJS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS) -Wl,--wrap=malloc -Wl,--wrap=calloc
 
 tests/test_filter32: tests/test_filter32.c src/intercept/filter.o src/syscall/sysnum32.o src/syscall/handlers.o $(COMMON_TEST_OBJS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS)

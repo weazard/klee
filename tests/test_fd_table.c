@@ -127,6 +127,54 @@ TEST(many_fds)
     klee_fd_table_destroy(ft);
 }
 
+/* dup2(fd, fd) is a no-op in the kernel, FD_CLOEXEC included.  It used to
+ * free the entry and then copy the path out of it. */
+TEST(dup2_same_fd)
+{
+    KleeFdTable *ft = klee_fd_table_create();
+    klee_fd_table_set(ft, 3, "/etc/passwd", true);
+    assert(klee_fd_table_dup(ft, 3, 3, false) == 0);
+    assert(strcmp(klee_fd_table_get(ft, 3), "/etc/passwd") == 0);
+    assert(klee_fd_table_is_cloexec(ft, 3) == true);
+    assert(ft->count == 1);
+    klee_fd_table_destroy(ft);
+}
+
+/* dup2 over a tracked fd */
+TEST(dup2_replaces)
+{
+    KleeFdTable *ft = klee_fd_table_create();
+    klee_fd_table_set(ft, 3, "/etc", false);
+    klee_fd_table_set(ft, 4, "/usr", true);
+    assert(klee_fd_table_dup(ft, 3, 4, false) == 0);
+    assert(strcmp(klee_fd_table_get(ft, 4), "/etc") == 0);
+    assert(klee_fd_table_is_cloexec(ft, 4) == false);
+    assert(ft->count == 2);
+    klee_fd_table_destroy(ft);
+}
+
+/* dup2 of an untracked fd (a pipe) over a tracked one: the old path must
+ * go, or *at() calls on the pipe would resolve against it */
+TEST(dup2_untracked_source)
+{
+    KleeFdTable *ft = klee_fd_table_create();
+    klee_fd_table_set(ft, 3, "/etc", false);
+    assert(klee_fd_table_dup(ft, 7, 3, false) == 0);
+    assert(klee_fd_table_get(ft, 3) == NULL);
+    assert(ft->count == 0);
+    klee_fd_table_destroy(ft);
+}
+
+/* A missing table reads as an empty one */
+TEST(null_table)
+{
+    assert(klee_fd_table_get(NULL, 3) == NULL);
+    assert(klee_fd_table_is_cloexec(NULL, 3) == false);
+    klee_fd_table_set_cloexec(NULL, 3, true);
+    assert(klee_fd_table_dup(NULL, 3, 4, false) == 0);
+    assert(klee_fd_table_set(NULL, 3, "/x", false) == -1);
+}
+
 int main(void)
 {
     klee_log_init(LOG_ERROR);
@@ -140,6 +188,10 @@ int main(void)
     RUN(overwrite_fd);
     RUN(set_cloexec);
     RUN(many_fds);
+    RUN(dup2_same_fd);
+    RUN(dup2_replaces);
+    RUN(dup2_untracked_source);
+    RUN(null_table);
     printf("All FD table tests passed!\n");
     return 0;
 }

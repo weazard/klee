@@ -290,14 +290,15 @@ int klee_path_resolve(KleeResolveCtx *ctx, const char *guest_path,
         else
             strcpy(state.guest_path, "/");
     } else {
-        /* Relative to dirfd - look up in FD table */
+        /* Relative to dirfd - look up in FD table.  An untracked one
+         * (inherited, received, or from a call klee does not follow) must
+         * not be taken for "/": the caller leaves the path to the kernel. */
         const char *dir_path = NULL;
         if (ctx->fd_table)
             dir_path = klee_fd_table_get(ctx->fd_table, dirfd);
-        if (dir_path)
-            snprintf(state.guest_path, PATH_MAX, "%s", dir_path);
-        else
-            strcpy(state.guest_path, "/");
+        if (!dir_path)
+            return -EBADF;
+        snprintf(state.guest_path, PATH_MAX, "%s", dir_path);
     }
 
     int rc = resolve_components(&state, guest_path);
@@ -316,8 +317,9 @@ int klee_path_guest_to_host(KleeResolveCtx *ctx, const char *guest_path,
     if (rc < 0)
         return rc;
 
-    return klee_mount_table_translate(ctx->mount_table, resolved,
-                                       host_path, PATH_MAX);
+    return klee_mount_table_translate_access(ctx->mount_table, resolved,
+                                              host_path, PATH_MAX,
+                                              ctx->ov_access);
 }
 
 int klee_path_resolve_nofollow(KleeResolveCtx *ctx, const char *guest_path,
@@ -341,6 +343,7 @@ int klee_path_guest_to_host_nofollow(KleeResolveCtx *ctx, const char *guest_path
     if (rc < 0)
         return rc;
 
-    return klee_mount_table_translate(ctx->mount_table, resolved,
-                                       host_path, PATH_MAX);
+    return klee_mount_table_translate_access(ctx->mount_table, resolved,
+                                              host_path, PATH_MAX,
+                                              ctx->ov_access);
 }
