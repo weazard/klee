@@ -18,6 +18,7 @@
 typedef struct klee_overlay_mount {
     char *merged_dir;       /* tmpfs-backed listing view of directories */
     char *upper_dir;        /* writable layer (NULL for ro-overlay) */
+    char *scratch_dir;      /* stand-ins the kernel removes for a whiteout */
     char **lower_dirs;      /* array of lower layer paths, bottom to top */
     int lower_count;
     bool readonly;
@@ -29,14 +30,17 @@ typedef enum {
     KLEE_OV_LOOKUP = 0,   /* path walk: the topmost entry, directories included */
     KLEE_OV_READ,         /* non-modifying call: directories show the merged view */
     KLEE_OV_LIST,         /* open: like READ, and a directory's listing is resynced */
-    KLEE_OV_WRITE,        /* changes contents or metadata: copy up first */
+    KLEE_OV_UNUSED,       /* the call fails before using it: the upper location */
+    KLEE_OV_WRITE,        /* opens for writing or truncates: copy up first */
     KLEE_OV_WRITE_CREATE, /* like WRITE, or creates the name when missing */
+    KLEE_OV_SETATTR,      /* changes owner, mode, times or xattrs: copy up first */
     KLEE_OV_CREATE,       /* creates the name when missing, else only opens it */
-    KLEE_OV_CREATE_EXCL,  /* creates the name: EEXIST if it exists */
+    KLEE_OV_CREATE_EXCL,  /* creates the name; the kernel answers EEXIST if it exists */
     KLEE_OV_UNLINK,
     KLEE_OV_RMDIR,
     KLEE_OV_RENAME_SRC,   /* rename source, or either side of RENAME_EXCHANGE */
-    KLEE_OV_RENAME_DST,
+    KLEE_OV_RENAME_DST,     /* rename destination of a non-directory */
+    KLEE_OV_RENAME_DST_DIR, /* rename destination of a directory */
     KLEE_OV_LINK_SRC,
 } KleeOvAccess;
 
@@ -65,6 +69,15 @@ void klee_overlay_whiteout(KleeOverlayMount *ov, const char *remainder);
 
 /* Check if a path has been whited out (deleted), itself or by an ancestor. */
 bool klee_overlay_is_whiteout(const KleeOverlayMount *ov, const char *remainder);
+
+/* Which layer of the overlay holds a host path */
+typedef enum {
+    KLEE_OV_HOST_NONE = 0,
+    KLEE_OV_HOST_UPPER,
+    KLEE_OV_HOST_LOWER,
+} KleeOvHostLayer;
+KleeOvHostLayer klee_overlay_host_layer(const KleeOverlayMount *ov,
+                                        const char *host_path);
 
 /* Destroy an overlay mount and free resources. */
 void klee_overlay_destroy(KleeOverlayMount *ov);

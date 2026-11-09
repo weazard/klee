@@ -306,6 +306,17 @@ int klee_mount_table_populate(KleeMountTable *mt, const KleeConfig *cfg)
             op->type != MOUNT_DEV_BIND_TRY) {
             return rc;
         }
+
+        /* A bind of a directory inside an overlay shows that part of the
+         * overlay, not the one layer its source path happens to be in */
+        if (rc == 0 && op->alias_overlay) {
+            KleeMount *m = klee_mount_table_resolve(mt, dest);
+            if (m) {
+                m->overlay = op->alias_overlay;
+                m->ov_prefix = klee_arena_strdup(
+                    mt->arena, op->alias_prefix ? op->alias_prefix : "");
+            }
+        }
     }
 
     return 0;
@@ -345,6 +356,24 @@ static int translate_depth(const KleeMountTable *mt,
     }
 
     KleeMount *mount = node->mount;
+
+    /* An overlay, or a bind of a directory inside one (ov_prefix): the
+     * layers are resolved for what the call does */
+    if (mount->overlay) {
+        /* A read-only mount of it must not change the overlay */
+        if (mount->is_readonly && access != KLEE_OV_LOOKUP &&
+            access != KLEE_OV_LIST)
+            access = KLEE_OV_READ;
+        if (!mount->ov_prefix || !mount->ov_prefix[0])
+            return klee_overlay_resolve(mount->overlay, remainder,
+                                         host_path_out, out_size, access);
+        char rel[PATH_MAX];
+        if (snprintf(rel, sizeof(rel), "%s/%s", mount->ov_prefix,
+                     remainder) >= (int)sizeof(rel))
+            return -ENAMETOOLONG;
+        return klee_overlay_resolve(mount->overlay, rel,
+                                     host_path_out, out_size, access);
+    }
 
     switch (mount->type) {
     case MOUNT_BIND_RW:
@@ -443,15 +472,7 @@ static int translate_depth(const KleeMountTable *mt,
     case MOUNT_OVERLAY:
     case MOUNT_TMP_OVERLAY:
     case MOUNT_RO_OVERLAY:
-        if (mount->overlay) {
-            /* A remounted read-only overlay must not be changed either */
-            if (mount->is_readonly && access != KLEE_OV_LOOKUP &&
-                access != KLEE_OV_LIST)
-                access = KLEE_OV_READ;
-            return klee_overlay_resolve(mount->overlay, remainder,
-                                         host_path_out, out_size, access);
-        }
-        /* Fallback: use source as merged dir */
+        /* No overlay state (its creation failed): use source as merged dir */
         if (mount->source) {
             while (*remainder == '/')
                 remainder++;
@@ -498,6 +519,40 @@ KleeOverlayMount *klee_mount_table_overlay_at(const KleeMountTable *mt,
 {
     KleeMount *mount = klee_mount_table_resolve(mt, guest_path);
     return mount ? mount->overlay : NULL;
+}
+
+struct host_layer_ctx {
+    const char *host_path;
+    KleeOverlayMount *ov;
+    KleeOvHostLayer layer;
+};
+
+static void host_layer_cb(const char *path, KleeMount *mount, void *ctx)
+{
+    (void)path;
+    struct host_layer_ctx *c = ctx;
+    /* every mount stacked on this mount point; an upper layer wins */
+    for (; mount; mount = mount->stacked) {
+        KleeOvHostLayer l = klee_overlay_host_layer(mount->overlay,
+                                                     c->host_path);
+        if (l == KLEE_OV_HOST_UPPER ||
+            (l == KLEE_OV_HOST_LOWER && c->layer == KLEE_OV_HOST_NONE)) {
+            c->ov = mount->overlay;
+            c->layer = l;
+        }
+    }
+}
+
+KleeOvHostLayer klee_mount_table_host_layer(const KleeMountTable *mt,
+                                            const char *host_path,
+                                            KleeOverlayMount **ov)
+{
+    struct host_layer_ctx c = { host_path, NULL, KLEE_OV_HOST_NONE };
+    if (mt && host_path)
+        klee_radix_walk(mt->tree, host_layer_cb, &c);
+    if (ov)
+        *ov = c.ov;
+    return c.layer;
 }
 
 bool klee_mount_table_is_readonly(const KleeMountTable *mt,

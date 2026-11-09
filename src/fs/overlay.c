@@ -10,14 +10,14 @@
  * The lower layers are never modified.  A call that changes a file from a
  * lower layer gets a copy of it in the upper directory first (copy-up), new
  * names are created in the upper directory, and a deletion only ever
- * removes something from the upper directory.
+ * removes something from the upper directory or a stand-in.
  *
  * Directories resolve to a tmpfs-backed merged directory that mirrors the
- * mode and times of the real directory.  Its entries are placeholders of
- * the right type (directory, symlink, fifo, empty file), resynced from the
- * layers whenever the directory is opened, so a listing shows the union of
- * the layers.  Files always resolve to their real layer, never to a
- * placeholder.
+ * owner, mode and times of the real directory.  Its entries are
+ * placeholders of the right type (directory, symlink, fifo, socket, empty
+ * file), resynced from the layers whenever the directory is opened, so a
+ * listing shows the union of the layers.  Files always resolve to their
+ * real layer, never to a placeholder.
  */
 #include "fs/overlay.h"
 #include "fs/tmpfs.h"
@@ -34,7 +34,6 @@
 #include <linux/limits.h>
 
 #define UPPER_LAYER (-1)
-#define NO_MODE ((mode_t)-1)
 
 /* An existing name and the layer that provides it */
 typedef struct {
@@ -108,6 +107,22 @@ static const char *base_of(const char *rel)
     return slash ? slash + 1 : rel;
 }
 
+/* dir itself or something below it */
+static bool path_under(const char *dir, const char *path)
+{
+    size_t len = strlen(dir);
+    while (len > 1 && dir[len - 1] == '/')
+        len--;
+    return strncmp(path, dir, len) == 0 &&
+           (path[len] == '\0' || path[len] == '/' || (len == 1 && dir[0] == '/'));
+}
+
+/* Fifos, sockets and devices: opening one for writing changes no layer */
+static bool is_special(mode_t mode)
+{
+    return S_ISFIFO(mode) || S_ISSOCK(mode) || S_ISCHR(mode) || S_ISBLK(mode);
+}
+
 /* ==================== Whiteouts ==================== */
 
 /* FNV-1a hash of the first len bytes of a relative path */
@@ -154,7 +169,8 @@ static int add_whiteout(KleeOverlayMount *ov, const char *rel)
 /* ==================== Layers ==================== */
 
 /* The topmost layer providing rel.  -ENOENT when no layer has it or it was
- * deleted, -ENOTDIR when a layer on top has a non-directory on its way. */
+ * deleted; -ENOTDIR or -EACCES when a layer on top has something in the
+ * way, with e->path the path that fails like that. */
 static int lookup(const KleeOverlayMount *ov, const char *rel, OvEntry *e)
 {
     if (ov->upper_dir) {
@@ -164,8 +180,8 @@ static int lookup(const KleeOverlayMount *ov, const char *rel, OvEntry *e)
             e->layer = UPPER_LAYER;
             return 0;
         }
-        if (errno == ENOTDIR)
-            return -ENOTDIR;
+        if (errno == ENOTDIR || errno == EACCES)
+            return -errno;
     }
     if (whited_out(ov, rel))
         return -ENOENT;
@@ -176,33 +192,27 @@ static int lookup(const KleeOverlayMount *ov, const char *rel, OvEntry *e)
             e->layer = i;
             return 0;
         }
-        if (errno == ENOTDIR)
-            return -ENOTDIR;
+        if (errno == ENOTDIR || errno == EACCES)
+            return -errno;
     }
     return -ENOENT;
 }
 
-/* Some lower layer has rel, whatever the whiteouts say */
-static bool in_lower(const KleeOverlayMount *ov, const char *rel)
+/* What the lower layers alone show at rel, whiteouts applied */
+static bool lower_entry(const KleeOverlayMount *ov, const char *rel,
+                        struct stat *st)
 {
     char path[PATH_MAX];
-    struct stat st;
-    for (int i = 0; i < ov->lower_count; i++)
-        if (join(path, sizeof(path), ov->lower_dirs[i], rel) == 0 &&
-            lstat(path, &st) == 0)
+    if (whited_out(ov, rel))
+        return false;
+    for (int i = ov->lower_count - 1; i >= 0; i--) {
+        if (join(path, sizeof(path), ov->lower_dirs[i], rel) < 0)
+            return false;
+        if (lstat(path, st) == 0)
             return true;
-    return false;
-}
-
-/* The topmost lower directory at rel, for its mode and times */
-static bool lower_dir(const KleeOverlayMount *ov, const char *rel,
-                      struct stat *st)
-{
-    char path[PATH_MAX];
-    for (int i = ov->lower_count - 1; i >= 0; i--)
-        if (join(path, sizeof(path), ov->lower_dirs[i], rel) == 0 &&
-            lstat(path, st) == 0 && S_ISDIR(st->st_mode))
-            return true;
+        if (errno == ENOTDIR || errno == EACCES)
+            return false;
+    }
     return false;
 }
 
@@ -219,34 +229,53 @@ static int absent_path(const KleeOverlayMount *ov, const char *rel,
 
 /* ==================== Directories klee writes into ==================== */
 
-/* klee creates entries in upper and merged directories that it made, but
- * their mode, copied from the real directory, may not let it (0555). */
-static mode_t unlock_dir(const char *dir)
-{
-    struct stat st;
-    if (lstat(dir, &st) < 0 || !S_ISDIR(st.st_mode) ||
-        (st.st_mode & S_IRWXU) == S_IRWXU)
-        return NO_MODE;
-    if (chmod(dir, (st.st_mode & 07777) | S_IRWXU) < 0)
-        return NO_MODE;
-    return st.st_mode & 07777;
-}
-
-static void relock_dir(const char *dir, mode_t mode)
-{
-    if (mode != NO_MODE)
-        chmod(dir, mode);
-}
-
 static void set_times(const char *path, const struct stat *st)
 {
     struct timespec ts[2] = { st->st_atim, st->st_mtim };
     utimensat(AT_FDCWD, path, ts, AT_SYMLINK_NOFOLLOW);
 }
 
-/* Give a directory klee created its final mode and times */
+/* A deletion recorded as a whiteout changes the directory as well */
+static void touch_mtime(const char *path)
+{
+    struct timespec ts[2] = { { 0, UTIME_OMIT }, { 0, UTIME_NOW } };
+    utimensat(AT_FDCWD, path, ts, AT_SYMLINK_NOFOLLOW);
+}
+
+/* klee puts entries into upper and merged directories that the sandbox did
+ * not ask for: copies, parent directories, placeholders.  Such a directory
+ * keeps its times, and gets its mode back if klee had to add permissions
+ * for itself (a copy of a 0555 directory is 0555). */
+typedef struct {
+    char path[PATH_MAX];
+    struct stat st;
+    bool held;
+} DirHold;
+
+static void hold_dir(DirHold *h, const char *dir)
+{
+    h->held = put(h->path, sizeof(h->path), dir) == 0 &&
+              lstat(dir, &h->st) == 0 && S_ISDIR(h->st.st_mode);
+    if (h->held && (h->st.st_mode & S_IRWXU) != S_IRWXU)
+        chmod(dir, (h->st.st_mode & 07777) | S_IRWXU);
+}
+
+static void release_dir(const DirHold *h)
+{
+    if (!h->held)
+        return;
+    if ((h->st.st_mode & S_IRWXU) != S_IRWXU)
+        chmod(h->path, h->st.st_mode & 07777);
+    set_times(h->path, &h->st);
+}
+
+/* Give a directory klee created the owner, mode and times of the one it
+ * stands for */
 static void finish_dir(const char *path, const struct stat *src)
 {
+    if (src && lchown(path, src->st_uid, src->st_gid) < 0) {
+        /* only root can keep another owner */
+    }
     chmod(path, src ? src->st_mode & 07777 : 0755);
     if (src)
         set_times(path, src);
@@ -255,8 +284,8 @@ static void finish_dir(const char *path, const struct stat *src)
 /* ==================== Upper layer ==================== */
 
 /* Create the upper copies of rel's ancestors (and of rel with include_self)
- * with the mode and times of the lower directory each one shadows.  A new
- * directory stays writable for klee until the next level is in it. */
+ * like the lower directory each one shadows.  A new directory stays
+ * writable for klee until the next level is in it. */
 static int make_upper_dirs(const KleeOverlayMount *ov, const char *rel,
                            bool include_self)
 {
@@ -287,18 +316,24 @@ static int make_upper_dirs(const KleeOverlayMount *ov, const char *rel,
                 rc = -ENOTDIR;
             continue;
         }
+        if (errno != ENOENT) {
+            rc = -errno;
+            continue;
+        }
 
-        mode_t locked = unlock_dir(parent);
+        DirHold hold;
+        hold_dir(&hold, parent);
         if (mkdir(up, S_IRWXU) < 0 && errno != EEXIST)
             rc = -errno;
-        relock_dir(parent, locked);
+        release_dir(&hold);
 
         if (pending[0])
             finish_dir(pending, pending_src ? &pending_st : NULL);
         pending[0] = '\0';
         if (rc == 0) {
             memcpy(pending, up, sizeof(up));
-            pending_src = lower_dir(ov, prefix, &pending_st);
+            pending_src = lower_entry(ov, prefix, &pending_st) &&
+                          S_ISDIR(pending_st.st_mode);
         }
     }
     if (pending[0])
@@ -361,8 +396,8 @@ static int copy_file(const char *src, const char *dst, const struct stat *st)
     return rc;
 }
 
-/* Copy the lower entry e of rel into the upper layer.  -ENOTSUP for a
- * device or socket, which cannot be recreated. */
+/* Copy the lower entry e of rel into the upper layer.  A device needs the
+ * right to create one: -EPERM without it, as from overlayfs. */
 static int copy_up(const KleeOverlayMount *ov, const char *rel,
                    const OvEntry *e)
 {
@@ -375,13 +410,14 @@ static int copy_up(const KleeOverlayMount *ov, const char *rel,
         join(updir, sizeof(updir), ov->upper_dir, prel) < 0)
         return -ENAMETOOLONG;
 
-    mode_t mode = e->st.st_mode & 07777;
-    mode_t locked = unlock_dir(updir);
-    if (S_ISREG(e->st.st_mode)) {
+    mode_t type = e->st.st_mode & S_IFMT;
+    DirHold hold;
+    hold_dir(&hold, updir);
+    if (type == S_IFREG) {
         rc = copy_file(e->path, up, &e->st);
-    } else if (S_ISDIR(e->st.st_mode)) {
+    } else if (type == S_IFDIR) {
         rc = mkdir(up, S_IRWXU) < 0 ? -errno : 0;
-    } else if (S_ISLNK(e->st.st_mode)) {
+    } else if (type == S_IFLNK) {
         char target[PATH_MAX];
         ssize_t len = readlink(e->path, target, sizeof(target) - 1);
         if (len < 0) {
@@ -390,43 +426,46 @@ static int copy_up(const KleeOverlayMount *ov, const char *rel,
             target[len] = '\0';
             rc = symlink(target, up) < 0 ? -errno : 0;
         }
-    } else if (S_ISFIFO(e->st.st_mode)) {
-        rc = mkfifo(up, S_IRUSR | S_IWUSR) < 0 ? -errno : 0;
     } else {
-        rc = -ENOTSUP;
+        rc = mknod(up, type | S_IRUSR | S_IWUSR, e->st.st_rdev) < 0 ? -errno : 0;
     }
-    relock_dir(updir, locked);
+    release_dir(&hold);
     if (rc == -EEXIST)
         rc = 0;   /* made meanwhile; the upper entry wins either way */
     if (rc < 0)
         return rc;
 
-    if (!S_ISREG(e->st.st_mode)) {
+    if (type != S_IFREG) {
         if (lchown(up, e->st.st_uid, e->st.st_gid) < 0) {
             /* only root can keep another owner */
         }
-        if (!S_ISLNK(e->st.st_mode))
-            chmod(up, mode);
+        if (type != S_IFLNK)
+            chmod(up, e->st.st_mode & 07777);
     }
     set_times(up, &e->st);
     KLEE_DEBUG("overlay: copied up %s", e->path);
     return 0;
 }
 
-/* The upper entry of an existing name, copied up first if needed.  A device
- * or socket keeps its lower path when in_place: writing to it does not
- * change the layer. */
+/* The upper entry of an existing name, copied up first if needed */
 static int upper_copy(const KleeOverlayMount *ov, const char *rel,
-                      const OvEntry *e, bool in_place, char *out, size_t size)
+                      const OvEntry *e, char *out, size_t size)
 {
-    if (e->layer == UPPER_LAYER)
-        return put(out, size, e->path);
-    int rc = copy_up(ov, rel, e);
-    if (rc == -ENOTSUP)
-        return in_place ? put(out, size, e->path) : -EXDEV;
-    if (rc < 0)
-        return rc;
+    if (e->layer != UPPER_LAYER) {
+        int rc = copy_up(ov, rel, e);
+        if (rc < 0)
+            return rc;
+    }
     return join(out, size, ov->upper_dir, rel);
+}
+
+/* The same for a call that moves or links the entry.  A device klee may
+ * not create is EXDEV: the caller's own copy then fails the same way. */
+static int upper_copy_to_move(const KleeOverlayMount *ov, const char *rel,
+                              const OvEntry *e, char *out, size_t size)
+{
+    int rc = upper_copy(ov, rel, e, out, size);
+    return rc == -EPERM && is_special(e->st.st_mode) ? -EXDEV : rc;
 }
 
 /* Upper path for a new name, with the parents the call needs to create it */
@@ -504,12 +543,12 @@ static unsigned char dtype_at(int dfd, const char *name)
     return IFTODT(st.st_mode);
 }
 
-/* Placeholders exist for the types getdents reports most; anything else
- * (device, socket) is listed as a regular file. */
+/* Placeholders exist for the types klee can always create; a device is
+ * listed as a regular file. */
 static unsigned char placeholder_type(unsigned char d_type)
 {
-    return d_type == DT_DIR || d_type == DT_LNK || d_type == DT_FIFO
-           ? d_type : DT_REG;
+    return d_type == DT_DIR || d_type == DT_LNK || d_type == DT_FIFO ||
+           d_type == DT_SOCK ? d_type : DT_REG;
 }
 
 /* Add the entries of one layer's directory; lower layers skip whiteouts */
@@ -585,16 +624,27 @@ static int collect(const KleeOverlayMount *ov, const char *rel, OvNames *l)
     return 0;
 }
 
+static int dir_is_empty(const KleeOverlayMount *ov, const char *rel,
+                        bool *empty)
+{
+    OvNames l = { 0 };
+    int rc = collect(ov, rel, &l);
+    *empty = l.n == 0;
+    names_free(&l);
+    return rc;
+}
+
 static void remove_entry(int dfd, const char *name);
 
 /* Delete a subtree of the merged view; it only holds placeholders */
 static void remove_tree(int dfd, const char *name)
 {
+    /* merged directories mirror real modes, which may keep klee out */
+    if (fchmodat(dfd, name, S_IRWXU, 0) < 0) {
+        /* then the removal below fails too and the next resync retries */
+    }
     int sub = openat(dfd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (sub >= 0) {
-        struct stat st;
-        if (fstat(sub, &st) == 0 && (st.st_mode & S_IRWXU) != S_IRWXU)
-            fchmod(sub, (st.st_mode & 07777) | S_IRWXU);
         OvNames names = { 0 };
         int dup_fd = dup(sub);
         DIR *d = dup_fd >= 0 ? fdopendir(dup_fd) : NULL;
@@ -640,6 +690,9 @@ static void make_placeholder(int dfd, const char *name, unsigned char type)
         break;
     case DT_FIFO:
         mkfifoat(dfd, name, S_IRUSR | S_IWUSR);
+        break;
+    case DT_SOCK:
+        mknodat(dfd, name, S_IFSOCK | S_IRUSR | S_IWUSR, 0);
         break;
     default:
         fd = openat(dfd, name, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
@@ -688,13 +741,14 @@ static int sync_dir(const KleeOverlayMount *ov, const char *rel,
     }
 
     if (rc == 0) {
-        mode_t locked = unlock_dir(mp);
+        DirHold hold;
+        hold_dir(&hold, mp);
         for (size_t i = 0; i < stale.n; i++)
             remove_entry(dfd, stale.v[i].name);
         for (size_t i = 0; i < want.n; i++)
             if (!present[i])
                 make_placeholder(dfd, want.v[i].name, want.v[i].type);
-        relock_dir(mp, locked);
+        release_dir(&hold);
     }
 
     if (d)
@@ -707,12 +761,16 @@ static int sync_dir(const KleeOverlayMount *ov, const char *rel,
     return rc;
 }
 
-/* Mirror the real directory's mode and times on its merged directory */
+/* Mirror the real directory's owner, mode and times on its merged directory */
 static void mirror_dir(const char *mp, const struct stat *real)
 {
     struct stat cur;
     if (lstat(mp, &cur) < 0)
         return;
+    if ((cur.st_uid != real->st_uid || cur.st_gid != real->st_gid) &&
+        lchown(mp, real->st_uid, real->st_gid) < 0) {
+        /* only root can show another owner */
+    }
     if ((cur.st_mode & 07777) != (real->st_mode & 07777))
         chmod(mp, real->st_mode & 07777);
     if (cur.st_mtim.tv_sec != real->st_mtim.tv_sec ||
@@ -743,10 +801,11 @@ static int merged_dir(const KleeOverlayMount *ov, const char *rel,
         if (lstat(path, &st) == 0 && S_ISDIR(st.st_mode))
             continue;
 
-        mode_t locked = unlock_dir(parent);
+        DirHold hold;
+        hold_dir(&hold, parent);
         unlink(path);   /* a placeholder of another type */
         int rc = mkdir(path, S_IRWXU) < 0 && errno != EEXIST ? -errno : 0;
-        relock_dir(parent, locked);
+        release_dir(&hold);
         if (rc < 0)
             return rc;
 
@@ -759,7 +818,7 @@ static int merged_dir(const KleeOverlayMount *ov, const char *rel,
 }
 
 /* What a directory resolves to: its merged directory, resynced for a
- * listing, with the real directory's mode and times. */
+ * listing, looking like the real directory. */
 static int dir_view(const KleeOverlayMount *ov, const char *rel,
                     const struct stat *real, bool list, char *out, size_t size)
 {
@@ -783,44 +842,41 @@ static void merged_forget(const KleeOverlayMount *ov, const char *rel)
     int dfd = open(parent, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (dfd < 0)
         return;
-    mode_t locked = unlock_dir(parent);
+    DirHold hold;
+    hold_dir(&hold, parent);
     remove_entry(dfd, base_of(rel));
-    relock_dir(parent, locked);
+    release_dir(&hold);
     close(dfd);
 }
 
-/* ==================== Deletions ==================== */
+/* ==================== Deletions and moves ==================== */
 
-/* For a name only lower layers have: an upper entry of the same kind for
- * the syscall to remove, so that it succeeds without touching them. */
-static int make_victim(const KleeOverlayMount *ov, const char *rel, bool dir)
+/* The kernel has to remove something for an unlink or rmdir to succeed, but
+ * a name that only lower layers have is deleted by recording a whiteout.
+ * Give the call a stand-in of the same kind, outside every layer: nothing
+ * can see it, and nothing is shadowed if the call never runs. */
+static int make_victim(KleeOverlayMount *ov, bool dir, char *out, size_t size)
 {
-    char up[PATH_MAX], prel[PATH_MAX], updir[PATH_MAX];
-    int rc = make_upper_dirs(ov, rel, false);
-    if (rc < 0)
-        return rc;
-    parent_of(rel, prel);
-    if (join(up, sizeof(up), ov->upper_dir, rel) < 0 ||
-        join(updir, sizeof(updir), ov->upper_dir, prel) < 0)
-        return -ENAMETOOLONG;
-    /* Fail as the deletion would, before anything is recorded */
-    if (access(updir, W_OK | X_OK) < 0)
-        return -errno;
-
-    if (dir) {
-        rc = mkdir(up, S_IRWXU) < 0 ? -errno : 0;
-    } else {
-        int fd = open(up, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, S_IRUSR | S_IWUSR);
-        rc = fd < 0 ? -errno : 0;
-        if (fd >= 0)
-            close(fd);
+    static unsigned serial;
+    if (!ov->scratch_dir) {
+        ov->scratch_dir = klee_tmpfs_create("(overlay scratch)");
+        if (!ov->scratch_dir)
+            return -ENOSPC;
     }
-    return rc;
+    int n = snprintf(out, size, "%s/%u", ov->scratch_dir, serial++);
+    if (n < 0 || (size_t)n >= size)
+        return -ENAMETOOLONG;
+    if (dir)
+        return mkdir(out, S_IRWXU) < 0 ? -errno : 0;
+    int fd = open(out, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+                  S_IRUSR | S_IWUSR);
+    if (fd < 0)
+        return -errno;
+    close(fd);
+    return 0;
 }
 
-/* unlink/rmdir: the upper path for the syscall to remove.  A name a lower
- * layer has is whited out first; the whiteout is harmless while an upper
- * entry still exists, as that one is found first. */
+/* unlink/rmdir: the path for the syscall to remove */
 static int delete_path(KleeOverlayMount *ov, const char *rel,
                        const OvEntry *e, bool dir, char *out, size_t size)
 {
@@ -832,49 +888,112 @@ static int delete_path(KleeOverlayMount *ov, const char *rel,
     if (dir && !*rel)
         return -EBUSY;
     if (dir) {
-        OvNames l = { 0 };
-        int rc = collect(ov, rel, &l);
-        size_t n = l.n;
-        names_free(&l);
+        bool empty;
+        int rc = dir_is_empty(ov, rel, &empty);
         if (rc < 0)
             return rc;
-        if (n)
+        if (!empty)
             return -ENOTEMPTY;
     }
 
-    if (e->layer != UPPER_LAYER) {
-        int rc = make_victim(ov, rel, dir);
+    struct stat lst;
+    bool lower = lower_entry(ov, rel, &lst);
+
+    if (e->layer == UPPER_LAYER) {
+        /* The kernel removes the upper entry.  What the lower layers have
+         * is hidden first; that shows nothing while the upper entry is
+         * there, so it does not matter if the call then fails. */
+        int rc = lower ? add_whiteout(ov, rel) : 0;
         if (rc < 0)
             return rc;
+        merged_forget(ov, rel);
+        return put(out, size, e->path);
     }
-    if (in_lower(ov, rel)) {
-        int rc = add_whiteout(ov, rel);
-        if (rc < 0)
-            return rc;
+
+    /* Only lower layers have it.  Fail as the deletion would before
+     * anything is recorded: the upper parent has the directory's mode. */
+    char prel[PATH_MAX], updir[PATH_MAX];
+    int rc = make_upper_dirs(ov, rel, false);
+    if (rc < 0)
+        return rc;
+    parent_of(rel, prel);
+    if (join(updir, sizeof(updir), ov->upper_dir, prel) < 0)
+        return -ENAMETOOLONG;
+    if (access(updir, W_OK | X_OK) < 0)
+        return -errno;
+
+    rc = make_victim(ov, dir, out, size);
+    if (rc < 0)
+        return rc;
+    rc = add_whiteout(ov, rel);
+    if (rc < 0) {
+        if (dir)
+            rmdir(out);
+        else
+            unlink(out);
+        return rc;
     }
+    touch_mtime(updir);
     merged_forget(ov, rel);
-    KLEE_DEBUG("overlay: delete %s", rel);
-    return join(out, size, ov->upper_dir, rel);
+    KLEE_DEBUG("overlay: whiteout %s", rel);
+    return 0;
 }
 
 /* Source of a rename: copied up and whited out in the lower layers, so the
- * kernel moves the upper entry.  A directory a lower layer has is EXDEV, as
- * with overlayfs without redirect_dir: callers then copy it instead. */
+ * kernel moves the upper entry.  A directory merged with lower ones is
+ * EXDEV, as with overlayfs without redirect_dir: callers then copy it. */
 static int move_path(KleeOverlayMount *ov, const char *rel, const OvEntry *e,
                      char *out, size_t size)
 {
     if (!*rel)
         return -EBUSY;
-    bool lower = in_lower(ov, rel);
-    if (S_ISDIR(e->st.st_mode) && lower)
+    struct stat lst;
+    bool lower = lower_entry(ov, rel, &lst);
+    if (S_ISDIR(e->st.st_mode) && lower && S_ISDIR(lst.st_mode))
         return -EXDEV;
-    int rc = upper_copy(ov, rel, e, false, out, size);
+    int rc = upper_copy_to_move(ov, rel, e, out, size);
     if (rc < 0)
         return rc;
     if (lower && (rc = add_whiteout(ov, rel)) < 0)
         return rc;
     merged_forget(ov, rel);
     return 0;
+}
+
+/* Destination of a rename whose source is (not) a directory */
+static int replace_path(KleeOverlayMount *ov, const char *rel, bool found,
+                        const OvEntry *e, bool src_dir, char *out, size_t size)
+{
+    if (!*rel)
+        return -EBUSY;
+    if (found) {
+        bool is_dir = S_ISDIR(e->st.st_mode);
+        if (is_dir != src_dir)
+            return is_dir ? -EISDIR : -ENOTDIR;
+        if (is_dir) {
+            /* A directory replaces an empty one: the kernel replaces its
+             * upper part, a whiteout keeps the lower part from showing
+             * through the new directory. */
+            bool empty;
+            int rc = dir_is_empty(ov, rel, &empty);
+            if (rc < 0)
+                return rc;
+            if (!empty)
+                return -ENOTEMPTY;
+            rc = upper_copy(ov, rel, e, out, size);
+            if (rc < 0)
+                return rc;
+            struct stat lst;
+            if (lower_entry(ov, rel, &lst) && (rc = add_whiteout(ov, rel)) < 0)
+                return rc;
+            merged_forget(ov, rel);
+            return 0;
+        }
+        if (e->layer == UPPER_LAYER)
+            return put(out, size, e->path);
+    }
+    /* A new name, or one that shadows what the lower layers have */
+    return create_path(ov, rel, out, size);
 }
 
 /* ==================== Public API ==================== */
@@ -923,8 +1042,9 @@ KleeOverlayMount *klee_overlay_create(const char *dest, const char *upper,
             char upper_name[PATH_MAX];
             snprintf(upper_name, sizeof(upper_name), "%s/.upper", dest);
             ov->upper_dir = klee_tmpfs_create(upper_name);
-            /* A fresh upper root shows like the root it covers */
-            if (ov->upper_dir && lower_dir(ov, "", &root))
+            /* A fresh upper root looks like the root it covers */
+            if (ov->upper_dir && lower_entry(ov, "", &root) &&
+                S_ISDIR(root.st_mode))
                 finish_dir(ov->upper_dir, &root);
         }
         if (!ov->upper_dir) {
@@ -963,19 +1083,27 @@ int klee_overlay_resolve(KleeOverlayMount *ov, const char *remainder,
     bool writable = ov->upper_dir && !ov->readonly;
     if (!writable && access != KLEE_OV_LOOKUP && access != KLEE_OV_LIST)
         access = KLEE_OV_READ;
+    bool reads = access == KLEE_OV_LOOKUP || access == KLEE_OV_READ ||
+                 access == KLEE_OV_LIST || access == KLEE_OV_UNUSED;
+    char *out = host_path_out;
+    size_t size = out_size;
 
     OvEntry e;
     rc = lookup(ov, rel, &e);
-    if (rc < 0 && rc != -ENOENT && rc != -ENOTDIR)
+    if (rc == -ENOTDIR || rc == -EACCES)
+        /* The kernel fails the same way on the path that did */
+        return reads ? put(out, size, e.path) : rc;
+    if (rc < 0 && rc != -ENOENT)
         return rc;
     bool found = rc == 0;
     bool is_dir = found && S_ISDIR(e.st.st_mode);
-    char *out = host_path_out;
-    size_t size = out_size;
 
     switch (access) {
     case KLEE_OV_LOOKUP:
         return found ? put(out, size, e.path) : absent_path(ov, rel, out, size);
+
+    case KLEE_OV_UNUSED:
+        return absent_path(ov, rel, out, size);
 
     case KLEE_OV_READ:
     case KLEE_OV_LIST:
@@ -993,15 +1121,26 @@ int klee_overlay_resolve(KleeOverlayMount *ov, const char *remainder,
             return access == KLEE_OV_WRITE_CREATE
                    ? create_path(ov, rel, out, size)
                    : absent_path(ov, rel, out, size);
-        return upper_copy(ov, rel, &e, true, out, size);
+        /* Readers and writers of a fifo, socket or device must meet on
+         * the same one, and writing to it changes no layer */
+        if (is_special(e.st.st_mode))
+            return put(out, size, e.path);
+        return upper_copy(ov, rel, &e, out, size);
+
+    case KLEE_OV_SETATTR:
+        if (!found)
+            return absent_path(ov, rel, out, size);
+        return upper_copy(ov, rel, &e, out, size);
 
     case KLEE_OV_CREATE_EXCL:
-        return found ? -EEXIST : create_path(ov, rel, out, size);
+        /* An existing entry makes the kernel answer EEXIST, in its own
+         * order among the errors of the call; nothing is created there. */
+        return found ? put(out, size, e.path) : create_path(ov, rel, out, size);
 
     case KLEE_OV_UNLINK:
     case KLEE_OV_RMDIR:
         if (!found)
-            return rc;
+            return -ENOENT;
         return delete_path(ov, rel, &e, access == KLEE_OV_RMDIR, out, size);
 
     case KLEE_OV_RENAME_SRC:
@@ -1010,21 +1149,17 @@ int klee_overlay_resolve(KleeOverlayMount *ov, const char *remainder,
         return move_path(ov, rel, &e, out, size);
 
     case KLEE_OV_RENAME_DST:
-        if (!*rel)
-            return -EBUSY;
-        /* Replacing a directory of a lower layer: see move_path */
-        if (is_dir && in_lower(ov, rel))
-            return -EXDEV;
-        if (found && e.layer == UPPER_LAYER)
-            return put(out, size, e.path);
-        return create_path(ov, rel, out, size);
+    case KLEE_OV_RENAME_DST_DIR:
+        return replace_path(ov, rel, found, &e,
+                            access == KLEE_OV_RENAME_DST_DIR, out, size);
 
     case KLEE_OV_LINK_SRC:
         if (!found)
             return absent_path(ov, rel, out, size);
+        /* The kernel refuses to link a directory */
         if (is_dir)
-            return -EPERM;
-        return upper_copy(ov, rel, &e, false, out, size);
+            return put(out, size, e.path);
+        return upper_copy_to_move(ov, rel, &e, out, size);
     }
     return -EINVAL;
 }
@@ -1048,6 +1183,20 @@ bool klee_overlay_is_whiteout(const KleeOverlayMount *ov, const char *remainder)
     return whited_out(ov, rel);
 }
 
+KleeOvHostLayer klee_overlay_host_layer(const KleeOverlayMount *ov,
+                                        const char *host_path)
+{
+    if (!ov || !host_path)
+        return KLEE_OV_HOST_NONE;
+    /* The upper directory first: it may lie inside a lower one */
+    if (ov->upper_dir && path_under(ov->upper_dir, host_path))
+        return KLEE_OV_HOST_UPPER;
+    for (int i = 0; i < ov->lower_count; i++)
+        if (path_under(ov->lower_dirs[i], host_path))
+            return KLEE_OV_HOST_LOWER;
+    return KLEE_OV_HOST_NONE;
+}
+
 void klee_overlay_destroy(KleeOverlayMount *ov)
 {
     if (!ov)
@@ -1062,6 +1211,7 @@ void klee_overlay_destroy(KleeOverlayMount *ov)
     if (ov->whiteouts)
         klee_ht_destroy(ov->whiteouts);
     free(ov->upper_dir);
+    free(ov->scratch_dir);
     /* merged_dir is managed by tmpfs subsystem */
     free(ov->merged_dir);
     free(ov);

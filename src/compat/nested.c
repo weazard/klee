@@ -231,6 +231,49 @@ static char *translate_nested_source(KleeProcess *proc, const char *guest_src)
 }
 
 /*
+ * A bind whose source is a directory inside an overlay of this sandbox.  A
+ * host path can only name one layer of it (and would let writes reach a
+ * lower layer), so the new mount refers to that part of the overlay.
+ */
+static void alias_overlay_source(KleeProcess *proc, KleeMountOp *op)
+{
+    KleeMountTable *mt = proc->sandbox->mount_table;
+    KleeResolveCtx ctx = {
+        .mount_table = mt,
+        .fd_table = proc->fd_table,
+        .vcwd = proc->vcwd,
+        .vroot = klee_mount_table_get_root(mt),
+        .flags = 0,
+    };
+    char resolved[PATH_MAX];
+    if (klee_path_resolve(&ctx, op->source, resolved, AT_FDCWD) < 0)
+        return;
+
+    KleeMount *m = klee_mount_table_resolve(mt, resolved);
+    if (!m || !m->overlay || !m->dest)
+        return;
+    size_t dest_len = strlen(m->dest);
+    if (strncmp(resolved, m->dest, dest_len) != 0)
+        return;
+
+    /* the source's path below the mount, after the mount's own prefix */
+    const char *below = resolved + dest_len;
+    while (*below == '/')
+        below++;
+    const char *base = m->ov_prefix ? m->ov_prefix : "";
+    size_t len = strlen(base) + strlen(below) + 2;
+    char *prefix = malloc(len);
+    if (!prefix)
+        return;
+    snprintf(prefix, len, "%s%s%s", base, *base && *below ? "/" : "", below);
+
+    op->alias_overlay = m->overlay;
+    op->alias_prefix = prefix;
+    KLEE_DEBUG("nested: source %s is in an overlay (%s)", op->source,
+               prefix[0] ? prefix : "its root");
+}
+
+/*
  * Apply nested mount operations to the parent's mount table.
  * For FD-based ops, open the tracee's FD via /proc/<pid>/fd/<N>
  * to get a local FD that klee_mount_table_populate can use.
@@ -257,6 +300,8 @@ static int apply_nested_mounts(KleeProcess *proc, KleeConfig *cfg, pid_t pid)
         case MOUNT_DEV_BIND:
         case MOUNT_DEV_BIND_TRY:
             needs_source_translate = true;
+            if (op->source)
+                alias_overlay_source(proc, op);
             break;
         case MOUNT_OVERLAY:
         case MOUNT_TMP_OVERLAY:

@@ -237,6 +237,10 @@ static int translate_path_arg_ex(KleeProcess *proc, KleeInterceptor *ic,
     if (rc < 0) {
         KLEE_DEBUG("path resolution failed for %s: %d", proc->saved_path, rc);
         proc->resolved_guest[0] = '\0';
+        /* A symlink loop in the sandbox is one for the kernel too.  The raw
+         * path must not go through: on the host it names something else. */
+        if (rc == -ELOOP)
+            return rc;
         return 0;
     }
 
@@ -360,6 +364,16 @@ int klee_enter_openat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     return check_readonly_open(proc, flags);
 }
 
+int klee_enter_creat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    /* creat(path, mode) is open(path, O_CREAT | O_WRONLY | O_TRUNC, mode) */
+    int flags = O_CREAT | O_WRONLY | O_TRUNC;
+    int rc = translate_path_arg_for(proc, ic, ev, 0, -1, false,
+                                    open_access(flags));
+    if (rc < 0) return rc;
+    return check_readonly_open(proc, flags);
+}
+
 int klee_enter_openat2(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
     /* openat2(dirfd, pathname, how, size) - how contains RESOLVE flags */
@@ -457,14 +471,25 @@ int klee_enter_lstat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     return translate_path_arg_nofollow(proc, ic, ev, 0, -1);
 }
 
+/* True when a path argument is "": with AT_EMPTY_PATH the call then works
+ * on the descriptor itself and there is nothing to translate. */
+static bool path_arg_empty(KleeInterceptor *ic, KleeEvent *ev, int idx)
+{
+    char first = 1;
+    return ev->args[idx] &&
+           klee_read_mem(ic, ev->pid, &first,
+                         (const void *)(uintptr_t)ev->args[idx], 1) == 0 &&
+           first == '\0';
+}
+
 int klee_enter_newfstatat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
     /* newfstatat(dirfd, pathname, statbuf, flags)
-     * AT_EMPTY_PATH  -> fstat semantics on dirfd, no path to translate
+     * AT_EMPTY_PATH and ""  -> fstat semantics on dirfd
      * AT_SYMLINK_NOFOLLOW -> lstat semantics
      * otherwise -> stat semantics */
     int flags = (int)ev->args[3];
-    if (flags & AT_EMPTY_PATH)
+    if ((flags & AT_EMPTY_PATH) && path_arg_empty(ic, ev, 1))
         return 0;
     if (flags & AT_SYMLINK_NOFOLLOW)
         return translate_path_arg_nofollow(proc, ic, ev, 1, 0);
@@ -473,6 +498,12 @@ int klee_enter_newfstatat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 
 int klee_enter_statx(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
+    /* statx(dirfd, pathname, flags, mask, statxbuf): flags as newfstatat */
+    int flags = (int)ev->args[2];
+    if ((flags & AT_EMPTY_PATH) && path_arg_empty(ic, ev, 1))
+        return 0;
+    if (flags & AT_SYMLINK_NOFOLLOW)
+        return translate_path_arg_nofollow(proc, ic, ev, 1, 0);
     return translate_path_arg(proc, ic, ev, 1, 0);
 }
 
@@ -1164,15 +1195,22 @@ static int enter_rename(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev,
                         int old_idx, int olddir_idx, int new_idx,
                         int newdir_idx, unsigned int flags)
 {
-    KleeOvAccess dst = (flags & RENAME_EXCHANGE) ? KLEE_OV_RENAME_SRC
-                     : (flags & RENAME_NOREPLACE) ? KLEE_OV_CREATE_EXCL
-                     : KLEE_OV_RENAME_DST;
     int rc = translate_path_arg_for(proc, ic, ev, old_idx, olddir_idx, true,
                                     KLEE_OV_RENAME_SRC);
     if (rc < 0) return rc;
     rc = check_readonly(proc, ev->syscall_nr);
     if (rc < 0) return rc;
     KleeOverlayMount *ov = overlay_of_path(proc);
+
+    /* An overlay prepares the destination for what is moved there.  With
+     * no source the kernel fails the call and nothing may be prepared. */
+    struct stat st;
+    KleeOvAccess dst = KLEE_OV_UNUSED;
+    if (proc->resolved_guest[0] && lstat(proc->translated_path, &st) == 0)
+        dst = (flags & RENAME_EXCHANGE) ? KLEE_OV_RENAME_SRC
+            : (flags & RENAME_NOREPLACE) ? KLEE_OV_CREATE_EXCL
+            : S_ISDIR(st.st_mode) ? KLEE_OV_RENAME_DST_DIR
+            : KLEE_OV_RENAME_DST;
 
     rc = translate_path_arg_for(proc, ic, ev, new_idx, newdir_idx, true, dst);
     if (rc < 0) return rc;
@@ -1237,33 +1275,106 @@ int klee_enter_unlinkat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     return check_readonly(proc, ev->syscall_nr);
 }
 
+/* /proc/<pid>/fd/<n>, also below task/<tid>: a magic link to an open file */
+static bool is_proc_fd_link(const char *path)
+{
+    if (strncmp(path, "/proc/", 6) != 0)
+        return false;
+    const char *p = path + 6;
+    for (int round = 0; round < 2; round++) {
+        if (*p < '0' || *p > '9')
+            return false;
+        while (*p >= '0' && *p <= '9')
+            p++;
+        if (strncmp(p, "/task/", 6) != 0)
+            break;
+        p += 6;
+    }
+    if (strncmp(p, "/fd/", 4) != 0)
+        return false;
+    p += 4;
+    if (*p < '0' || *p > '9')
+        return false;
+    while (*p >= '0' && *p <= '9')
+        p++;
+    return *p == '\0';
+}
+
+/* Linking the file behind a descriptor (proc_link names it) to a name in
+ * dst_ov.  Only a file of that overlay's upper layer may get a name there:
+ * a name for a file of a lower layer would be a way to write to it, and
+ * anything else is on another mount. */
+static int check_link_by_fd(KleeProcess *proc, const char *proc_link,
+                            KleeOverlayMount *dst_ov)
+{
+    char host[PATH_MAX];
+    KleeOverlayMount *src_ov = NULL;
+    KleeOvHostLayer layer = KLEE_OV_HOST_NONE;
+    ssize_t len = readlink(proc_link, host, sizeof(host) - 1);
+    if (len > 0) {
+        host[len] = '\0';
+        layer = klee_mount_table_host_layer(proc->sandbox->mount_table, host,
+                                            &src_ov);
+    }
+    if (layer == KLEE_OV_HOST_LOWER)
+        return -EXDEV;
+    if (layer == KLEE_OV_HOST_UPPER ? src_ov != dst_ov : dst_ov != NULL)
+        return -EXDEV;
+    return 0;
+}
+
 /* link, linkat.  An overlay copies the source up, so the new name never
  * shares an inode with a lower layer. */
 static int enter_link(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev,
                       int old_idx, int olddir_idx, int new_idx,
                       int newdir_idx, int flags)
 {
-    /* With AT_EMPTY_PATH and "" the source is olddirfd itself */
-    char first = 1;
-    bool by_fd = (flags & AT_EMPTY_PATH) && ev->args[old_idx] &&
-                 klee_read_mem(ic, ev->pid, &first,
-                               (const void *)(uintptr_t)ev->args[old_idx], 1) == 0 &&
-                 first == '\0';
+    char fd_link[64] = "";       /* the source is an open file */
+    KleeOverlayMount *src_ov = NULL;
+    bool src_gone = false, src_dir = false;
+    struct stat st;
 
-    KleeOverlayMount *ov = NULL;
-    if (!by_fd) {
+    if (olddir_idx >= 0 && (flags & AT_EMPTY_PATH) &&
+        path_arg_empty(ic, ev, old_idx)) {
+        /* With AT_EMPTY_PATH and "" the source is olddirfd itself */
+        snprintf(fd_link, sizeof(fd_link), "/proc/%d/fd/%d", (int)ev->pid,
+                 (int)ev->args[olddir_idx]);
+    } else {
         int rc = translate_path_arg_for(proc, ic, ev, old_idx, olddir_idx,
                                         !(flags & AT_SYMLINK_FOLLOW),
                                         KLEE_OV_LINK_SRC);
         if (rc < 0) return rc;
-        ov = overlay_of_path(proc);
+        src_ov = overlay_of_path(proc);
+        if ((flags & AT_SYMLINK_FOLLOW) && is_proc_fd_link(proc->resolved_guest))
+            snprintf(fd_link, sizeof(fd_link), "%.63s", proc->resolved_guest);
+        else if (proc->resolved_guest[0] &&
+                 lstat(proc->translated_path, &st) < 0)
+            src_gone = true;
+        else if (proc->resolved_guest[0])
+            src_dir = S_ISDIR(st.st_mode);
     }
 
+    /* Without a source the kernel fails the call: nothing is prepared */
     int rc = translate_path_arg_for(proc, ic, ev, new_idx, newdir_idx, true,
-                                    KLEE_OV_CREATE_EXCL);
+                                    src_gone ? KLEE_OV_UNUSED
+                                             : KLEE_OV_CREATE_EXCL);
     if (rc < 0) return rc;
-    if (!by_fd && overlay_of_path(proc) != ov)
-        return -EXDEV;
+    if (src_gone)
+        return 0;
+    /* An existing name is EEXIST, which the kernel reports before the rest */
+    if (proc->resolved_guest[0] && lstat(proc->translated_path, &st) == 0)
+        return 0;
+
+    KleeOverlayMount *dst_ov = overlay_of_path(proc);
+    if (fd_link[0] && proc->sandbox && proc->sandbox->mount_table)
+        rc = check_link_by_fd(proc, fd_link, dst_ov);
+    else
+        rc = src_ov != dst_ov ? -EXDEV : 0;
+    if (rc < 0) return rc;
+    /* The layers of an overlay may be different file systems, for which
+     * the kernel would answer EXDEV before it refuses a directory */
+    if (src_dir && dst_ov)
+        return -EPERM;
     return check_readonly(proc, ev->syscall_nr);
 }
 
@@ -1300,28 +1411,28 @@ int klee_enter_symlinkat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 
 int klee_enter_chmod(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    int rc = translate_path_arg_for(proc, ic, ev, 0, -1, false, KLEE_OV_WRITE);
+    int rc = translate_path_arg_for(proc, ic, ev, 0, -1, false, KLEE_OV_SETATTR);
     if (rc < 0) return rc;
     return check_readonly(proc, ev->syscall_nr);
 }
 
 int klee_enter_fchmodat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    int rc = translate_path_arg_for(proc, ic, ev, 1, 0, false, KLEE_OV_WRITE);
+    int rc = translate_path_arg_for(proc, ic, ev, 1, 0, false, KLEE_OV_SETATTR);
     if (rc < 0) return rc;
     return check_readonly(proc, ev->syscall_nr);
 }
 
 int klee_enter_chown(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    int rc = translate_path_arg_for(proc, ic, ev, 0, -1, false, KLEE_OV_WRITE);
+    int rc = translate_path_arg_for(proc, ic, ev, 0, -1, false, KLEE_OV_SETATTR);
     if (rc < 0) return rc;
     return check_readonly(proc, ev->syscall_nr);
 }
 
 int klee_enter_lchown(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    int rc = translate_path_arg_for(proc, ic, ev, 0, -1, true, KLEE_OV_WRITE);
+    int rc = translate_path_arg_for(proc, ic, ev, 0, -1, true, KLEE_OV_SETATTR);
     if (rc < 0) return rc;
     return check_readonly(proc, ev->syscall_nr);
 }
@@ -1331,7 +1442,7 @@ int klee_enter_fchownat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     /* fchownat(dirfd, path, uid, gid, flags) */
     bool nofollow = (ev->args[4] & AT_SYMLINK_NOFOLLOW) != 0;
     int rc = translate_path_arg_for(proc, ic, ev, 1, 0, nofollow,
-                                    KLEE_OV_WRITE);
+                                    KLEE_OV_SETATTR);
     if (rc < 0) return rc;
     return check_readonly(proc, ev->syscall_nr);
 }
@@ -2152,7 +2263,7 @@ static int enter_path_at(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev,
         return 0;
     }
     int rc = translate_path_arg_for(proc, ic, ev, path_idx, dirfd_idx, nofollow,
-                                    write ? KLEE_OV_WRITE : KLEE_OV_READ);
+                                    write ? KLEE_OV_SETATTR : KLEE_OV_READ);
     if (rc < 0) return rc;
     return write ? check_readonly(proc, ev->syscall_nr) : 0;
 }

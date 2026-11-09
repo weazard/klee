@@ -22,6 +22,7 @@ typedef struct klee_mount {
     int perms;
     struct klee_mount *stacked;  /* shadow stack for overlapping mounts */
     KleeOverlayMount *overlay;  /* overlay state (for overlay mounts) */
+    char *ov_prefix;            /* bind of a directory in an overlay: its path there */
 } KleeMount;
 
 typedef struct klee_mount_table {
@@ -69,6 +70,11 @@ int klee_mount_table_translate_access(const KleeMountTable *mt,
 /* The overlay a guest path is in, or NULL */
 KleeOverlayMount *klee_mount_table_overlay_at(const KleeMountTable *mt,
                                                const char *guest_path);
+
+/* Whether a host path lies in a layer of one of the overlays, and which */
+KleeOvHostLayer klee_mount_table_host_layer(const KleeMountTable *mt,
+                                            const char *host_path,
+                                            KleeOverlayMount **ov);
 
 /* Check if a guest path is on a read-only mount */
 bool klee_mount_table_is_readonly(const KleeMountTable *mt,

@@ -41,6 +41,7 @@ void klee_config_destroy(KleeConfig *cfg)
                 free(op->overlay_srcs[i]);
             free(op->overlay_srcs);
         }
+        free(op->alias_prefix);
         free(op);
         op = next;
     }

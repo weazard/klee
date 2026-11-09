@@ -45,6 +45,9 @@ typedef struct klee_mount_op {
     int fd;                 /* for --bind-data, --ro-bind-data, --file */
     char **overlay_srcs;    /* for --overlay */
     int overlay_src_count;
+    /* nested bind whose source lies inside an overlay of the sandbox */
+    struct klee_overlay_mount *alias_overlay;
+    char *alias_prefix;     /* the source's path within that overlay */
     struct klee_mount_op *next;
 } KleeMountOp;
 
