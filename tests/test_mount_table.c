@@ -3,6 +3,7 @@
  */
 #include "fs/mount_table.h"
 #include "fs/overlay.h"
+#include "fs/overlay_state.h"
 #include "fs/tmpfs.h"
 #include "config.h"
 #include "util/log.h"
@@ -12,6 +13,7 @@
 #include <assert.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <ftw.h>
 #include <stdbool.h>
 #include <sys/stat.h>
@@ -335,24 +337,20 @@ TEST(overlay_unlink)
     ov_setup(&fx, false);
     char host[PATH_MAX], lower[PATH_MAX];
 
-    assert(klee_overlay_resolve(fx.ov, "sub", host, sizeof(host), KLEE_OV_UNLINK) == -EISDIR);
-    assert(klee_overlay_resolve(fx.ov, "nope", host, sizeof(host), KLEE_OV_UNLINK) == -ENOENT);
+    assert(klee_overlay_remove(fx.ov, "sub", false) == -EISDIR);
+    assert(klee_overlay_remove(fx.ov, "nope", false) == -ENOENT);
 
-    /* Only in a lower layer: whited out, and the syscall removes an upper
-     * stand-in */
-    assert(klee_overlay_resolve(fx.ov, "a", host, sizeof(host), KLEE_OV_UNLINK) == 0);
-    assert(in_upper(&fx, host));
-    assert(unlink(host) == 0);
+    /* Only in a lower layer: the operation records a whiteout. */
+    assert(klee_overlay_remove(fx.ov, "a", false) == 0);
     snprintf(lower, sizeof(lower), "%s/a", fx.l1);
     assert(exists(lower));
     assert(klee_overlay_is_whiteout(fx.ov, "a"));
     assert(klee_overlay_resolve(fx.ov, "a", host, sizeof(host), KLEE_OV_READ) == 0);
     assert(!exists(host));
-    assert(klee_overlay_resolve(fx.ov, "a", host, sizeof(host), KLEE_OV_UNLINK) == -ENOENT);
+    assert(klee_overlay_remove(fx.ov, "a", false) == -ENOENT);
 
     /* In both lower layers: hidden in both */
-    assert(klee_overlay_resolve(fx.ov, "shared", host, sizeof(host), KLEE_OV_UNLINK) == 0);
-    assert(unlink(host) == 0);
+    assert(klee_overlay_remove(fx.ov, "shared", false) == 0);
     assert(klee_overlay_resolve(fx.ov, "", host, sizeof(host), KLEE_OV_LIST) == 0);
     assert(strcmp(listing(host), "b sub/") == 0);
 
@@ -370,14 +368,12 @@ TEST(overlay_rmdir)
     ov_setup(&fx, false);
     char host[PATH_MAX], lower[PATH_MAX];
 
-    assert(klee_overlay_resolve(fx.ov, "sub", host, sizeof(host), KLEE_OV_RMDIR) == -ENOTEMPTY);
-    assert(klee_overlay_resolve(fx.ov, "a", host, sizeof(host), KLEE_OV_RMDIR) == -ENOTDIR);
-    assert(klee_overlay_resolve(fx.ov, "", host, sizeof(host), KLEE_OV_RMDIR) == -EBUSY);
+    assert(klee_overlay_remove(fx.ov, "sub", true) == -ENOTEMPTY);
+    assert(klee_overlay_remove(fx.ov, "a", true) == -ENOTDIR);
+    assert(klee_overlay_remove(fx.ov, "", true) == -EBUSY);
 
-    assert(klee_overlay_resolve(fx.ov, "sub/inner", host, sizeof(host), KLEE_OV_UNLINK) == 0);
-    assert(unlink(host) == 0);
-    assert(klee_overlay_resolve(fx.ov, "sub", host, sizeof(host), KLEE_OV_RMDIR) == 0);
-    assert(rmdir(host) == 0);
+    assert(klee_overlay_remove(fx.ov, "sub/inner", false) == 0);
+    assert(klee_overlay_remove(fx.ov, "sub", true) == 0);
     assert(klee_overlay_resolve(fx.ov, "sub", host, sizeof(host), KLEE_OV_READ) == 0);
     assert(!exists(host));
     snprintf(lower, sizeof(lower), "%s/sub/inner", fx.l1);
@@ -400,14 +396,15 @@ TEST(overlay_rename)
     char src[PATH_MAX], dst[PATH_MAX], lower[PATH_MAX];
 
     /* A directory a lower layer has: EXDEV, as with overlayfs */
-    assert(klee_overlay_resolve(fx.ov, "sub", src, sizeof(src), KLEE_OV_RENAME_SRC) == -EXDEV);
-    assert(klee_overlay_resolve(fx.ov, "sub", dst, sizeof(dst), KLEE_OV_RENAME_DST) == -EXDEV);
+    assert(klee_overlay_rename(fx.ov, "sub", "moved", 0) == -EXDEV);
+    assert(klee_overlay_rename(fx.ov, "a", "sub", 0) == -EISDIR);
+    assert(klee_overlay_rename(fx.ov, "a", "b", RENAME_NOREPLACE) == -EEXIST);
+    snprintf(src, sizeof(src), "%s/a", fx.ov->upper_dir);
+    assert(!exists(src));
+    assert(!klee_overlay_is_whiteout(fx.ov, "a"));
 
     /* A file is copied up, and the kernel moves the copy */
-    assert(klee_overlay_resolve(fx.ov, "a", src, sizeof(src), KLEE_OV_RENAME_SRC) == 0);
-    assert(klee_overlay_resolve(fx.ov, "sub/moved", dst, sizeof(dst), KLEE_OV_RENAME_DST) == 0);
-    assert(in_upper(&fx, src) && in_upper(&fx, dst));
-    assert(rename(src, dst) == 0);
+    assert(klee_overlay_rename(fx.ov, "a", "sub/moved", 0) == 0);
     snprintf(lower, sizeof(lower), "%s/a", fx.l1);
     assert(exists(lower));
     assert(klee_overlay_resolve(fx.ov, "a", src, sizeof(src), KLEE_OV_READ) == 0);
@@ -421,13 +418,12 @@ TEST(overlay_link)
 {
     OvFixture fx;
     ov_setup(&fx, false);
-    char src[PATH_MAX], dst[PATH_MAX], lower[PATH_MAX];
+    char dst[PATH_MAX], lower[PATH_MAX];
 
-    assert(klee_overlay_resolve(fx.ov, "sub", src, sizeof(src), KLEE_OV_LINK_SRC) == -EPERM);
+    assert(klee_overlay_link(fx.ov, "sub", "b-link") == -EPERM);
     /* The new name links to an upper copy, never to the lower inode */
-    assert(klee_overlay_resolve(fx.ov, "b", src, sizeof(src), KLEE_OV_LINK_SRC) == 0);
-    assert(klee_overlay_resolve(fx.ov, "b-link", dst, sizeof(dst), KLEE_OV_CREATE_EXCL) == 0);
-    assert(link(src, dst) == 0);
+    assert(klee_overlay_link(fx.ov, "b", "b-link") == 0);
+    assert(klee_overlay_resolve(fx.ov, "b-link", dst, sizeof(dst), KLEE_OV_READ) == 0);
     write_file(dst, "through the link");
     snprintf(lower, sizeof(lower), "%s/b", fx.l2);
     assert(strcmp(read_file(lower), "b2") == 0);
@@ -446,13 +442,73 @@ TEST(overlay_readonly)
     /* Nothing is prepared or recorded: the read-only checks refuse these */
     assert(klee_overlay_resolve(fx.ov, "a", host, sizeof(host), KLEE_OV_WRITE) == 0);
     assert(strcmp(host, lower) == 0);
-    assert(klee_overlay_resolve(fx.ov, "a", host, sizeof(host), KLEE_OV_UNLINK) == 0);
-    assert(strcmp(host, lower) == 0);
+    assert(klee_overlay_remove(fx.ov, "a", false) == -EROFS);
     assert(!klee_overlay_is_whiteout(fx.ov, "a"));
 
     assert(klee_overlay_resolve(fx.ov, "", host, sizeof(host), KLEE_OV_LIST) == 0);
     assert(strcmp(listing(host), "a b shared sub/") == 0);
     ov_teardown(&fx);
+}
+
+TEST(overlay_persistent_recovery)
+{
+    OvFixture fx;
+    ov_setup(&fx, false);
+    char upper[] = "/tmp/klee-test-ov-upper-XXXXXX";
+    assert(mkdtemp(upper));
+    char *lowers[] = { fx.l1, fx.l2 };
+    klee_overlay_destroy(fx.ov);
+    fx.ov = klee_overlay_create("/test-ov", upper, lowers, 2, false);
+    assert(fx.ov);
+    assert(!klee_overlay_create("/competing-view", upper, lowers, 2, false));
+    assert(errno == EWOULDBLOCK);
+
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/shared", upper);
+    write_file(path, "existing upper file");
+    assert(klee_overlay_remove(fx.ov, "a", false) == 0);
+
+    /* Simulate a stop with a durable intent before and after kernel unlink. */
+    for (int removed = 0; removed <= 1; removed++) {
+        struct stat st;
+        assert(lstat(path, &st) == 0);
+        KleeOverlayChange change = {
+            .operation = KLEE_OVERLAY_REMOVE,
+            .flags = KLEE_OVERLAY_MASK_SOURCE,
+            .old_inode = klee_overlay_inode(&st),
+            .old_path = "shared",
+        };
+        assert(klee_overlay_state_begin(fx.ov->state, &change) == 0);
+        if (removed)
+            assert(unlink(path) == 0);
+        klee_overlay_destroy(fx.ov);
+
+        fx.ov = klee_overlay_create("/test-ov", upper, lowers, 2, false);
+        assert(fx.ov);
+        assert(klee_overlay_is_whiteout(fx.ov, "a"));
+        assert(klee_overlay_is_whiteout(fx.ov, "shared") == (removed != 0));
+        char resolved[PATH_MAX];
+        assert(klee_overlay_resolve(fx.ov, "shared", resolved,
+                                     sizeof(resolved), KLEE_OV_READ) == 0);
+        if (removed)
+            assert(!exists(resolved));
+        else
+            assert(strcmp(read_file(resolved), "existing upper file") == 0);
+    }
+    assert(klee_overlay_resolve(fx.ov, KLEE_OVERLAY_STATE_DIR, path, sizeof(path),
+                                 KLEE_OV_LOOKUP) == -ENOENT);
+
+    /* Names can contain newlines and must be recovered byte for byte. */
+    snprintf(path, sizeof(path), "%s/line\nfeed", fx.l1);
+    write_file(path, "lower");
+    assert(klee_overlay_remove(fx.ov, "line\nfeed", false) == 0);
+    klee_overlay_destroy(fx.ov);
+    fx.ov = klee_overlay_create("/test-ov", upper, lowers, 2, false);
+    assert(fx.ov);
+    assert(klee_overlay_is_whiteout(fx.ov, "line\nfeed"));
+    assert(strcmp(read_file(path), "lower") == 0);
+    ov_teardown(&fx);
+    rm_rf(upper);
 }
 
 /* Through the mount table: a remounted read-only overlay is not changed */
@@ -466,6 +522,7 @@ TEST(overlay_mount_table)
     KleeMount *m = klee_mount_table_resolve(mt, "/ov");
     assert(m != NULL);
     m->overlay = fx.ov;
+    klee_overlay_ref(fx.ov);
     assert(klee_mount_table_overlay_at(mt, "/ov/a") == fx.ov);
     assert(klee_mount_table_overlay_at(mt, "/elsewhere") == NULL);
 
@@ -478,7 +535,6 @@ TEST(overlay_mount_table)
     assert(klee_mount_table_translate_access(mt, "/ov/a", host, sizeof(host), KLEE_OV_WRITE) == 0);
     assert(in_upper(&fx, host));
 
-    m->overlay = NULL;
     klee_mount_table_destroy(mt);
     ov_teardown(&fx);
 }
@@ -518,6 +574,7 @@ int main(void)
     RUN(overlay_rename);
     RUN(overlay_link);
     RUN(overlay_readonly);
+    RUN(overlay_persistent_recovery);
     RUN(overlay_mount_table);
     RUN(gen_mountinfo);
     klee_tmpfs_cleanup();

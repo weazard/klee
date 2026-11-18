@@ -36,6 +36,7 @@ void klee_config_destroy(KleeConfig *cfg)
         KleeMountOp *next = op->next;
         free(op->source);
         free(op->dest);
+        free(op->overlay_prefix);
         if (op->overlay_srcs) {
             for (int i = 0; i < op->overlay_src_count; i++)
                 free(op->overlay_srcs[i]);

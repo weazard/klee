@@ -11,9 +11,10 @@
 #ifndef KLEE_OVERLAY_H
 #define KLEE_OVERLAY_H
 
-#include "util/hash_table.h"
 #include <stdbool.h>
 #include <stddef.h>
+
+struct klee_overlay_state;
 
 typedef struct klee_overlay_mount {
     char *merged_dir;       /* tmpfs-backed listing view of directories */
@@ -21,7 +22,8 @@ typedef struct klee_overlay_mount {
     char **lower_dirs;      /* array of lower layer paths, bottom to top */
     int lower_count;
     bool readonly;
-    KleeHashTable *whiteouts;  /* hashes of relative paths deleted in the sandbox */
+    struct klee_overlay_state *state;
+    unsigned int refs;
 } KleeOverlayMount;
 
 /* What the syscall being translated does with the path */
@@ -29,15 +31,11 @@ typedef enum {
     KLEE_OV_LOOKUP = 0,   /* path walk: the topmost entry, directories included */
     KLEE_OV_READ,         /* non-modifying call: directories show the merged view */
     KLEE_OV_LIST,         /* open: like READ, and a directory's listing is resynced */
-    KLEE_OV_WRITE,        /* changes contents or metadata: copy up first */
+    KLEE_OV_WRITE,        /* changes contents: copy up regular files */
     KLEE_OV_WRITE_CREATE, /* like WRITE, or creates the name when missing */
     KLEE_OV_CREATE,       /* creates the name when missing, else only opens it */
     KLEE_OV_CREATE_EXCL,  /* creates the name: EEXIST if it exists */
-    KLEE_OV_UNLINK,
-    KLEE_OV_RMDIR,
-    KLEE_OV_RENAME_SRC,   /* rename source, or either side of RENAME_EXCHANGE */
-    KLEE_OV_RENAME_DST,
-    KLEE_OV_LINK_SRC,
+    KLEE_OV_SETATTR,      /* changes metadata: copy up first */
 } KleeOvAccess;
 
 /* Create a userspace overlay.
@@ -60,13 +58,17 @@ int klee_overlay_resolve(KleeOverlayMount *ov, const char *remainder,
                           char *host_path_out, size_t out_size,
                           KleeOvAccess access);
 
-/* Record a whiteout (deletion) for a path in the overlay. */
-void klee_overlay_whiteout(KleeOverlayMount *ov, const char *remainder);
+/* Validate and perform the entire name operation in the supervisor. */
+int klee_overlay_remove(KleeOverlayMount *ov, const char *path, bool directory);
+int klee_overlay_rename(KleeOverlayMount *ov, const char *old_path,
+                        const char *new_path, unsigned int flags);
+int klee_overlay_link(KleeOverlayMount *ov, const char *old_path, const char *new_path);
 
 /* Check if a path has been whited out (deleted), itself or by an ancestor. */
 bool klee_overlay_is_whiteout(const KleeOverlayMount *ov, const char *remainder);
 
-/* Destroy an overlay mount and free resources. */
+/* Add or drop a reference to the shared backing layers. */
+void klee_overlay_ref(KleeOverlayMount *ov);
 void klee_overlay_destroy(KleeOverlayMount *ov);
 
 #endif /* KLEE_OVERLAY_H */

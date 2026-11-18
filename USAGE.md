@@ -103,8 +103,21 @@ specified.
 | `--remount-ro DEST`          | 1              | Remount an existing mount at DEST as read-only      |
 | `--chmod OCTAL DEST`         | 2              | Set permissions on an existing mount                 |
 | `--overlay-src PATH`         | 1              | Add an overlay source layer (stacks)                |
-| `--overlay RW WORK DEST`     | 3              | Mount overlayfs with read-write layer               |
-| `--tmp-overlay DEST`         | 1              | Mount overlayfs with tmpfs for writes               |
+| `--overlay RW WORK DEST`     | 3              | Mount a writable overlay with a persistent upper    |
+| `--tmp-overlay DEST`         | 1              | Mount a writable overlay with a temporary upper     |
+
+Klee keeps deletion records and interrupted name operations in the reserved
+`RW/.klee-overlay` directory. Keep that directory with the upper when backing
+up or reopening an overlay. Klee accepts `WORK` for Bubblewrap compatibility.
+One launcher owns a persistent upper at a time, and nested binds can share
+that launcher's overlay. Give each independent launcher a dedicated upper and
+leave it under Klee's control while mounted.
+
+The upper filesystem must support directory locking, atomic rename, and file
+and directory `fsync`. Klee reports a setup error if it cannot recover the
+recorded state. Name changes require matching host filesystem credentials
+between Klee and the workload, which Klee checks through `/proc`.
+Applications still need to sync their own file writes.
 
 ### Mount Modifiers
 
@@ -495,9 +508,9 @@ diff <(bwrap --bind / / -- /usr/bin/id) \
 - **Overlay mounts** (`--overlay`, `--tmp-overlay`, `--ro-overlay`) are
   emulated without overlayfs. Changes copy a file up to the upper layer
   and deletions are recorded as whiteouts, so lower layers are not
-  modified. Whiteouts are kept in memory only: with `--overlay`, a lower
-  file deleted in one run is back in the next. Renaming a directory that a
-  lower layer has fails with `EXDEV`, as on overlayfs without
+  modified. `--tmp-overlay` discards its changes when the session ends.
+  Renaming a directory that still merges a lower layer fails with `EXDEV`,
+  as on overlayfs without
   `redirect_dir`; `mv` copies it instead. `fchmod`, `fchown` and
   `fsetxattr` on a read-only descriptor of a lower-layer file still reach
   that file.
@@ -516,7 +529,8 @@ diff <(bwrap --bind / / -- /usr/bin/id) \
   rights the sandbox should have.
 - **io_uring** is blocked (`-ENOSYS`) because it bypasses both seccomp
   and ptrace interception.
-- **Nested bwrap/klee** invocations are detected but not fully layered.
+- **Nested bwrap/klee** invocations get their own mount view. Namespace
+  emulation for the nested command still uses the enclosing Klee process.
 - **Directory listings** do not synthesize mount points that have no
   directory in the underlying rootfs (`ls /` after `--bind rootfs /
   --ro-bind /usr /usr` does not show `usr` unless `rootfs/usr` exists).

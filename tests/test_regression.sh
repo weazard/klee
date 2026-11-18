@@ -31,6 +31,7 @@
 #  24. dup2(fd, fd) and dup2 of an untracked fd keep descriptor paths right
 #  25. Writable overlays never modify their lower layers
 #  26. creat and fstatat with AT_EMPTY_PATH translate nonempty guest paths
+#  27. Writable overlays recover persisted name changes and support nested binds
 set -e
 
 KLEE="${KLEE:-./klee}"
@@ -1049,6 +1050,17 @@ if command -v cc >/dev/null 2>&1; then
     rm -rf "$SP"
 else
     echo "  SKIP: C compiler unavailable (creat and fstatat test)"
+fi
+
+echo "--- Persistent overlay namespace and nested binds ---"
+if command -v python3 >/dev/null 2>&1; then
+    if out=$(python3 tests/test_overlay_persistence.py "$KLEE" 2>&1); then
+        pass "persistent overlay mutations and nested mounts"
+    else
+        fail "persistent overlay (got: $out)"
+    fi
+else
+    echo "  SKIP: python3 unavailable (persistent overlay test)"
 fi
 
 echo ""

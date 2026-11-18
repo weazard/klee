@@ -6,12 +6,15 @@
 #define KLEE_FD_TABLE_H
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <linux/limits.h>
 
 typedef struct klee_fd_entry {
     int fd;
     char virtual_path[PATH_MAX];
     bool cloexec;
+    uint64_t overlay_mount;
+    bool overlay_upper;
     struct klee_fd_entry *next;  /* hash chain */
 } KleeFdEntry;
 
@@ -41,6 +44,8 @@ int klee_fd_table_set(KleeFdTable *ft, int fd, const char *virtual_path,
 
 /* Get virtual path for FD. Returns NULL if not tracked (or ft is NULL). */
 const char *klee_fd_table_get(const KleeFdTable *ft, int fd);
+void klee_fd_table_set_overlay(KleeFdTable *ft, int fd, uint64_t mount, bool upper);
+void klee_fd_table_get_overlay(const KleeFdTable *ft, int fd, uint64_t *mount, bool *upper);
 
 /* Check if FD has cloexec (false if not tracked or ft is NULL) */
 bool klee_fd_table_is_cloexec(const KleeFdTable *ft, int fd);

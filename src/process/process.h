@@ -44,6 +44,7 @@ enum {
 
 typedef struct klee_sandbox {
     KleeMountTable *mount_table;
+    bool owns_mount_table;
     KleePidMap *pid_map;
     KleeIdState *root_id_state;
     KleeIpcNs *ipc_ns;
@@ -84,6 +85,7 @@ typedef struct klee_process {
 
     KleeIdState *id_state;
     KleeSandbox *sandbox;
+    KleeSandbox *exec_previous_sandbox;
 
     KleeArena *event_arena;   /* reset per syscall event */
     KleeArena *life_arena;    /* lives for process lifetime */
@@ -108,6 +110,7 @@ typedef struct klee_process {
     uint64_t demux_args[6];
     uint64_t demux_saved_ptr;   /* socketcall's original argument pointer */
     int deny_errno;             /* non-zero when syscall was denied on enter */
+    bool emulated_syscall;       /* inject a successful result at the exit stop */
     bool seccomp_entered;       /* waiting for extra enter-stop after SECCOMP event */
     bool suppress_initial_stop; /* suppress first SIGSTOP after fork (ptrace artifact) */
     bool skip_uid_virt;         /* skip UID/GID virtualization for this process
@@ -157,6 +160,7 @@ void klee_process_unshare(KleeProcess *proc, unsigned long flags);
 
 /* Handle exec: clear cloexec FDs, update vexe */
 void klee_process_exec(KleeProcess *proc, const char *new_exe);
+void klee_process_finish_mount_exec(KleeProcess *proc, bool success);
 
 /* Create/destroy sandbox */
 KleeSandbox *klee_sandbox_create(void);

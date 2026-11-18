@@ -20,6 +20,7 @@
  * placeholder.
  */
 #include "fs/overlay.h"
+#include "fs/overlay_state.h"
 #include "fs/tmpfs.h"
 #include "util/log.h"
 
@@ -30,6 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <linux/limits.h>
 
@@ -110,63 +112,31 @@ static const char *base_of(const char *rel)
 
 /* ==================== Whiteouts ==================== */
 
-/* FNV-1a hash of the first len bytes of a relative path */
-static uint64_t hash_path(const char *path, size_t len)
-{
-    uint64_t h = 14695981039346656037ULL;
-    for (size_t i = 0; i < len; i++) {
-        h ^= (unsigned char)path[i];
-        h *= 1099511628211ULL;
-    }
-    return h;
-}
-
 /* rel itself was deleted in the sandbox */
 static bool whiteout_exact(const KleeOverlayMount *ov, const char *rel)
 {
-    return ov->whiteouts && *rel &&
-           klee_ht_contains(ov->whiteouts, hash_path(rel, strlen(rel)));
+    return klee_overlay_state_has(ov->state, rel, strlen(rel));
 }
 
 /* rel or one of its ancestors was deleted: no lower layer shows it */
 static bool whited_out(const KleeOverlayMount *ov, const char *rel)
 {
-    if (!ov->whiteouts || !*rel)
+    if (!ov->state || !*rel)
         return false;
     for (size_t i = 1;; i++) {
         if (rel[i] != '/' && rel[i] != '\0')
             continue;
-        if (klee_ht_contains(ov->whiteouts, hash_path(rel, i)))
+        if (klee_overlay_state_has(ov->state, rel, i))
             return true;
         if (rel[i] == '\0')
             return false;
     }
 }
 
-static int add_whiteout(KleeOverlayMount *ov, const char *rel)
-{
-    uint64_t h = hash_path(rel, strlen(rel));
-    klee_ht_put(ov->whiteouts, h, (void *)1);
-    /* klee_ht_put returns NULL for a new key and on failure alike */
-    return klee_ht_contains(ov->whiteouts, h) ? 0 : -ENOMEM;
-}
-
 /* ==================== Layers ==================== */
 
-/* The topmost layer providing rel.  -ENOENT when no layer has it or it was
- * deleted, -ENOTDIR when a layer on top has a non-directory on its way. */
-static int lookup(const KleeOverlayMount *ov, const char *rel, OvEntry *e)
+static int lookup_lower(const KleeOverlayMount *ov, const char *rel, OvEntry *e)
 {
-    if (ov->upper_dir) {
-        if (join(e->path, sizeof(e->path), ov->upper_dir, rel) < 0)
-            return -ENAMETOOLONG;
-        if (lstat(e->path, &e->st) == 0) {
-            e->layer = UPPER_LAYER;
-            return 0;
-        }
-        if (errno == ENOTDIR)
-            return -ENOTDIR;
-    }
     if (whited_out(ov, rel))
         return -ENOENT;
     for (int i = ov->lower_count - 1; i >= 0; i--) {
@@ -176,34 +146,37 @@ static int lookup(const KleeOverlayMount *ov, const char *rel, OvEntry *e)
             e->layer = i;
             return 0;
         }
-        if (errno == ENOTDIR)
-            return -ENOTDIR;
+        if (errno != ENOENT)
+            return -errno;
     }
     return -ENOENT;
 }
 
-/* Some lower layer has rel, whatever the whiteouts say */
-static bool in_lower(const KleeOverlayMount *ov, const char *rel)
+/* Lookup is independent of copy-up and never creates upper entries. */
+static int lookup(const KleeOverlayMount *ov, const char *rel, OvEntry *e)
 {
-    char path[PATH_MAX];
-    struct stat st;
-    for (int i = 0; i < ov->lower_count; i++)
-        if (join(path, sizeof(path), ov->lower_dirs[i], rel) == 0 &&
-            lstat(path, &st) == 0)
-            return true;
-    return false;
+    if (ov->upper_dir) {
+        if (join(e->path, sizeof(e->path), ov->upper_dir, rel) < 0)
+            return -ENAMETOOLONG;
+        if (lstat(e->path, &e->st) == 0) {
+            e->layer = UPPER_LAYER;
+            return 0;
+        }
+        if (errno != ENOENT)
+            return -errno;
+    }
+    return lookup_lower(ov, rel, e);
 }
 
 /* The topmost lower directory at rel, for its mode and times */
 static bool lower_dir(const KleeOverlayMount *ov, const char *rel,
                       struct stat *st)
 {
-    char path[PATH_MAX];
-    for (int i = ov->lower_count - 1; i >= 0; i--)
-        if (join(path, sizeof(path), ov->lower_dirs[i], rel) == 0 &&
-            lstat(path, st) == 0 && S_ISDIR(st->st_mode))
-            return true;
-    return false;
+    OvEntry entry;
+    if (lookup_lower(ov, rel, &entry) < 0 || !S_ISDIR(entry.st.st_mode))
+        return false;
+    *st = entry.st;
+    return true;
 }
 
 /* Where a missing name would be.  Never a placeholder: the upper layer, or
@@ -254,179 +227,208 @@ static void finish_dir(const char *path, const struct stat *src)
 
 /* ==================== Upper layer ==================== */
 
-/* Create the upper copies of rel's ancestors (and of rel with include_self)
- * with the mode and times of the lower directory each one shadows.  A new
- * directory stays writable for klee until the next level is in it. */
-static int make_upper_dirs(const KleeOverlayMount *ov, const char *rel,
-                           bool include_self)
+static mode_t unlock_temp_parent(const KleeOverlayState *state, int fd)
 {
-    char prefix[PATH_MAX], prel[PATH_MAX], up[PATH_MAX], parent[PATH_MAX];
-    char pending[PATH_MAX] = "";
-    struct stat pending_st;
-    bool pending_src = false;
-    size_t len = strlen(rel);
-    int rc = 0;
+    struct stat st;
+    if (state->durable || fstat(fd, &st) < 0 || (st.st_mode & S_IRWXU) == S_IRWXU ||
+        fchmodat(fd, ".", (st.st_mode & 07777) | S_IRWXU, 0) < 0)
+        return NO_MODE;
+    return st.st_mode & 07777;
+}
 
-    for (size_t i = 1; i <= len && rc == 0; i++) {
+static void finish_upper_directory(int fd, const struct stat *source)
+{
+    fchmod(fd, source ? source->st_mode & 07777 : 0755);
+    if (source) {
+        struct timespec times[2] = { source->st_atim, source->st_mtim };
+        futimens(fd, times);
+    }
+    close(fd);
+}
+
+/* Copy upper parents without following symlinks. Finish each new directory's
+ * mode after putting the next level inside it. */
+static int make_upper_dirs(const KleeOverlayMount *ov, const char *rel, bool include_self)
+{
+    char prefix[PATH_MAX];
+    int pending_fd = -1;
+    struct stat pending_stat;
+    bool has_lower = false;
+    int rc = 0;
+    for (size_t i = 1; *rel && rc == 0; i++) {
         if (rel[i] != '/' && rel[i] != '\0')
             continue;
-        if (rel[i] == '\0' && !include_self)
+        if (!rel[i] && !include_self)
             break;
+
         memcpy(prefix, rel, i);
         prefix[i] = '\0';
-        parent_of(prefix, prel);
-        if (join(up, sizeof(up), ov->upper_dir, prefix) < 0 ||
-            join(parent, sizeof(parent), ov->upper_dir, prel) < 0) {
-            rc = -ENAMETOOLONG;
+        const char *name;
+        int parent_fd = klee_overlay_open_parent(ov->state->upper_fd, prefix, &name);
+        if (parent_fd < 0) {
+            rc = parent_fd;
             break;
         }
-
         struct stat st;
-        if (lstat(up, &st) == 0) {
-            if (!S_ISDIR(st.st_mode))
-                rc = -ENOTDIR;
-            continue;
-        }
-
-        mode_t locked = unlock_dir(parent);
-        if (mkdir(up, S_IRWXU) < 0 && errno != EEXIST)
+        if (fstatat(parent_fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0) {
+            rc = S_ISDIR(st.st_mode) ? 0 : -ENOTDIR;
+        } else if (errno != ENOENT) {
             rc = -errno;
-        relock_dir(parent, locked);
-
-        if (pending[0])
-            finish_dir(pending, pending_src ? &pending_st : NULL);
-        pending[0] = '\0';
-        if (rc == 0) {
-            memcpy(pending, up, sizeof(up));
-            pending_src = lower_dir(ov, prefix, &pending_st);
+        } else {
+            mode_t mode = unlock_temp_parent(ov->state, parent_fd);
+            bool created = mkdirat(parent_fd, name, S_IRWXU) == 0;
+            if (!created)
+                rc = -errno;
+            if (mode != NO_MODE && fchmodat(parent_fd, ".", mode, 0) < 0 && rc == 0)
+                rc = -errno;
+            if (created) {
+                if (pending_fd >= 0)
+                    finish_upper_directory(pending_fd, has_lower ? &pending_stat : NULL);
+                pending_fd = openat(parent_fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+                if (pending_fd < 0)
+                    rc = -errno;
+                else
+                    has_lower = lower_dir(ov, prefix, &pending_stat);
+            }
         }
+        close(parent_fd);
+        if (!rel[i])
+            break;
     }
-    if (pending[0])
-        finish_dir(pending, pending_src ? &pending_st : NULL);
+    if (pending_fd >= 0)
+        finish_upper_directory(pending_fd, has_lower ? &pending_stat : NULL);
     return rc;
 }
 
-/* Copy a regular file under a temporary name and rename it into place, so
- * that an interrupted copy never shadows the lower file. */
-static int copy_file(const char *src, const char *dst, const struct stat *st)
+/* Copy a file into the private staging directory. A partial copy is never
+ * addressable through the overlay and is discarded after an interruption. */
+static int copy_file(const OvEntry *entry, int dirfd, const char *name, bool durable)
 {
-    static unsigned serial;
-    char tmp[PATH_MAX];
-    const char *slash = strrchr(dst, '/');
-    int n = snprintf(tmp, sizeof(tmp), "%.*s/.klee-copyup.%d.%u",
-                     (int)(slash ? slash - dst : 0), dst, (int)getpid(),
-                     serial++);
-    if (n < 0 || (size_t)n >= sizeof(tmp))
-        return -ENAMETOOLONG;
-
-    int in = open(src, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    int in = open(entry->path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (in < 0)
         return -errno;
-    int out = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-    if (out < 0) {
-        int err = errno;
+    struct stat current;
+    if (fstat(in, &current) < 0) {
+        int rc = -errno;
         close(in);
-        return -err;
+        return rc;
+    }
+    if (current.st_dev != entry->st.st_dev || current.st_ino != entry->st.st_ino ||
+        !S_ISREG(current.st_mode)) {
+        close(in);
+        return -ESTALE;
     }
 
+    int out = openat(dirfd, name, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (out < 0) {
+        int rc = -errno;
+        close(in);
+        return rc;
+    }
     int rc = 0;
     char buf[65536];
-    ssize_t got = 0;
-    while (rc == 0 && (got = read(in, buf, sizeof(buf))) > 0) {
-        for (ssize_t done = 0; done < got;) {
-            ssize_t w = write(out, buf + done, (size_t)(got - done));
-            if (w < 0) {
+    while (rc == 0) {
+        ssize_t got = read(in, buf, sizeof(buf));
+        if (got < 0 && errno == EINTR)
+            continue;
+        if (got <= 0) {
+            if (got < 0)
                 rc = -errno;
+            break;
+        }
+        for (ssize_t offset = 0; offset < got;) {
+            ssize_t written = write(out, buf + offset, (size_t)(got - offset));
+            if (written < 0 && errno == EINTR)
+                continue;
+            if (written <= 0) {
+                rc = written < 0 ? -errno : -EIO;
                 break;
             }
-            done += w;
+            offset += written;
         }
     }
-    if (rc == 0 && got < 0)
-        rc = -errno;
     if (rc == 0) {
-        if (fchown(out, st->st_uid, st->st_gid) < 0) {
-            /* only root can keep another owner */
-        }
-        if (fchmod(out, st->st_mode & 07777) < 0)
+        mode_t mode = current.st_mode & 07777;
+        if (fchown(out, current.st_uid, current.st_gid) < 0)
+            mode &= ~(S_ISUID | S_ISGID);
+        struct timespec times[2] = { current.st_atim, current.st_mtim };
+        if (fchmod(out, mode) < 0 || futimens(out, times) < 0 ||
+            (durable && fsync(out) < 0))
             rc = -errno;
     }
     if (close(out) < 0 && rc == 0)
         rc = -errno;
     close(in);
-    if (rc == 0 && rename(tmp, dst) < 0)
-        rc = -errno;
-    if (rc < 0)
-        unlink(tmp);
     return rc;
 }
 
-/* Copy the lower entry e of rel into the upper layer.  -ENOTSUP for a
- * device or socket, which cannot be recreated. */
-static int copy_up(const KleeOverlayMount *ov, const char *rel,
-                   const OvEntry *e)
+static int stage_copy(KleeOverlayState *state, const OvEntry *entry, const char *name)
 {
-    char up[PATH_MAX], prel[PATH_MAX], updir[PATH_MAX];
-    int rc = make_upper_dirs(ov, rel, false);
-    if (rc < 0)
-        return rc;
-    parent_of(rel, prel);
-    if (join(up, sizeof(up), ov->upper_dir, rel) < 0 ||
-        join(updir, sizeof(updir), ov->upper_dir, prel) < 0)
-        return -ENAMETOOLONG;
-
-    mode_t mode = e->st.st_mode & 07777;
-    mode_t locked = unlock_dir(updir);
-    if (S_ISREG(e->st.st_mode)) {
-        rc = copy_file(e->path, up, &e->st);
-    } else if (S_ISDIR(e->st.st_mode)) {
-        rc = mkdir(up, S_IRWXU) < 0 ? -errno : 0;
-    } else if (S_ISLNK(e->st.st_mode)) {
+    mode_t mode = entry->st.st_mode;
+    int dirfd = state->directory_fd;
+    if (S_ISREG(mode))
+        return copy_file(entry, dirfd, name, state->durable);
+    if (S_ISLNK(mode)) {
         char target[PATH_MAX];
-        ssize_t len = readlink(e->path, target, sizeof(target) - 1);
-        if (len < 0) {
-            rc = -errno;
-        } else {
-            target[len] = '\0';
-            rc = symlink(target, up) < 0 ? -errno : 0;
-        }
-    } else if (S_ISFIFO(e->st.st_mode)) {
-        rc = mkfifo(up, S_IRUSR | S_IWUSR) < 0 ? -errno : 0;
+        ssize_t length = readlink(entry->path, target, sizeof(target));
+        if (length < 0)
+            return -errno;
+        if ((size_t)length >= sizeof(target))
+            return -ENAMETOOLONG;
+        target[length] = '\0';
+        if (symlinkat(target, dirfd, name) < 0)
+            return -errno;
+    } else if (S_ISFIFO(mode)) {
+        if (mkfifoat(dirfd, name, 0600) < 0 ||
+            fchmodat(dirfd, name, mode & 0777, 0) < 0)
+            return -errno;
     } else {
-        rc = -ENOTSUP;
+        return -ENOTSUP;
     }
-    relock_dir(updir, locked);
-    if (rc == -EEXIST)
-        rc = 0;   /* made meanwhile; the upper entry wins either way */
-    if (rc < 0)
-        return rc;
-
-    if (!S_ISREG(e->st.st_mode)) {
-        if (lchown(up, e->st.st_uid, e->st.st_gid) < 0) {
-            /* only root can keep another owner */
-        }
-        if (!S_ISLNK(e->st.st_mode))
-            chmod(up, mode);
-    }
-    set_times(up, &e->st);
-    KLEE_DEBUG("overlay: copied up %s", e->path);
+    struct timespec times[2] = { entry->st.st_atim, entry->st.st_mtim };
+    if (utimensat(dirfd, name, times, AT_SYMLINK_NOFOLLOW) < 0)
+        return -errno;
     return 0;
 }
 
-/* The upper entry of an existing name, copied up first if needed.  A device
- * or socket keeps its lower path when in_place: writing to it does not
- * change the layer. */
-static int upper_copy(const KleeOverlayMount *ov, const char *rel,
-                      const OvEntry *e, bool in_place, char *out, size_t size)
+static int install_stage(KleeOverlayState *state, const char *stage, const char *path,
+                         bool copy_up)
 {
-    if (e->layer == UPPER_LAYER)
-        return put(out, size, e->path);
-    int rc = copy_up(ov, rel, e);
-    if (rc == -ENOTSUP)
-        return in_place ? put(out, size, e->path) : -EXDEV;
+    const char *name;
+    int parent = klee_overlay_open_parent(state->upper_fd, path, &name);
+    if (parent < 0)
+        return parent;
+    mode_t mode = copy_up ? unlock_temp_parent(state, parent) : NO_MODE;
+    int rc = renameat(state->directory_fd, stage, parent, name) == 0 ? 0 : -errno;
+    if (mode != NO_MODE && fchmodat(parent, ".", mode, 0) < 0 && rc == 0)
+        rc = -errno;
+    close(parent);
+    return rc;
+}
+
+static int copy_up(const KleeOverlayMount *ov, const char *rel, const OvEntry *entry)
+{
+    if (S_ISDIR(entry->st.st_mode))
+        return make_upper_dirs(ov, rel, true);
+    int rc = make_upper_dirs(ov, rel, false);
     if (rc < 0)
         return rc;
-    return join(out, size, ov->upper_dir, rel);
+    KleeOverlayState *state = ov->state;
+    rc = stage_copy(state, entry, KLEE_OVERLAY_STAGE_SOURCE);
+    if (rc == 0)
+        rc = install_stage(state, KLEE_OVERLAY_STAGE_SOURCE, rel, true);
+    if (rc < 0)
+        klee_overlay_state_clear_stage(state);
+    return rc;
+}
+
+static int upper_copy(const KleeOverlayMount *ov, const char *rel,
+                      const OvEntry *entry, char *out, size_t size)
+{
+    if (entry->layer == UPPER_LAYER)
+        return put(out, size, entry->path);
+    int rc = copy_up(ov, rel, entry);
+    return rc < 0 ? rc : join(out, size, ov->upper_dir, rel);
 }
 
 /* Upper path for a new name, with the parents the call needs to create it */
@@ -518,13 +520,21 @@ static int scan_layer(const KleeOverlayMount *ov, const char *dir,
 {
     DIR *d = opendir(dir);
     if (!d)
-        return 0;
+        return -errno;
 
     int rc = 0;
     struct dirent *de;
     char child[PATH_MAX];
-    while (rc == 0 && (de = readdir(d)) != NULL) {
+    while (rc == 0) {
+        errno = 0;
+        de = readdir(d);
+        if (!de) {
+            rc = -errno;
+            break;
+        }
         if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        if (ov->state && !*rel && strcmp(de->d_name, KLEE_OVERLAY_STATE_DIR) == 0)
             continue;
         if (lower && (child_of(child, sizeof(child), rel, de->d_name) < 0 ||
                       whiteout_exact(ov, child)))
@@ -553,6 +563,8 @@ static int collect(const KleeOverlayMount *ov, const char *rel, OvNames *l)
                 lowers = false;   /* a non-directory hides the layers below */
         } else if (errno == ENOTDIR) {
             lowers = false;
+        } else if (errno != ENOENT) {
+            return -errno;
         }
     }
 
@@ -562,6 +574,8 @@ static int collect(const KleeOverlayMount *ov, const char *rel, OvNames *l)
         if (lstat(path, &st) < 0) {
             if (errno == ENOTDIR)
                 break;
+            if (errno != ENOENT)
+                return -errno;
             continue;
         }
         if (!S_ISDIR(st.st_mode))
@@ -789,92 +803,336 @@ static void merged_forget(const KleeOverlayMount *ov, const char *rel)
     close(dfd);
 }
 
-/* ==================== Deletions ==================== */
+/* ==================== Namespace mutations ==================== */
 
-/* For a name only lower layers have: an upper entry of the same kind for
- * the syscall to remove, so that it succeeds without touching them. */
-static int make_victim(const KleeOverlayMount *ov, const char *rel, bool dir)
+static int writable_path(KleeOverlayMount *ov, const char *path, char *relative)
 {
-    char up[PATH_MAX], prel[PATH_MAX], updir[PATH_MAX];
-    int rc = make_upper_dirs(ov, rel, false);
+    if (!ov->state || ov->readonly)
+        return -EROFS;
+    if (ov->state->faulted)
+        return -EIO;
+    int rc = normalize(path, relative, PATH_MAX);
     if (rc < 0)
         return rc;
-    parent_of(rel, prel);
-    if (join(up, sizeof(up), ov->upper_dir, rel) < 0 ||
-        join(updir, sizeof(updir), ov->upper_dir, prel) < 0)
-        return -ENAMETOOLONG;
-    /* Fail as the deletion would, before anything is recorded */
-    if (access(updir, W_OK | X_OK) < 0)
-        return -errno;
+    return klee_overlay_state_path(relative) ? -ENOENT : 0;
+}
 
-    if (dir) {
-        rc = mkdir(up, S_IRWXU) < 0 ? -errno : 0;
-    } else {
-        int fd = open(up, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, S_IRUSR | S_IWUSR);
-        rc = fd < 0 ? -errno : 0;
-        if (fd >= 0)
-            close(fd);
-    }
+static bool has_trailing_slash(const char *path)
+{
+    size_t length = strlen(path);
+    return length && path[length - 1] == '/';
+}
+
+static int empty_directory(const KleeOverlayMount *ov, const char *relative)
+{
+    OvNames names = { 0 };
+    int rc = collect(ov, relative, &names);
+    if (rc == 0 && names.n)
+        rc = -ENOTEMPTY;
+    names_free(&names);
     return rc;
 }
 
-/* unlink/rmdir: the upper path for the syscall to remove.  A name a lower
- * layer has is whited out first; the whiteout is harmless while an upper
- * entry still exists, as that one is found first. */
-static int delete_path(KleeOverlayMount *ov, const char *rel,
-                       const OvEntry *e, bool dir, char *out, size_t size)
+static int check_parent(const KleeOverlayMount *ov, const char *relative,
+                        const OvEntry *entry)
 {
-    bool is_dir = S_ISDIR(e->st.st_mode);
-    if (!dir && is_dir)
-        return -EISDIR;
-    if (dir && !is_dir)
-        return -ENOTDIR;
-    if (dir && !*rel)
-        return -EBUSY;
-    if (dir) {
-        OvNames l = { 0 };
-        int rc = collect(ov, rel, &l);
-        size_t n = l.n;
-        names_free(&l);
-        if (rc < 0)
-            return rc;
-        if (n)
-            return -ENOTEMPTY;
-    }
-
-    if (e->layer != UPPER_LAYER) {
-        int rc = make_victim(ov, rel, dir);
-        if (rc < 0)
-            return rc;
-    }
-    if (in_lower(ov, rel)) {
-        int rc = add_whiteout(ov, rel);
-        if (rc < 0)
-            return rc;
-    }
-    merged_forget(ov, rel);
-    KLEE_DEBUG("overlay: delete %s", rel);
-    return join(out, size, ov->upper_dir, rel);
-}
-
-/* Source of a rename: copied up and whited out in the lower layers, so the
- * kernel moves the upper entry.  A directory a lower layer has is EXDEV, as
- * with overlayfs without redirect_dir: callers then copy it instead. */
-static int move_path(KleeOverlayMount *ov, const char *rel, const OvEntry *e,
-                     char *out, size_t size)
-{
-    if (!*rel)
-        return -EBUSY;
-    bool lower = in_lower(ov, rel);
-    if (S_ISDIR(e->st.st_mode) && lower)
-        return -EXDEV;
-    int rc = upper_copy(ov, rel, e, false, out, size);
+    char parent_path[PATH_MAX];
+    parent_of(relative, parent_path);
+    OvEntry parent;
+    int rc = lookup(ov, parent_path, &parent);
     if (rc < 0)
         return rc;
-    if (lower && (rc = add_whiteout(ov, rel)) < 0)
-        return rc;
-    merged_forget(ov, rel);
+    if (!S_ISDIR(parent.st.st_mode))
+        return -ENOTDIR;
+    if (faccessat(AT_FDCWD, parent.path, W_OK | X_OK, AT_EACCESS) < 0)
+        return -errno;
+    uid_t uid = geteuid();
+    if (entry && uid && (parent.st.st_mode & S_ISVTX) &&
+        uid != parent.st.st_uid && uid != entry->st.st_uid)
+        return -EPERM;
     return 0;
+}
+
+static int apply_mask(const KleeOverlayMount *ov, const char *relative,
+                      unsigned int mask, bool reject_merged_dir, KleeOverlayChange *change)
+{
+    OvEntry lower;
+    int rc = lookup_lower(ov, relative, &lower);
+    if (rc == -ENOENT || rc == -ENOTDIR)
+        return 0;
+    if (rc < 0)
+        return rc;
+    if (reject_merged_dir && S_ISDIR(lower.st.st_mode))
+        return -EXDEV;
+    change->flags |= mask;
+    return 0;
+}
+
+static int begin_change(KleeOverlayMount *ov, const KleeOverlayChange *change)
+{
+    int rc = klee_overlay_state_begin(ov->state, change);
+    if (rc < 0 && !ov->state->faulted)
+        klee_overlay_state_clear_stage(ov->state);
+    return rc;
+}
+
+static int finish_change(KleeOverlayMount *ov, const KleeOverlayChange *change, int result)
+{
+    int rc = klee_overlay_state_finish(ov->state, change, result == 0);
+    if (rc < 0)
+        return rc;
+    if (result == 0) {
+        merged_forget(ov, change->old_path);
+        if (*change->new_path)
+            merged_forget(ov, change->new_path);
+    }
+    return result;
+}
+
+int klee_overlay_remove(KleeOverlayMount *ov, const char *path, bool directory)
+{
+    KleeOverlayChange change = { 0 };
+    int rc = writable_path(ov, path, change.old_path);
+    if (rc < 0)
+        return rc;
+    if (!*change.old_path)
+        return directory ? -EBUSY : -EISDIR;
+
+    OvEntry entry;
+    rc = lookup(ov, change.old_path, &entry);
+    if (rc < 0)
+        return rc;
+    bool is_dir = S_ISDIR(entry.st.st_mode);
+    if ((directory || has_trailing_slash(path)) && !is_dir)
+        return -ENOTDIR;
+    if (!directory && is_dir)
+        return -EISDIR;
+    if (directory && (rc = empty_directory(ov, change.old_path)) < 0)
+        return rc;
+    rc = check_parent(ov, change.old_path, &entry);
+    if (rc < 0)
+        return rc;
+    rc = apply_mask(ov, change.old_path, KLEE_OVERLAY_MASK_SOURCE, false, &change);
+    if (rc < 0)
+        return rc;
+
+    change.operation = entry.layer == UPPER_LAYER ? KLEE_OVERLAY_REMOVE : KLEE_OVERLAY_MASK;
+    change.old_inode = klee_overlay_inode(&entry.st);
+    rc = begin_change(ov, &change);
+    if (rc < 0)
+        return rc;
+    if (change.operation == KLEE_OVERLAY_REMOVE) {
+        const char *name;
+        int parent = klee_overlay_open_parent(ov->state->upper_fd, change.old_path, &name);
+        if (parent < 0)
+            rc = parent;
+        else {
+            if (unlinkat(parent, name, directory ? AT_REMOVEDIR : 0) < 0)
+                rc = -errno;
+            close(parent);
+        }
+    }
+    return finish_change(ov, &change, rc);
+}
+
+static bool below_path(const char *directory, const char *child)
+{
+    size_t size = strlen(directory);
+    return strncmp(directory, child, size) == 0 && child[size] == '/';
+}
+
+static int prepare_inode(KleeOverlayState *state, const OvEntry *entry,
+                         const char *stage_name, KleeOverlayInode *inode)
+{
+    struct stat st = entry->st;
+    if (entry->layer != UPPER_LAYER) {
+        int rc = stage_copy(state, entry, stage_name);
+        if (rc < 0)
+            return rc == -ENOTSUP ? -EXDEV : rc;
+        if (fstatat(state->directory_fd, stage_name, &st, AT_SYMLINK_NOFOLLOW) < 0)
+            return -errno;
+    }
+    *inode = klee_overlay_inode(&st);
+    return 0;
+}
+
+static int change_name(KleeOverlayState *state, const KleeOverlayChange *change,
+                       unsigned int rename_flags)
+{
+    bool private_source = change->operation == KLEE_OVERLAY_RENAME &&
+                          (change->flags & KLEE_OVERLAY_STAGE_OLD);
+    const char *old_name = KLEE_OVERLAY_STAGE_SOURCE;
+    const char *new_name;
+    int from = private_source ? state->directory_fd :
+               klee_overlay_open_parent(state->upper_fd, change->old_path, &old_name);
+    if (from < 0)
+        return from;
+    int to = klee_overlay_open_parent(state->upper_fd, change->new_path, &new_name);
+    int rc = to;
+    if (to >= 0) {
+        int result;
+        if (change->operation == KLEE_OVERLAY_LINK)
+            result = linkat(from, old_name, to, new_name, 0);
+        else if (rename_flags)
+            result = syscall(SYS_renameat2, from, old_name, to, new_name, rename_flags);
+        else
+            result = renameat(from, old_name, to, new_name);
+        rc = result == 0 ? 0 : -errno;
+        close(to);
+    }
+    if (!private_source)
+        close(from);
+    return rc;
+}
+
+int klee_overlay_rename(KleeOverlayMount *ov, const char *old_path,
+                        const char *new_path, unsigned int flags)
+{
+    if (flags && flags != RENAME_NOREPLACE && flags != RENAME_EXCHANGE)
+        return -EINVAL;
+    bool exchange = flags == RENAME_EXCHANGE;
+    KleeOverlayChange change = {
+        .operation = exchange ? KLEE_OVERLAY_EXCHANGE : KLEE_OVERLAY_RENAME,
+    };
+    int rc = writable_path(ov, old_path, change.old_path);
+    if (rc == 0)
+        rc = writable_path(ov, new_path, change.new_path);
+    if (rc < 0)
+        return rc;
+    if (!*change.old_path || !*change.new_path)
+        return -EBUSY;
+
+    OvEntry old_entry, new_entry;
+    rc = lookup(ov, change.old_path, &old_entry);
+    if (rc < 0)
+        return rc;
+    rc = lookup(ov, change.new_path, &new_entry);
+    if (rc < 0 && (rc != -ENOENT || exchange))
+        return rc;
+    bool target_exists = rc == 0;
+    bool old_dir = S_ISDIR(old_entry.st.st_mode);
+    bool new_dir = target_exists && S_ISDIR(new_entry.st.st_mode);
+    if ((has_trailing_slash(old_path) && !old_dir) ||
+        (has_trailing_slash(new_path) && !(target_exists ? new_dir : old_dir)))
+        return -ENOTDIR;
+    if (flags == RENAME_NOREPLACE && target_exists)
+        return -EEXIST;
+    if (target_exists && old_entry.st.st_dev == new_entry.st.st_dev &&
+        old_entry.st.st_ino == new_entry.st.st_ino)
+        return 0;
+    if ((old_dir && below_path(change.old_path, change.new_path)) ||
+        (new_dir && below_path(change.new_path, change.old_path)))
+        return -EINVAL;
+
+    if (!exchange && target_exists) {
+        if (old_dir != new_dir)
+            return new_dir ? -EISDIR : -ENOTDIR;
+        if (new_dir && (rc = empty_directory(ov, change.new_path)) < 0)
+            return rc;
+    }
+    rc = check_parent(ov, change.old_path, &old_entry);
+    if (rc == 0)
+        rc = check_parent(ov, change.new_path, target_exists ? &new_entry : NULL);
+    if (rc == 0)
+        rc = apply_mask(ov, change.old_path, KLEE_OVERLAY_MASK_SOURCE, old_dir, &change);
+    if (rc == 0)
+        rc = apply_mask(ov, change.new_path, KLEE_OVERLAY_MASK_TARGET, exchange && new_dir, &change);
+    if (rc < 0)
+        return rc;
+
+    /* A moved opaque directory must still hide the destination's lowers. */
+    if (old_dir && whited_out(ov, change.old_path))
+        change.flags |= KLEE_OVERLAY_MASK_TARGET;
+    if (exchange && new_dir && whited_out(ov, change.new_path))
+        change.flags |= KLEE_OVERLAY_MASK_SOURCE;
+
+    if (old_entry.layer != UPPER_LAYER)
+        change.flags |= KLEE_OVERLAY_STAGE_OLD;
+    if (exchange && new_entry.layer != UPPER_LAYER)
+        change.flags |= KLEE_OVERLAY_STAGE_NEW;
+
+    rc = make_upper_dirs(ov, change.new_path, false);
+    if (rc == 0 && (change.flags & KLEE_OVERLAY_STAGE_OLD) && exchange)
+        rc = make_upper_dirs(ov, change.old_path, false);
+    if (rc < 0)
+        return rc;
+
+    KleeOverlayState *state = ov->state;
+    rc = prepare_inode(state, &old_entry, KLEE_OVERLAY_STAGE_SOURCE, &change.old_inode);
+    if (rc == 0 && exchange)
+        rc = prepare_inode(state, &new_entry, KLEE_OVERLAY_STAGE_TARGET, &change.new_inode);
+    else if (target_exists && new_entry.layer == UPPER_LAYER)
+        change.new_inode = klee_overlay_inode(&new_entry.st);
+    if (rc < 0) {
+        klee_overlay_state_clear_stage(state);
+        return rc;
+    }
+    rc = begin_change(ov, &change);
+    if (rc < 0)
+        return rc;
+
+    if (exchange) {
+        if (change.flags & KLEE_OVERLAY_STAGE_OLD)
+            rc = install_stage(state, KLEE_OVERLAY_STAGE_SOURCE, change.old_path, false);
+        if (rc == 0 && (change.flags & KLEE_OVERLAY_STAGE_NEW))
+            rc = install_stage(state, KLEE_OVERLAY_STAGE_TARGET, change.new_path, false);
+        if (rc == 0)
+            rc = klee_overlay_state_sync(state, &change);
+    }
+    if (rc == 0)
+        rc = change_name(state, &change, flags);
+    return finish_change(ov, &change, rc);
+}
+
+int klee_overlay_link(KleeOverlayMount *ov, const char *old_path, const char *new_path)
+{
+    KleeOverlayChange change = { .operation = KLEE_OVERLAY_LINK };
+    int rc = writable_path(ov, old_path, change.old_path);
+    if (rc == 0)
+        rc = writable_path(ov, new_path, change.new_path);
+    if (rc < 0)
+        return rc;
+
+    OvEntry entry, target;
+    rc = lookup(ov, change.old_path, &entry);
+    if (rc < 0)
+        return rc;
+    if (S_ISDIR(entry.st.st_mode))
+        return -EPERM;
+    if (has_trailing_slash(old_path))
+        return -ENOTDIR;
+    rc = lookup(ov, change.new_path, &target);
+    if (rc == 0)
+        return -EEXIST;
+    if (rc != -ENOENT || has_trailing_slash(new_path))
+        return rc;
+    rc = check_parent(ov, change.new_path, NULL);
+    if (rc == 0)
+        rc = make_upper_dirs(ov, change.new_path, false);
+    if (rc == 0 && entry.layer != UPPER_LAYER) {
+        change.flags |= KLEE_OVERLAY_STAGE_OLD;
+        rc = make_upper_dirs(ov, change.old_path, false);
+    }
+    if (rc < 0)
+        return rc;
+
+    KleeOverlayState *state = ov->state;
+    rc = prepare_inode(state, &entry, KLEE_OVERLAY_STAGE_SOURCE, &change.old_inode);
+    if (rc < 0) {
+        klee_overlay_state_clear_stage(state);
+        return rc;
+    }
+    rc = begin_change(ov, &change);
+    if (rc < 0)
+        return rc;
+    if (change.flags & KLEE_OVERLAY_STAGE_OLD) {
+        rc = install_stage(state, KLEE_OVERLAY_STAGE_SOURCE, change.old_path, false);
+        if (rc == 0)
+            rc = klee_overlay_state_sync(state, &change);
+    }
+    if (rc == 0)
+        rc = change_name(state, &change, 0);
+    return finish_change(ov, &change, rc);
 }
 
 /* ==================== Public API ==================== */
@@ -887,10 +1145,8 @@ KleeOverlayMount *klee_overlay_create(const char *dest, const char *upper,
         return NULL;
 
     ov->readonly = ro;
-
-    ov->whiteouts = klee_ht_create();
-    if (!ov->whiteouts)
-        goto fail;
+    ov->refs = 1;
+    int error = ENOMEM;
 
     /* Copy lower layer paths */
     if (lower_count > 0) {
@@ -899,9 +1155,22 @@ KleeOverlayMount *klee_overlay_create(const char *dest, const char *upper,
             goto fail;
         ov->lower_count = lower_count;
         for (int i = 0; i < lower_count; i++) {
-            ov->lower_dirs[i] = strdup(lowers[i]);
-            if (!ov->lower_dirs[i])
+            ov->lower_dirs[i] = upper ? realpath(lowers[i], NULL) : strdup(lowers[i]);
+            if (!ov->lower_dirs[i]) {
+                error = upper ? errno : ENOMEM;
                 goto fail;
+            }
+            if (upper) {
+                struct stat st;
+                if (stat(ov->lower_dirs[i], &st) < 0) {
+                    error = errno;
+                    goto fail;
+                }
+                if (!S_ISDIR(st.st_mode)) {
+                    error = ENOTDIR;
+                    goto fail;
+                }
+            }
         }
     }
 
@@ -915,22 +1184,36 @@ KleeOverlayMount *klee_overlay_create(const char *dest, const char *upper,
     }
 
     /* Upper directory for writable overlays */
-    struct stat root;
     if (!ro) {
         if (upper) {
-            ov->upper_dir = strdup(upper);
+            ov->upper_dir = realpath(upper, NULL);
+            if (!ov->upper_dir) {
+                error = errno;
+                goto fail;
+            }
+            for (int i = 0; i < lower_count; i++) {
+                if (strcmp(ov->upper_dir, ov->lower_dirs[i]) == 0) {
+                    error = EINVAL;
+                    goto fail;
+                }
+            }
         } else {
             char upper_name[PATH_MAX];
             snprintf(upper_name, sizeof(upper_name), "%s/.upper", dest);
             ov->upper_dir = klee_tmpfs_create(upper_name);
-            /* A fresh upper root shows like the root it covers */
-            if (ov->upper_dir && lower_dir(ov, "", &root))
-                finish_dir(ov->upper_dir, &root);
         }
         if (!ov->upper_dir) {
             KLEE_WARN("overlay: failed to create upper dir for %s", dest);
             goto fail;
         }
+        int rc = klee_overlay_state_open(ov->upper_dir, upper != NULL, &ov->state);
+        if (rc < 0) {
+            error = -rc;
+            goto fail;
+        }
+        struct stat root;
+        if (!upper && lower_dir(ov, "", &root))
+            finish_dir(ov->upper_dir, &root);
     }
 
     OvEntry top;
@@ -943,6 +1226,7 @@ KleeOverlayMount *klee_overlay_create(const char *dest, const char *upper,
 
 fail:
     klee_overlay_destroy(ov);
+    errno = error;
     return NULL;
 }
 
@@ -957,6 +1241,13 @@ int klee_overlay_resolve(KleeOverlayMount *ov, const char *remainder,
     int rc = normalize(remainder, rel, sizeof(rel));
     if (rc < 0)
         return rc;
+
+    if (ov->state) {
+        if (ov->state->faulted)
+            return -EIO;
+        if (klee_overlay_state_path(rel))
+            return -ENOENT;
+    }
 
     /* A read-only overlay is never changed.  The read-only checks refuse
      * what would modify it, with the kernel's errors. */
@@ -993,51 +1284,20 @@ int klee_overlay_resolve(KleeOverlayMount *ov, const char *remainder,
             return access == KLEE_OV_WRITE_CREATE
                    ? create_path(ov, rel, out, size)
                    : absent_path(ov, rel, out, size);
-        return upper_copy(ov, rel, &e, true, out, size);
+        /* Data I/O on a special entry uses the same object as readers. */
+        if (S_ISFIFO(e.st.st_mode) || S_ISSOCK(e.st.st_mode) ||
+            S_ISCHR(e.st.st_mode) || S_ISBLK(e.st.st_mode))
+            return put(out, size, e.path);
+        return upper_copy(ov, rel, &e, out, size);
 
     case KLEE_OV_CREATE_EXCL:
         return found ? -EEXIST : create_path(ov, rel, out, size);
 
-    case KLEE_OV_UNLINK:
-    case KLEE_OV_RMDIR:
-        if (!found)
-            return rc;
-        return delete_path(ov, rel, &e, access == KLEE_OV_RMDIR, out, size);
-
-    case KLEE_OV_RENAME_SRC:
-        if (!found)
-            return absent_path(ov, rel, out, size);
-        return move_path(ov, rel, &e, out, size);
-
-    case KLEE_OV_RENAME_DST:
-        if (!*rel)
-            return -EBUSY;
-        /* Replacing a directory of a lower layer: see move_path */
-        if (is_dir && in_lower(ov, rel))
-            return -EXDEV;
-        if (found && e.layer == UPPER_LAYER)
-            return put(out, size, e.path);
-        return create_path(ov, rel, out, size);
-
-    case KLEE_OV_LINK_SRC:
-        if (!found)
-            return absent_path(ov, rel, out, size);
-        if (is_dir)
-            return -EPERM;
-        return upper_copy(ov, rel, &e, false, out, size);
+    case KLEE_OV_SETATTR:
+        return found ? upper_copy(ov, rel, &e, out, size)
+                     : absent_path(ov, rel, out, size);
     }
     return -EINVAL;
-}
-
-void klee_overlay_whiteout(KleeOverlayMount *ov, const char *remainder)
-{
-    char rel[PATH_MAX];
-    if (!ov || !remainder || !ov->whiteouts ||
-        normalize(remainder, rel, sizeof(rel)) < 0 || !*rel)
-        return;
-    if (add_whiteout(ov, rel) == 0)
-        merged_forget(ov, rel);
-    KLEE_DEBUG("overlay: whiteout %s", rel);
 }
 
 bool klee_overlay_is_whiteout(const KleeOverlayMount *ov, const char *remainder)
@@ -1048,9 +1308,15 @@ bool klee_overlay_is_whiteout(const KleeOverlayMount *ov, const char *remainder)
     return whited_out(ov, rel);
 }
 
+void klee_overlay_ref(KleeOverlayMount *ov)
+{
+    if (ov)
+        ov->refs++;
+}
+
 void klee_overlay_destroy(KleeOverlayMount *ov)
 {
-    if (!ov)
+    if (!ov || --ov->refs)
         return;
 
     /* lower_dirs are just path copies; tmpfs cleanup handles actual dirs */
@@ -1059,8 +1325,7 @@ void klee_overlay_destroy(KleeOverlayMount *ov)
             free(ov->lower_dirs[i]);
         free(ov->lower_dirs);
     }
-    if (ov->whiteouts)
-        klee_ht_destroy(ov->whiteouts);
+    klee_overlay_state_close(ov->state);
     free(ov->upper_dir);
     /* merged_dir is managed by tmpfs subsystem */
     free(ov->merged_dir);

@@ -38,7 +38,7 @@ endif
 UTIL_SRCS = src/util/log.c src/util/arena.c src/util/hash_table.c
 FS_SRCS   = src/fs/radix_tree.c src/fs/mount_table.c src/fs/path_resolve.c \
             src/fs/fd_table.c src/fs/tmpfs.c src/fs/readonly.c src/fs/pivot.c \
-            src/fs/overlay.c
+            src/fs/overlay.c src/fs/overlay_state.c
 NS_SRCS   = src/ns/pid_ns.c src/ns/user_ns.c src/ns/ipc_ns.c \
             src/ns/uts_ns.c src/ns/net_ns.c src/ns/proc_synth.c
 INTERCEPT_SRCS = src/intercept/intercept.c src/intercept/seccomp_notif.c \
@@ -121,10 +121,10 @@ tests/test_cli: tests/test_cli.c src/cli.o src/config.o $(COMMON_TEST_OBJS)
 tests/test_radix_tree: tests/test_radix_tree.c src/fs/radix_tree.o $(COMMON_TEST_OBJS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-tests/test_mount_table: tests/test_mount_table.c src/fs/mount_table.o src/fs/radix_tree.o src/fs/tmpfs.o src/fs/pivot.o src/fs/overlay.o src/fuse/fuse_mountinfo.o src/config.o $(COMMON_TEST_OBJS)
+tests/test_mount_table: tests/test_mount_table.c src/fs/mount_table.o src/fs/radix_tree.o src/fs/tmpfs.o src/fs/pivot.o src/fs/overlay.o src/fs/overlay_state.o src/fuse/fuse_mountinfo.o src/config.o $(COMMON_TEST_OBJS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-tests/test_path_resolve: tests/test_path_resolve.c src/fs/path_resolve.o src/fs/mount_table.o src/fs/radix_tree.o src/fs/tmpfs.o src/fs/pivot.o src/fs/fd_table.o src/fs/overlay.o src/fuse/fuse_mountinfo.o src/config.o $(COMMON_TEST_OBJS)
+tests/test_path_resolve: tests/test_path_resolve.c src/fs/path_resolve.o src/fs/mount_table.o src/fs/radix_tree.o src/fs/tmpfs.o src/fs/pivot.o src/fs/fd_table.o src/fs/overlay.o src/fs/overlay_state.o src/fuse/fuse_mountinfo.o src/config.o $(COMMON_TEST_OBJS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 tests/test_pid_ns: tests/test_pid_ns.c src/ns/pid_ns.o $(COMMON_TEST_OBJS)
@@ -137,7 +137,7 @@ tests/test_fd_table: tests/test_fd_table.c src/fs/fd_table.o $(COMMON_TEST_OBJS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 # --wrap lets the test make malloc/calloc fail
-tests/test_process: tests/test_process.c src/process/process.o src/fs/fd_table.o $(COMMON_TEST_OBJS)
+tests/test_process: tests/test_process.c src/process/process.o $(FS_TEST_OBJS) src/fuse/fuse_mountinfo.o src/config.o $(COMMON_TEST_OBJS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS) -Wl,--wrap=malloc -Wl,--wrap=calloc
 
 tests/test_filter32: tests/test_filter32.c src/intercept/filter.o src/syscall/sysnum32.o src/syscall/handlers.o $(COMMON_TEST_OBJS)

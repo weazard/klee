@@ -3,6 +3,7 @@
  * Per-process state management implementation
  */
 #include "process/process.h"
+#include "fs/mount_table.h"
 #include "ns/ipc_ns.h"
 #include "util/log.h"
 
@@ -138,6 +139,7 @@ void klee_process_remove(KleeProcessTable *pt, pid_t real_pid)
 
     if (proc->sandbox)
         klee_sandbox_unref(proc->sandbox);
+    klee_sandbox_unref(proc->exec_previous_sandbox);
     if (proc->event_arena)
         klee_arena_destroy(proc->event_arena);
     if (proc->life_arena)
@@ -223,8 +225,22 @@ void klee_process_unshare(KleeProcess *proc, unsigned long flags)
     }
 }
 
+void klee_process_finish_mount_exec(KleeProcess *proc, bool success)
+{
+    if (!proc->exec_previous_sandbox)
+        return;
+    if (success) {
+        klee_sandbox_unref(proc->exec_previous_sandbox);
+    } else {
+        klee_sandbox_unref(proc->sandbox);
+        proc->sandbox = proc->exec_previous_sandbox;
+    }
+    proc->exec_previous_sandbox = NULL;
+}
+
 void klee_process_exec(KleeProcess *proc, const char *new_exe)
 {
+    klee_process_finish_mount_exec(proc, true);
     /* Avoid UB: caller often passes proc->vexe as new_exe (overlapping
      * src/dst in snprintf).  Only copy when it's a different buffer. */
     if (new_exe && new_exe != proc->vexe)
@@ -260,7 +276,9 @@ void klee_sandbox_unref(KleeSandbox *sb)
         return;
     if (--sb->ref_count <= 0) {
         free(sb->hostname);
-        /* mount_table, pid_map, and ipc_ns freed separately */
+        if (sb->owns_mount_table)
+            klee_mount_table_destroy(sb->mount_table);
+        /* The launcher owns the shared namespace resources. */
         free(sb);
     }
 }
