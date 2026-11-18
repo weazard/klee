@@ -30,6 +30,7 @@
 #  23. statx shows the virtual owner
 #  24. dup2(fd, fd) and dup2 of an untracked fd keep descriptor paths right
 #  25. Writable overlays never modify their lower layers
+#  26. creat and fstatat with AT_EMPTY_PATH translate nonempty guest paths
 set -e
 
 KLEE="${KLEE:-./klee}"
@@ -1007,6 +1008,40 @@ else
     fail "--overlay (got: $out)"
 fi
 rm -rf "$OV"
+
+# ---------------------------------------------------------------------------
+# Fix 26: creat skipped path translation. fstatat with AT_EMPTY_PATH also
+# skipped it for nonempty paths, including paths relative to a guest dirfd.
+# ---------------------------------------------------------------------------
+echo "--- creat and fstatat translate guest paths ---"
+if command -v cc >/dev/null 2>&1; then
+    SP=$(mktemp -d /tmp/klee-path-syscalls.XXXXXX)
+    mkdir "$SP/writable"
+    printf 'keep\n' > "$SP/entry"
+    ln -s entry "$SP/writable/link"
+    if cc -std=c11 -Wall -Wextra -o "$SP/probe" tests/test_path_syscalls.c; then
+        if out=$($KLEE --bind / / --bind "$SP/writable" "$SP/view" \
+                  --ro-bind "$SP/entry" "$SP/view/entry" -- "$SP/probe" \
+                  creat "$SP/view/created" "$SP/view/entry" 2>&1) &&
+           [ -f "$SP/writable/created" ] && [ "$(cat "$SP/entry")" = "keep" ]; then
+            pass "creat translates creation and truncation and respects read-only binds"
+        else
+            fail "creat guest path (got: $out)"
+        fi
+        if out=$($KLEE --bind / / --bind "$SP/writable" "$SP/view" \
+                  --ro-bind "$SP/entry" "$SP/view/entry" -- "$SP/probe" \
+                  fstatat "$SP/view" "$SP/view/entry" 2>&1); then
+            pass "fstatat translates nonempty paths and preserves empty-path semantics"
+        else
+            fail "fstatat AT_EMPTY_PATH (got: $out)"
+        fi
+    else
+        fail "compile creat and fstatat probe"
+    fi
+    rm -rf "$SP"
+else
+    echo "  SKIP: C compiler unavailable (creat and fstatat test)"
+fi
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

@@ -360,6 +360,15 @@ int klee_enter_openat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     return check_readonly_open(proc, flags);
 }
 
+int klee_enter_creat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    const int flags = O_CREAT | O_WRONLY | O_TRUNC;
+    int rc = translate_path_arg_for(proc, ic, ev, 0, -1, false,
+                                    open_access(flags));
+    if (rc < 0) return rc;
+    return check_readonly_open(proc, flags);
+}
+
 int klee_enter_openat2(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
     /* openat2(dirfd, pathname, how, size) - how contains RESOLVE flags */
@@ -459,13 +468,17 @@ int klee_enter_lstat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 
 int klee_enter_newfstatat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    /* newfstatat(dirfd, pathname, statbuf, flags)
-     * AT_EMPTY_PATH  -> fstat semantics on dirfd, no path to translate
-     * AT_SYMLINK_NOFOLLOW -> lstat semantics
-     * otherwise -> stat semantics */
+    /* With AT_EMPTY_PATH the kernel uses dirfd itself for an empty path.
+     * Leave NULL to the kernel too, which accepts it starting with Linux 6.11. */
     int flags = (int)ev->args[3];
-    if (flags & AT_EMPTY_PATH)
-        return 0;
+    if (flags & AT_EMPTY_PATH) {
+        const void *path = (const void *)(uintptr_t)ev->args[1];
+        char first;
+        if (!path ||
+            (klee_read_mem(ic, ev->pid, &first, path, sizeof(first)) == 0 &&
+             first == '\0'))
+            return 0;
+    }
     if (flags & AT_SYMLINK_NOFOLLOW)
         return translate_path_arg_nofollow(proc, ic, ev, 1, 0);
     return translate_path_arg(proc, ic, ev, 1, 0);
