@@ -287,7 +287,7 @@ static int ptrace_continue_running(KleeInterceptor *self, pid_t pid, int signal)
 
 /* Skip a syscall by replacing orig_rax with -1 (invalid).
  * The kernel will return -ENOSYS; the caller must override the return
- * value on the subsequent syscall-exit stop via deny_errno. */
+ * value on the subsequent syscall-exit stop. */
 static int ptrace_skip_syscall(KleeInterceptor *self, pid_t pid, long retval)
 {
     (void)self;
@@ -311,9 +311,10 @@ static int ptrace_skip_syscall(KleeInterceptor *self, pid_t pid, long retval)
 static int ptrace_respond(KleeInterceptor *self, KleeEvent *event,
                           long retval, int err)
 {
-    (void)retval;
-    if (err) {
-        ptrace_skip_syscall(self, event->pid, -err);
+    if (err || event->emulated) {
+        int rc = ptrace_skip_syscall(self, event->pid, retval);
+        if (rc < 0)
+            return rc;
     }
     return ptrace_continue(self, event->pid, 0);
 }

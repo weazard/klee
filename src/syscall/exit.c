@@ -9,6 +9,7 @@
 #include "process/memory.h"
 #include "process/regs.h"
 #include "fs/fd_table.h"
+#include "fs/mount_table.h"
 #include "ns/pid_ns.h"
 #include "ns/user_ns.h"
 #include "ns/uts_ns.h"
@@ -34,8 +35,6 @@
 
 int klee_exit_open(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    (void)ic;
-
     /* Track new FD if open succeeded */
     if (ev->retval >= 0) {
         int fd = (int)ev->retval;
@@ -48,6 +47,14 @@ int klee_exit_open(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
             flags = (int)ev->args[1];
         else if (syscall_nr == KLEE_SYS_openat)
             flags = (int)ev->args[2];
+#ifdef KLEE_SYS_openat2
+        else if (syscall_nr == KLEE_SYS_openat2) {
+            uint64_t how_flags;
+            if (klee_read_mem(ic, ev->pid, &how_flags,
+                              (const void *)(uintptr_t)ev->args[2], sizeof(how_flags)) == 0)
+                flags = (int)how_flags;
+        }
+#endif
         cloexec = !!(flags & O_CLOEXEC);
 
         /* Use the resolved absolute guest path so that fchdir() and
@@ -56,10 +63,27 @@ int klee_exit_open(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
          * untracked: *at() calls on it then go to the kernel as they are. */
         const char *vpath = proc->resolved_guest[0] ? proc->resolved_guest
                                                     : proc->saved_path;
-        if (vpath[0] == '/')
-            klee_fd_table_set(proc->fd_table, fd, vpath, cloexec);
-        else
+        if (vpath[0] != '/') {
             klee_fd_table_remove(proc->fd_table, fd);
+            return 0;
+        }
+        if (klee_fd_table_set(proc->fd_table, fd, vpath, cloexec) == 0 &&
+            proc->resolved_guest[0] && proc->sandbox) {
+            KleeMount *mount = klee_mount_table_resolve(proc->sandbox->mount_table, vpath);
+            if (mount && mount->overlay) {
+                const char *upper = mount->overlay->upper_dir;
+                char relative[PATH_MAX], path[PATH_MAX];
+                bool on_upper = false;
+                if (upper && klee_mount_table_overlay_relative(proc->sandbox->mount_table,
+                                                                  vpath, relative, sizeof(relative)) == 0) {
+                    int length = snprintf(path, sizeof(path), "%s%s%s",
+                                           upper, *relative ? "/" : "", relative);
+                    on_upper = length >= 0 && (size_t)length < sizeof(path) &&
+                               strcmp(path, proc->translated_path) == 0;
+                }
+                klee_fd_table_set_overlay(proc->fd_table, fd, mount->id, on_upper);
+            }
+        }
     }
     return 0;
 }

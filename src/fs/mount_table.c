@@ -17,6 +17,8 @@
 #include <sys/stat.h>
 #include <linux/limits.h>
 
+static uint64_t next_mount_id = 1;
+
 KleeMountTable *klee_mount_table_create(void)
 {
     KleeMountTable *mt = calloc(1, sizeof(KleeMountTable));
@@ -40,13 +42,77 @@ KleeMountTable *klee_mount_table_create(void)
     return mt;
 }
 
+static void release_mounts(const char *path, KleeMount *mount, void *data)
+{
+    (void)path;
+    (void)data;
+    for (; mount; mount = mount->stacked)
+        klee_overlay_destroy(mount->overlay);
+}
+
 void klee_mount_table_destroy(KleeMountTable *mt)
 {
     if (!mt)
         return;
-    /* Arena owns all nodes and mount entries */
+    klee_radix_walk(mt->tree, release_mounts, NULL);
     klee_arena_destroy(mt->arena);
     free(mt);
+}
+
+typedef struct {
+    KleeMountTable *copy;
+    bool failed;
+} MountClone;
+
+static void clone_mounts(const char *path, KleeMount *mount, void *data)
+{
+    MountClone *clone = data;
+    if (clone->failed)
+        return;
+    KleeMountTable *copy = clone->copy;
+    RadixNode *node = klee_radix_insert(copy->tree, path, NULL);
+    if (!node) {
+        clone->failed = true;
+        return;
+    }
+    KleeMount **tail = &node->mount;
+    for (; mount; mount = mount->stacked) {
+        KleeMount *entry = klee_arena_alloc(copy->arena, sizeof(*entry));
+        if (!entry) {
+            clone->failed = true;
+            return;
+        }
+        *entry = *mount;
+        entry->stacked = NULL;
+        entry->source = mount->source ? klee_arena_strdup(copy->arena, mount->source) : NULL;
+        entry->dest = klee_arena_strdup(copy->arena, mount->dest);
+        entry->overlay_prefix = mount->overlay_prefix
+            ? klee_arena_strdup(copy->arena, mount->overlay_prefix) : NULL;
+        if (!entry->dest || (mount->source && !entry->source) ||
+            (mount->overlay_prefix && !entry->overlay_prefix)) {
+            clone->failed = true;
+            return;
+        }
+        klee_overlay_ref(entry->overlay);
+        *tail = entry;
+        tail = &entry->stacked;
+        copy->num_mounts++;
+    }
+}
+
+KleeMountTable *klee_mount_table_clone(const KleeMountTable *mt)
+{
+    KleeMountTable *copy = klee_mount_table_create();
+    if (!copy)
+        return NULL;
+    copy->virtual_root = klee_arena_strdup(copy->arena, mt->virtual_root);
+    MountClone clone = { .copy = copy, .failed = !copy->virtual_root };
+    klee_radix_walk(mt->tree, clone_mounts, &clone);
+    if (clone.failed) {
+        klee_mount_table_destroy(copy);
+        return NULL;
+    }
+    return copy;
 }
 
 int klee_mount_table_add(KleeMountTable *mt, MountType type,
@@ -60,8 +126,11 @@ int klee_mount_table_add(KleeMountTable *mt, MountType type,
     mount->type = type;
     mount->source = source ? klee_arena_strdup(mt->arena, source) : NULL;
     mount->dest = dest ? klee_arena_strdup(mt->arena, dest) : NULL;
+    if (!mount->dest || (source && !mount->source))
+        return -ENOMEM;
     mount->is_readonly = readonly;
     mount->perms = perms;
+    mount->id = next_mount_id++;
 
     RadixNode *node = klee_radix_insert(mt->tree, dest, mount);
     if (!node)
@@ -219,53 +288,26 @@ int klee_mount_table_populate(KleeMountTable *mt, const KleeConfig *cfg)
             continue;
 
         case MOUNT_OVERLAY:
-        {
-            /* --overlay: upper=source, lowers=overlay_srcs */
-            KleeOverlayMount *ov = klee_overlay_create(
-                dest, source, op->overlay_srcs, op->overlay_src_count, false);
-            if (!ov) {
-                KLEE_WARN("overlay: failed to create overlay for %s", dest);
-                continue;
-            }
-            int rc = klee_mount_table_add(mt, MOUNT_OVERLAY,
-                                           ov->merged_dir, dest, false, op->perms);
-            if (rc < 0) return rc;
-            KleeMount *m = klee_mount_table_resolve(mt, dest);
-            if (m) m->overlay = ov;
-            continue;
-        }
-
         case MOUNT_TMP_OVERLAY:
-        {
-            /* --tmp-overlay: tmpfs upper, lowers=overlay_srcs */
-            KleeOverlayMount *ov = klee_overlay_create(
-                dest, NULL, op->overlay_srcs, op->overlay_src_count, false);
-            if (!ov) {
-                KLEE_WARN("overlay: failed to create tmp-overlay for %s", dest);
-                continue;
-            }
-            int rc = klee_mount_table_add(mt, MOUNT_TMP_OVERLAY,
-                                           ov->merged_dir, dest, false, op->perms);
-            if (rc < 0) return rc;
-            KleeMount *m = klee_mount_table_resolve(mt, dest);
-            if (m) m->overlay = ov;
-            continue;
-        }
-
         case MOUNT_RO_OVERLAY:
         {
-            /* --ro-overlay: no upper, lowers=overlay_srcs, readonly */
+            bool ro = op->type == MOUNT_RO_OVERLAY;
+            const char *upper = op->type == MOUNT_OVERLAY ? source : NULL;
+            if (op->type == MOUNT_OVERLAY && !upper)
+                return -EINVAL;
             KleeOverlayMount *ov = klee_overlay_create(
-                dest, NULL, op->overlay_srcs, op->overlay_src_count, true);
+                dest, upper, op->overlay_srcs, op->overlay_src_count, ro);
             if (!ov) {
-                KLEE_WARN("overlay: failed to create ro-overlay for %s", dest);
-                continue;
+                int error = errno;
+                KLEE_ERROR("overlay setup for %s failed: %s", dest, strerror(error));
+                return -error;
             }
-            int rc = klee_mount_table_add(mt, MOUNT_RO_OVERLAY,
-                                           ov->merged_dir, dest, true, op->perms);
-            if (rc < 0) return rc;
-            KleeMount *m = klee_mount_table_resolve(mt, dest);
-            if (m) m->overlay = ov;
+            int rc = klee_mount_table_add(mt, op->type, ov->merged_dir, dest, ro, op->perms);
+            if (rc < 0) {
+                klee_overlay_destroy(ov);
+                return rc;
+            }
+            klee_mount_table_resolve(mt, dest)->overlay = ov;
             continue;
         }
 
@@ -306,6 +348,15 @@ int klee_mount_table_populate(KleeMountTable *mt, const KleeConfig *cfg)
             op->type != MOUNT_DEV_BIND_TRY) {
             return rc;
         }
+        if (rc == 0 && op->overlay_alias) {
+            KleeMount *mount = klee_mount_table_resolve(mt, dest);
+            mount->overlay_prefix = klee_arena_strdup(mt->arena, op->overlay_prefix);
+            if (!mount->overlay_prefix)
+                return -ENOMEM;
+            mount->overlay = op->overlay_alias;
+            mount->is_readonly |= op->overlay_alias_readonly;
+            klee_overlay_ref(mount->overlay);
+        }
     }
 
     return 0;
@@ -324,6 +375,26 @@ KleeMount *klee_mount_table_resolve(const KleeMountTable *mt,
         return NULL;
 
     return node->mount;
+}
+
+static int overlay_relative(const KleeMount *mount, const char *remainder,
+                            char *relative, size_t size)
+{
+    while (*remainder == '/')
+        remainder++;
+    const char *prefix = mount->overlay_prefix ? mount->overlay_prefix : "";
+    int n = snprintf(relative, size, "%s%s%s", prefix, *prefix && *remainder ? "/" : "", remainder);
+    return n < 0 || (size_t)n >= size ? -ENAMETOOLONG : 0;
+}
+
+int klee_mount_table_overlay_relative(const KleeMountTable *mt, const char *guest_path,
+                                       char *relative, size_t size)
+{
+    const char *remainder;
+    RadixNode *node = klee_radix_lookup(mt->tree, guest_path, NULL, &remainder);
+    if (!node || !node->mount || !node->mount->overlay)
+        return -EINVAL;
+    return overlay_relative(node->mount, remainder, relative, size);
 }
 
 static int translate_depth(const KleeMountTable *mt,
@@ -345,6 +416,16 @@ static int translate_depth(const KleeMountTable *mt,
     }
 
     KleeMount *mount = node->mount;
+
+    if (mount->overlay) {
+        if (mount->is_readonly && access != KLEE_OV_LOOKUP && access != KLEE_OV_LIST)
+            access = KLEE_OV_READ;
+        char relative[PATH_MAX];
+        int rc = overlay_relative(mount, remainder, relative, sizeof(relative));
+        if (rc < 0)
+            return rc;
+        return klee_overlay_resolve(mount->overlay, relative, host_path_out, out_size, access);
+    }
 
     switch (mount->type) {
     case MOUNT_BIND_RW:
@@ -443,27 +524,7 @@ static int translate_depth(const KleeMountTable *mt,
     case MOUNT_OVERLAY:
     case MOUNT_TMP_OVERLAY:
     case MOUNT_RO_OVERLAY:
-        if (mount->overlay) {
-            /* A remounted read-only overlay must not be changed either */
-            if (mount->is_readonly && access != KLEE_OV_LOOKUP &&
-                access != KLEE_OV_LIST)
-                access = KLEE_OV_READ;
-            return klee_overlay_resolve(mount->overlay, remainder,
-                                         host_path_out, out_size, access);
-        }
-        /* Fallback: use source as merged dir */
-        if (mount->source) {
-            while (*remainder == '/')
-                remainder++;
-            if (*remainder)
-                snprintf(host_path_out, out_size, "%s/%s",
-                         mount->source, remainder);
-            else
-                snprintf(host_path_out, out_size, "%s", mount->source);
-        } else {
-            snprintf(host_path_out, out_size, "%s", guest_path);
-        }
-        break;
+        return -EIO;
 
     case MOUNT_REMOUNT_RO:
     case MOUNT_CHMOD:

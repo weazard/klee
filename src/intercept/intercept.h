@@ -43,6 +43,7 @@ typedef struct {
     unsigned abi_flags;    /* KLEE_SYS32_* for i386 syscalls */
     uint64_t args[6];
     long retval;
+    bool emulated;        /* the supervisor completed the syscall */
     int signal;
     uint64_t notif_id;     /* seccomp_unotify notification ID */
     pid_t new_child_pid;   /* for fork/clone events */

@@ -283,8 +283,8 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
          * enter-stop before the exit-stop.  Skip that extra stop. */
         if (proc->state == PROC_STATE_SYSCALL_ENTER &&
             el->interceptor->backend == INTERCEPT_PTRACE) {
-            if (proc->deny_errno) {
-                /* A syscall denied on enter returns -ENOSYS from the
+            if (proc->deny_errno || proc->emulated_syscall) {
+                /* A syscall skipped on enter returns -ENOSYS from the
                  * injected invalid syscall, so its exit-stop looks like an
                  * enter-stop.  Route to the exit path so the intended errno
                  * override runs — this must take priority over the seccomp
@@ -323,16 +323,23 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
                                  el->interceptor->ptrace.seccomp_filter;
         proc->path_arg_count = 0;
         proc->deny_errno = 0;
+        proc->emulated_syscall = false;
+        event->emulated = false;
         proc->resolved_guest[0] = '\0';
         klee_arena_reset(proc->event_arena);
 
         int rc = klee_dispatch_enter(proc, el->interceptor, event);
-        if (rc < 0) {
-            /* Deny the syscall: for ptrace, replace with invalid syscall
-             * (-1 → kernel returns ENOSYS) and store the real errno to
-             * override at the exit stop. */
-            proc->deny_errno = -rc;
-            el->interceptor->respond(el->interceptor, event, -1, -rc);
+        if (rc < 0 || event->emulated) {
+            /* Skip the tracee syscall and deliver its result. */
+            proc->deny_errno = rc < 0 ? -rc : 0;
+            proc->emulated_syscall = event->emulated;
+            int reply = el->interceptor->respond(el->interceptor, event,
+                                               rc < 0 ? -1 : 0, proc->deny_errno);
+            if (reply < 0 && reply != -ESRCH) {
+                KLEE_ERROR("failed to return syscall result to %d: %s",
+                           event->pid, strerror(-reply));
+                kill(event->pid, SIGKILL);
+            }
             return 0;
         }
         if (el->interceptor->backend == INTERCEPT_PTRACE)
@@ -373,18 +380,23 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
     case KLEE_EVENT_SYSCALL_EXIT: {
         proc->state = PROC_STATE_SYSCALL_EXIT;
         event->syscall_nr = proc->current_syscall;
+        if (proc->exec_previous_sandbox && event->retval < 0 &&
+            (event->syscall_nr == KLEE_SYS_execve || event->syscall_nr == KLEE_SYS_execveat))
+            klee_process_finish_mount_exec(proc, false);
         klee_abi_demux_exit_args(proc, event);
 
         /* Consolidate all register modifications into a single push */
         bool need_reg_push = false;
 
-        /* If the syscall was denied on enter, override the return value
+        /* If the syscall was skipped on enter, override the return value
          * (kernel returned ENOSYS for the invalid -1 syscall) with the
          * actual errno we want the tracee to see. */
-        if (proc->deny_errno && el->interceptor->backend == INTERCEPT_PTRACE) {
+        if ((proc->deny_errno || proc->emulated_syscall) &&
+            el->interceptor->backend == INTERCEPT_PTRACE) {
             klee_regs_fetch(el->interceptor, proc);
             klee_regs_set_result(proc, (long)-proc->deny_errno);
             proc->deny_errno = 0;
+            proc->emulated_syscall = false;
             /* A handler may have rewritten path arguments before refusing
              * the call (the second path of a rename, a read-only open):
              * the tracee keeps its own registers either way. */
@@ -398,7 +410,7 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
             }
             if (proc->demux_mem && proc->demux_dirty)
                 klee_abi_demux_restore(proc);
-            /* Skip normal exit dispatch — syscall was denied */
+            /* The tracee never executed this syscall. */
             klee_regs_push(el->interceptor, proc);
             proc->state = PROC_STATE_RUNNING;
             el->interceptor->continue_running(el->interceptor, event->pid, 0);

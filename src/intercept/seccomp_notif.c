@@ -143,7 +143,8 @@ static int seccomp_respond(KleeInterceptor *self, KleeEvent *event,
     resp.id = event->notif_id;
     resp.val = retval;
     resp.error = err ? -err : 0;
-    resp.flags = (err == 0 && retval == 0) ? SECCOMP_USER_NOTIF_FLAG_CONTINUE : 0;
+    resp.flags = (!event->emulated && err == 0 && retval == 0)
+               ? SECCOMP_USER_NOTIF_FLAG_CONTINUE : 0;
 
     if (ioctl(self->seccomp.notif_fd, SECCOMP_IOCTL_NOTIF_SEND, &resp) < 0) {
         if (errno == ENOENT) {

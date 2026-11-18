@@ -24,6 +24,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <signal.h>
+#include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -122,15 +123,17 @@ static int translate_path_arg_ex(KleeProcess *proc, KleeInterceptor *ic,
 
     void *path_addr = (void *)(uintptr_t)ev->args[arg_idx];
     if (!path_addr)
-        return 0;
+        return access == KLEE_OV_LOOKUP ? -EFAULT : 0;
 
     /* Read guest path */
     int rc = klee_read_path(ic, ev->pid, proc->saved_path,
                             sizeof(proc->saved_path), path_addr);
     if (rc < 0) {
         KLEE_DEBUG("failed to read path from tracee: %d", rc);
-        return 0; /* pass through on failure */
+        return access == KLEE_OV_LOOKUP ? -EFAULT : 0;
     }
+    if (rc == 0 && access == KLEE_OV_LOOKUP)
+        return -ENOENT;
 
     /* Rewrite /proc/self and /proc/thread-self to use the tracee's real PID.
      * The kernel's /proc/self is a magic symlink to the CURRENT process's PID.
@@ -237,7 +240,8 @@ static int translate_path_arg_ex(KleeProcess *proc, KleeInterceptor *ic,
     if (rc < 0) {
         KLEE_DEBUG("path resolution failed for %s: %d", proc->saved_path, rc);
         proc->resolved_guest[0] = '\0';
-        return 0;
+        /* Inherited dirfds without a guest mapping keep kernel semantics. */
+        return rc == -EBADF ? 0 : rc;
     }
 
     rc = klee_mount_table_translate_access(ctx.mount_table,
@@ -252,6 +256,9 @@ static int translate_path_arg_ex(KleeProcess *proc, KleeInterceptor *ic,
             return rc;
         return 0;
     }
+    if (access == KLEE_OV_LOOKUP &&
+        klee_mount_table_overlay_at(ctx.mount_table, proc->resolved_guest))
+        return 0;
 
     /* Generate synthetic /proc/<pid>/stat and /proc/<pid>/status files
      * with virtual PIDs.  The kernel's real /proc files contain host PIDs
@@ -360,6 +367,15 @@ int klee_enter_openat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     return check_readonly_open(proc, flags);
 }
 
+int klee_enter_creat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    const int flags = O_CREAT | O_WRONLY | O_TRUNC;
+    int rc = translate_path_arg_for(proc, ic, ev, 0, -1, false,
+                                    open_access(flags));
+    if (rc < 0) return rc;
+    return check_readonly_open(proc, flags);
+}
+
 int klee_enter_openat2(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
     /* openat2(dirfd, pathname, how, size) - how contains RESOLVE flags */
@@ -459,13 +475,17 @@ int klee_enter_lstat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 
 int klee_enter_newfstatat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    /* newfstatat(dirfd, pathname, statbuf, flags)
-     * AT_EMPTY_PATH  -> fstat semantics on dirfd, no path to translate
-     * AT_SYMLINK_NOFOLLOW -> lstat semantics
-     * otherwise -> stat semantics */
+    /* With AT_EMPTY_PATH the kernel uses dirfd itself for an empty path.
+     * Leave NULL to the kernel too, which accepts it starting with Linux 6.11. */
     int flags = (int)ev->args[3];
-    if (flags & AT_EMPTY_PATH)
-        return 0;
+    if (flags & AT_EMPTY_PATH) {
+        const void *path = (const void *)(uintptr_t)ev->args[1];
+        char first;
+        if (!path ||
+            (klee_read_mem(ic, ev->pid, &first, path, sizeof(first)) == 0 &&
+             first == '\0'))
+            return 0;
+    }
     if (flags & AT_SYMLINK_NOFOLLOW)
         return translate_path_arg_nofollow(proc, ic, ev, 1, 0);
     return translate_path_arg(proc, ic, ev, 1, 0);
@@ -1141,44 +1161,126 @@ int klee_enter_execveat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     return 0;
 }
 
-/* The overlay the last translated path is in, or NULL */
-static KleeOverlayMount *overlay_of_path(KleeProcess *proc)
+typedef struct {
+    KleeMount *mount;
+    bool mount_root;
+    char relative[PATH_MAX];
+} OverlayOperand;
+
+/* Resolve both operands before permitting any change to an upper layer. */
+static int lookup_operand(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev,
+                           int path_idx, int dir_idx, bool nofollow, OverlayOperand *out)
 {
-    if (!proc->resolved_guest[0] || !proc->sandbox ||
-        !proc->sandbox->mount_table)
-        return NULL;
-    return klee_mount_table_overlay_at(proc->sandbox->mount_table,
-                                       proc->resolved_guest);
+    int rc = translate_path_arg_for(proc, ic, ev, path_idx, dir_idx, nofollow,
+                                    KLEE_OV_LOOKUP);
+    if (rc < 0 || !proc->resolved_guest[0] || !proc->sandbox || !proc->sandbox->mount_table)
+        return rc;
+    KleeMountTable *table = proc->sandbox->mount_table;
+    KleeMount *mount = klee_mount_table_resolve(table, proc->resolved_guest);
+    if (!mount || !mount->overlay)
+        return 0;
+    out->mount = mount;
+    RadixNode *exact = klee_radix_find_exact(table->tree, proc->resolved_guest);
+    out->mount_root = exact && exact->mount == mount;
+    rc = klee_mount_table_overlay_relative(table, proc->resolved_guest,
+                                           out->relative, sizeof(out->relative));
+    if (rc == 0) {
+        size_t length = strlen(proc->saved_path);
+        if (length && proc->saved_path[length - 1] == '/') {
+            size_t tail = strlen(out->relative);
+            if (tail + 1 >= sizeof(out->relative))
+                return -ENAMETOOLONG;
+            out->relative[tail] = '/';
+            out->relative[tail + 1] = '\0';
+        }
+    }
+    return rc;
 }
 
-#ifndef RENAME_NOREPLACE
-#define RENAME_NOREPLACE (1 << 0)
-#endif
-#ifndef RENAME_EXCHANGE
-#define RENAME_EXCHANGE (1 << 1)
-#endif
+static int overlay_result(KleeEvent *event, int result)
+{
+    event->emulated = result == 0;
+    return result;
+}
 
-/* rename, renameat, renameat2.  Moving a name into or out of an overlay
- * crosses a mount, which the kernel refuses with EXDEV. */
+static bool status_field(FILE *status, const char *key, char **line, size_t *size)
+{
+    size_t length = strlen(key);
+    while (getline(line, size, status) >= 0) {
+        if (strncmp(*line, key, length) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Namespace mutations run in the supervisor, so they require the same
+ * actual kernel credentials. Virtual UID/GID settings remain independent. */
+static int overlay_credentials(pid_t pid)
+{
+    char path[64];
+    struct stat supervisor, tracee;
+    snprintf(path, sizeof(path), "/proc/%d/ns/user", pid);
+    if (stat("/proc/self/ns/user", &supervisor) < 0 || stat(path, &tracee) < 0)
+        return -errno;
+    if (supervisor.st_dev != tracee.st_dev || supervisor.st_ino != tracee.st_ino)
+        return -EPERM;
+
+    FILE *self_status = fopen("/proc/self/status", "re");
+    if (!self_status)
+        return -errno;
+    snprintf(path, sizeof(path), "/proc/%d/status", pid);
+    FILE *tracee_status = fopen(path, "re");
+    if (!tracee_status) {
+        int rc = -errno;
+        fclose(self_status);
+        return rc;
+    }
+    const char *const keys[] = { "Uid:", "Gid:", "Groups:", "CapEff:" };
+    char *self_line = NULL, *tracee_line = NULL;
+    size_t self_size = 0, tracee_size = 0;
+    int rc = 0;
+    for (size_t i = 0; i < sizeof(keys) / sizeof(*keys); i++) {
+        if (!status_field(self_status, keys[i], &self_line, &self_size) ||
+            !status_field(tracee_status, keys[i], &tracee_line, &tracee_size)) {
+            rc = -EIO;
+            break;
+        }
+        if (strcmp(self_line, tracee_line)) {
+            rc = -EPERM;
+            break;
+        }
+    }
+    free(self_line);
+    free(tracee_line);
+    fclose(self_status);
+    fclose(tracee_status);
+    return rc;
+}
+
 static int enter_rename(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev,
                         int old_idx, int olddir_idx, int new_idx,
                         int newdir_idx, unsigned int flags)
 {
-    KleeOvAccess dst = (flags & RENAME_EXCHANGE) ? KLEE_OV_RENAME_SRC
-                     : (flags & RENAME_NOREPLACE) ? KLEE_OV_CREATE_EXCL
-                     : KLEE_OV_RENAME_DST;
-    int rc = translate_path_arg_for(proc, ic, ev, old_idx, olddir_idx, true,
-                                    KLEE_OV_RENAME_SRC);
-    if (rc < 0) return rc;
-    rc = check_readonly(proc, ev->syscall_nr);
-    if (rc < 0) return rc;
-    KleeOverlayMount *ov = overlay_of_path(proc);
-
-    rc = translate_path_arg_for(proc, ic, ev, new_idx, newdir_idx, true, dst);
-    if (rc < 0) return rc;
-    if (overlay_of_path(proc) != ov)
+    OverlayOperand old = {0}, new = {0};
+    int rc = lookup_operand(proc, ic, ev, old_idx, olddir_idx, true, &old);
+    if (rc == 0)
+        rc = check_readonly(proc, ev->syscall_nr);
+    if (rc == 0)
+        rc = lookup_operand(proc, ic, ev, new_idx, newdir_idx, true, &new);
+    if (rc < 0)
+        return rc;
+    if (old.mount != new.mount)
         return -EXDEV;
-    return check_readonly(proc, ev->syscall_nr);
+    rc = check_readonly(proc, ev->syscall_nr);
+    if (rc < 0 || !old.mount)
+        return rc;
+    if (old.mount_root || new.mount_root)
+        return -EBUSY;
+    rc = overlay_credentials(ev->pid);
+    if (rc < 0)
+        return rc;
+    return overlay_result(ev, klee_overlay_rename(old.mount->overlay,
+                                                  old.relative, new.relative, flags));
 }
 
 int klee_enter_rename(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
@@ -1213,58 +1315,102 @@ int klee_enter_mkdirat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     return check_readonly(proc, ev->syscall_nr);
 }
 
+static int enter_remove(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev,
+                        int path_idx, int dir_idx, bool directory)
+{
+    OverlayOperand path = {0};
+    int rc = lookup_operand(proc, ic, ev, path_idx, dir_idx, true, &path);
+    if (rc == 0)
+        rc = check_readonly(proc, ev->syscall_nr);
+    if (rc < 0 || !path.mount)
+        return rc;
+    if (path.mount_root)
+        return directory ? -EBUSY : -EISDIR;
+    rc = overlay_credentials(ev->pid);
+    if (rc < 0)
+        return rc;
+    return overlay_result(ev, klee_overlay_remove(path.mount->overlay, path.relative,
+                                                  directory));
+}
+
 int klee_enter_rmdir(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    int rc = translate_path_arg_for(proc, ic, ev, 0, -1, true, KLEE_OV_RMDIR);
-    if (rc < 0) return rc;
-    return check_readonly(proc, ev->syscall_nr);
+    return enter_remove(proc, ic, ev, 0, -1, true);
 }
 
 int klee_enter_unlink(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    int rc = translate_path_arg_for(proc, ic, ev, 0, -1, true, KLEE_OV_UNLINK);
-    if (rc < 0) return rc;
-    return check_readonly(proc, ev->syscall_nr);
+    return enter_remove(proc, ic, ev, 0, -1, false);
 }
 
 int klee_enter_unlinkat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    /* unlinkat(dirfd, path, flags) */
-    KleeOvAccess access = (ev->args[2] & AT_REMOVEDIR) ? KLEE_OV_RMDIR
-                                                       : KLEE_OV_UNLINK;
-    int rc = translate_path_arg_for(proc, ic, ev, 1, 0, true, access);
-    if (rc < 0) return rc;
-    return check_readonly(proc, ev->syscall_nr);
+    unsigned int flags = ev->args[2];
+    if (flags & ~AT_REMOVEDIR)
+        return -EINVAL;
+    return enter_remove(proc, ic, ev, 1, 0, (flags & AT_REMOVEDIR) != 0);
 }
 
-/* link, linkat.  An overlay copies the source up, so the new name never
- * shares an inode with a lower layer. */
+/* A procfd names an open description. Its recorded layer may differ from
+ * what a fresh lookup of the pathname would find after copy-up or rename. */
+static int self_proc_fd(const KleeProcess *proc)
+{
+    if (!proc->resolved_guest[0])
+        return -1;
+    int pid, fd;
+    char extra;
+    if (sscanf(proc->resolved_guest, "/proc/%d/fd/%d%c", &pid, &fd, &extra) != 2 ||
+        pid != proc->real_pid || fd < 0)
+        return -1;
+    return fd;
+}
+
 static int enter_link(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev,
                       int old_idx, int olddir_idx, int new_idx,
                       int newdir_idx, int flags)
 {
-    /* With AT_EMPTY_PATH and "" the source is olddirfd itself */
-    char first = 1;
-    bool by_fd = (flags & AT_EMPTY_PATH) && ev->args[old_idx] &&
+    if (flags & ~(AT_EMPTY_PATH | AT_SYMLINK_FOLLOW))
+        return -EINVAL;
+
+    char first;
+    bool by_fd = olddir_idx >= 0 && (flags & AT_EMPTY_PATH) && ev->args[old_idx] &&
                  klee_read_mem(ic, ev->pid, &first,
                                (const void *)(uintptr_t)ev->args[old_idx], 1) == 0 &&
                  first == '\0';
-
-    KleeOverlayMount *ov = NULL;
+    int source_fd = by_fd ? (int)ev->args[olddir_idx] : -1;
+    OverlayOperand old = {0}, new = {0};
+    int rc = 0;
     if (!by_fd) {
-        int rc = translate_path_arg_for(proc, ic, ev, old_idx, olddir_idx,
-                                        !(flags & AT_SYMLINK_FOLLOW),
-                                        KLEE_OV_LINK_SRC);
-        if (rc < 0) return rc;
-        ov = overlay_of_path(proc);
+        rc = lookup_operand(proc, ic, ev, old_idx, olddir_idx,
+                            !(flags & AT_SYMLINK_FOLLOW), &old);
+        if (rc < 0)
+            return rc;
+        if (flags & AT_SYMLINK_FOLLOW)
+            source_fd = self_proc_fd(proc);
     }
+    rc = lookup_operand(proc, ic, ev, new_idx, newdir_idx, true, &new);
+    if (rc == 0)
+        rc = check_readonly(proc, ev->syscall_nr);
+    if (rc < 0)
+        return rc;
 
-    int rc = translate_path_arg_for(proc, ic, ev, new_idx, newdir_idx, true,
-                                    KLEE_OV_CREATE_EXCL);
-    if (rc < 0) return rc;
-    if (!by_fd && overlay_of_path(proc) != ov)
+    if (by_fd || source_fd >= 0) {
+        uint64_t mount_id = 0;
+        bool upper = false;
+        klee_fd_table_get_overlay(proc->fd_table, source_fd, &mount_id, &upper);
+        if (mount_id != (new.mount ? new.mount->id : 0) || (mount_id && !upper))
+            return -EXDEV;
+        return new.mount ? translate_path_arg_for(proc, ic, ev, new_idx, newdir_idx,
+                                                    true, KLEE_OV_CREATE_EXCL) : 0;
+    }
+    if (old.mount != new.mount)
         return -EXDEV;
-    return check_readonly(proc, ev->syscall_nr);
+    if (!old.mount)
+        return 0;
+    rc = overlay_credentials(ev->pid);
+    if (rc < 0)
+        return rc;
+    return overlay_result(ev, klee_overlay_link(old.mount->overlay, old.relative, new.relative));
 }
 
 int klee_enter_link(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
@@ -1300,28 +1446,28 @@ int klee_enter_symlinkat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 
 int klee_enter_chmod(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    int rc = translate_path_arg_for(proc, ic, ev, 0, -1, false, KLEE_OV_WRITE);
+    int rc = translate_path_arg_for(proc, ic, ev, 0, -1, false, KLEE_OV_SETATTR);
     if (rc < 0) return rc;
     return check_readonly(proc, ev->syscall_nr);
 }
 
 int klee_enter_fchmodat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    int rc = translate_path_arg_for(proc, ic, ev, 1, 0, false, KLEE_OV_WRITE);
+    int rc = translate_path_arg_for(proc, ic, ev, 1, 0, false, KLEE_OV_SETATTR);
     if (rc < 0) return rc;
     return check_readonly(proc, ev->syscall_nr);
 }
 
 int klee_enter_chown(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    int rc = translate_path_arg_for(proc, ic, ev, 0, -1, false, KLEE_OV_WRITE);
+    int rc = translate_path_arg_for(proc, ic, ev, 0, -1, false, KLEE_OV_SETATTR);
     if (rc < 0) return rc;
     return check_readonly(proc, ev->syscall_nr);
 }
 
 int klee_enter_lchown(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    int rc = translate_path_arg_for(proc, ic, ev, 0, -1, true, KLEE_OV_WRITE);
+    int rc = translate_path_arg_for(proc, ic, ev, 0, -1, true, KLEE_OV_SETATTR);
     if (rc < 0) return rc;
     return check_readonly(proc, ev->syscall_nr);
 }
@@ -1331,7 +1477,7 @@ int klee_enter_fchownat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     /* fchownat(dirfd, path, uid, gid, flags) */
     bool nofollow = (ev->args[4] & AT_SYMLINK_NOFOLLOW) != 0;
     int rc = translate_path_arg_for(proc, ic, ev, 1, 0, nofollow,
-                                    KLEE_OV_WRITE);
+                                    KLEE_OV_SETATTR);
     if (rc < 0) return rc;
     return check_readonly(proc, ev->syscall_nr);
 }
@@ -2152,7 +2298,7 @@ static int enter_path_at(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev,
         return 0;
     }
     int rc = translate_path_arg_for(proc, ic, ev, path_idx, dirfd_idx, nofollow,
-                                    write ? KLEE_OV_WRITE : KLEE_OV_READ);
+                                    write ? KLEE_OV_SETATTR : KLEE_OV_READ);
     if (rc < 0) return rc;
     return write ? check_readonly(proc, ev->syscall_nr) : 0;
 }

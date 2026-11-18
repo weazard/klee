@@ -419,15 +419,15 @@ int main(int argc, char **argv)
             sandbox->unshare_user = true;
             KLEE_INFO("zypak: forced unshare_user for Chrome compatibility");
         }
-        /* Default to uid/gid 1000 if bwrap didn't specify --uid/--gid.
-         * Chrome's root check is geteuid()==0, so the virtual uid must
-         * be non-zero for processes that don't have --no-sandbox. */
+        /* Match the host credentials for D-Bus authentication. Chrome
+         * still needs a non-root identity when Klee itself runs as root. */
+        uid_t real_uid = getuid();
         if (!cfg.uid_set) {
-            cfg.uid = 1000;
+            cfg.uid = real_uid ? real_uid : 1000;
             cfg.uid_set = true;
         }
         if (!cfg.gid_set) {
-            cfg.gid = 1000;
+            cfg.gid = real_uid ? getgid() : 1000;
             cfg.gid_set = true;
         }
         /* Disable PID namespace virtualization for Chrome/Zypak.
@@ -549,12 +549,10 @@ int main(int argc, char **argv)
         init_proc->virtual_ppid = 0;
     }
 
-    /* Set initial ID state.  When Zypak is detected and no explicit
-     * --uid/--gid was given, default to UID/GID 1000 instead of 0.
-     * Chrome fatally refuses to run as root. */
+    /* Zypak has already selected its default IDs above. */
     if (cfg.unshare_user) {
-        uid_t uid = cfg.uid_set ? cfg.uid : (sandbox->zypak_detected ? 1000 : 0);
-        gid_t gid = cfg.gid_set ? cfg.gid : (sandbox->zypak_detected ? 1000 : 0);
+        uid_t uid = cfg.uid_set ? cfg.uid : 0;
+        gid_t gid = cfg.gid_set ? cfg.gid : 0;
         init_proc->id_state = klee_id_state_create(uid, gid);
     }
 

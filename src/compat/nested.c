@@ -230,8 +230,46 @@ static char *translate_nested_source(KleeProcess *proc, const char *guest_src)
     return strdup(guest_src);
 }
 
+/* Preserve the guest layer view when taking a bind from an overlay. */
+static int bind_overlay_source(KleeProcess *proc, KleeMountOp *op)
+{
+    KleeMountTable *mt = proc->sandbox->mount_table;
+    KleeResolveCtx ctx = {
+        .mount_table = mt,
+        .fd_table = proc->fd_table,
+        .vcwd = proc->vcwd,
+        .vroot = klee_mount_table_get_root(mt),
+    };
+    char guest[PATH_MAX];
+    if (!op->source || klee_path_resolve(&ctx, op->source, guest, AT_FDCWD) < 0)
+        return 0;
+    KleeMount *mount = klee_mount_table_resolve(mt, guest);
+    if (!mount || !mount->overlay)
+        return 0;
+    char relative[PATH_MAX], backed[PATH_MAX];
+    int rc = klee_mount_table_overlay_relative(mt, guest, relative, sizeof(relative));
+    if (rc < 0)
+        return rc;
+    rc = klee_overlay_resolve(mount->overlay, relative, backed, sizeof(backed), KLEE_OV_LOOKUP);
+    if (rc < 0)
+        return rc;
+    struct stat entry;
+    if (lstat(backed, &entry) < 0) {
+        if (errno == ENOENT && (op->type == MOUNT_BIND_TRY ||
+                               op->type == MOUNT_BIND_RO_TRY || op->type == MOUNT_DEV_BIND_TRY))
+            return 0;
+        return -errno;
+    }
+    op->overlay_prefix = strdup(relative);
+    if (!op->overlay_prefix)
+        return -ENOMEM;
+    op->overlay_alias = mount->overlay;
+    op->overlay_alias_readonly = mount->is_readonly;
+    return 0;
+}
+
 /*
- * Apply nested mount operations to the parent's mount table.
+ * Apply nested mount operations to the child's mount table.
  * For FD-based ops, open the tracee's FD via /proc/<pid>/fd/<N>
  * to get a local FD that klee_mount_table_populate can use.
  *
@@ -239,9 +277,8 @@ static char *translate_nested_source(KleeProcess *proc, const char *guest_src)
  * Translate them to host paths via klee_path_guest_to_host before
  * adding, so the child process can find files on the real filesystem.
  */
-static int apply_nested_mounts(KleeProcess *proc, KleeConfig *cfg, pid_t pid)
+static int apply_nested_mounts(KleeProcess *proc, KleeMountTable *mt, KleeConfig *cfg, pid_t pid)
 {
-    KleeMountTable *mt = proc->sandbox->mount_table;
     int local_fds[256];
     int local_fd_count = 0;
 
@@ -256,8 +293,13 @@ static int apply_nested_mounts(KleeProcess *proc, KleeConfig *cfg, pid_t pid)
         case MOUNT_BIND_RO_TRY:
         case MOUNT_DEV_BIND:
         case MOUNT_DEV_BIND_TRY:
+        {
+            int rc = bind_overlay_source(proc, op);
+            if (rc < 0)
+                return rc;
             needs_source_translate = true;
             break;
+        }
         case MOUNT_OVERLAY:
         case MOUNT_TMP_OVERLAY:
         case MOUNT_RO_OVERLAY:
@@ -499,11 +541,31 @@ int klee_nested_handle_exec(KleeProcess *proc, KleeInterceptor *ic,
         }
     }
 
-    /* 5b. Apply nested mount operations to parent's mount table */
+    /* 5b. Install a separate mount view for the nested command. */
     if (proc->sandbox && proc->sandbox->mount_table && nested_cfg.mount_ops) {
-        rc = apply_nested_mounts(proc, &nested_cfg, pid);
-        if (rc < 0)
-            KLEE_WARN("nested: some mount ops failed: %d", rc);
+        KleeMountTable *table = klee_mount_table_clone(proc->sandbox->mount_table);
+        KleeSandbox *child = klee_sandbox_create();
+        if (!table || !child) {
+            klee_mount_table_destroy(table);
+            klee_sandbox_unref(child);
+            ret = -ENOMEM;
+            goto out;
+        }
+        *child = *proc->sandbox;
+        child->ref_count = 1;
+        child->mount_table = table;
+        child->owns_mount_table = true;
+        const char *hostname = proc->sandbox->hostname;
+        child->hostname = hostname ? strdup(hostname) : NULL;
+        rc = hostname && !child->hostname ? -ENOMEM
+                                         : apply_nested_mounts(proc, table, &nested_cfg, pid);
+        if (rc < 0) {
+            klee_sandbox_unref(child);
+            ret = rc;
+            goto out;
+        }
+        proc->exec_previous_sandbox = proc->sandbox;
+        proc->sandbox = child;
 
         /* Create host-side mirrors for /run/host mounts added by nested config */
         klee_mount_table_create_host_mirrors(proc->sandbox->mount_table);
@@ -775,6 +837,8 @@ int klee_nested_handle_exec(KleeProcess *proc, KleeInterceptor *ic,
     snprintf(proc->vexe, PATH_MAX, "%s", target_abs);
 
 out:
+    if (ret < 0)
+        klee_process_finish_mount_exec(proc, false);
     if (cfg_inited)
         klee_config_destroy(&nested_cfg);
     free_argv(new_envp, new_envc);

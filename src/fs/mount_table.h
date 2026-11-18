@@ -12,6 +12,7 @@
 #include <stdbool.h>
 #include <sys/types.h>
 #include <linux/limits.h>
+#include <stdint.h>
 
 typedef struct klee_mount {
     MountType type;
@@ -22,6 +23,8 @@ typedef struct klee_mount {
     int perms;
     struct klee_mount *stacked;  /* shadow stack for overlapping mounts */
     KleeOverlayMount *overlay;  /* overlay state (for overlay mounts) */
+    char *overlay_prefix;       /* relative root of a bind into an overlay */
+    uint64_t id;                /* stable across inherited views */
 } KleeMount;
 
 typedef struct klee_mount_table {
@@ -33,6 +36,7 @@ typedef struct klee_mount_table {
 
 /* Create a new mount table */
 KleeMountTable *klee_mount_table_create(void);
+KleeMountTable *klee_mount_table_clone(const KleeMountTable *mt);
 
 /* Destroy mount table */
 void klee_mount_table_destroy(KleeMountTable *mt);
@@ -49,6 +53,8 @@ int klee_mount_table_add(KleeMountTable *mt, MountType type,
  * Returns the mount entry, or NULL if no mount matches. */
 KleeMount *klee_mount_table_resolve(const KleeMountTable *mt,
                                      const char *guest_path);
+int klee_mount_table_overlay_relative(const KleeMountTable *mt, const char *guest_path,
+                                       char *relative, size_t size);
 
 /* Translate a guest path to a host path.
  * Performs prefix substitution based on the best matching mount.

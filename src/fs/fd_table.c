@@ -98,6 +98,8 @@ int klee_fd_table_set(KleeFdTable *ft, int fd, const char *virtual_path,
     if (existing) {
         snprintf(existing->virtual_path, PATH_MAX, "%s", virtual_path);
         existing->cloexec = cloexec;
+        existing->overlay_mount = 0;
+        existing->overlay_upper = false;
         return 0;
     }
 
@@ -108,6 +110,8 @@ int klee_fd_table_set(KleeFdTable *ft, int fd, const char *virtual_path,
     e->fd = fd;
     snprintf(e->virtual_path, PATH_MAX, "%s", virtual_path);
     e->cloexec = cloexec;
+    e->overlay_mount = 0;
+    e->overlay_upper = false;
 
     int bucket = fd_hash(fd);
     e->next = ft->buckets[bucket];
@@ -123,6 +127,22 @@ const char *klee_fd_table_get(const KleeFdTable *ft, int fd)
 
     KleeFdEntry *e = find_entry(ft, fd);
     return e ? e->virtual_path : NULL;
+}
+
+void klee_fd_table_set_overlay(KleeFdTable *ft, int fd, uint64_t mount, bool upper)
+{
+    KleeFdEntry *entry = ft ? find_entry(ft, fd) : NULL;
+    if (entry) {
+        entry->overlay_mount = mount;
+        entry->overlay_upper = upper;
+    }
+}
+
+void klee_fd_table_get_overlay(const KleeFdTable *ft, int fd, uint64_t *mount, bool *upper)
+{
+    KleeFdEntry *entry = ft ? find_entry(ft, fd) : NULL;
+    *mount = entry ? entry->overlay_mount : 0;
+    *upper = entry && entry->overlay_upper;
 }
 
 bool klee_fd_table_is_cloexec(const KleeFdTable *ft, int fd)
@@ -180,7 +200,13 @@ int klee_fd_table_dup(KleeFdTable *ft, int old_fd, int new_fd, bool cloexec)
     }
 
     /* old_fd != new_fd, so updating new_fd's entry leaves path intact */
-    return klee_fd_table_set(ft, new_fd, path, cloexec);
+    uint64_t mount;
+    bool upper;
+    klee_fd_table_get_overlay(ft, old_fd, &mount, &upper);
+    int rc = klee_fd_table_set(ft, new_fd, path, cloexec);
+    if (rc == 0)
+        klee_fd_table_set_overlay(ft, new_fd, mount, upper);
+    return rc;
 }
 
 void klee_fd_table_exec(KleeFdTable *ft)

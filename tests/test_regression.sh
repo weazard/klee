@@ -30,6 +30,8 @@
 #  23. statx shows the virtual owner
 #  24. dup2(fd, fd) and dup2 of an untracked fd keep descriptor paths right
 #  25. Writable overlays never modify their lower layers
+#  26. creat and fstatat with AT_EMPTY_PATH translate nonempty guest paths
+#  27. Writable overlays recover persisted name changes and support nested binds
 set -e
 
 KLEE="${KLEE:-./klee}"
@@ -355,21 +357,29 @@ fi
 # (root containers included).  Expect: virtual uid == real uid, except
 # real root maps to 1000 (Chrome refuses euid 0).
 # ---------------------------------------------------------------------------
-echo "--- Zypak true-positive: virtual uid tracks real uid ---"
+echo "--- Zypak true-positive: virtual IDs track host credentials ---"
 FAKEAPP=$(mktemp -d /tmp/klee-zypakapp.XXXXXX)
 mkdir -p "$FAKEAPP/bin"
 printf "#!/bin/sh\nexit 0\n" > "$FAKEAPP/bin/zypak-helper"
 chmod +x "$FAKEAPP/bin/zypak-helper"
 real_uid=$(id -u)
-want=$real_uid
-[ "$real_uid" = "0" ] && want=1000
-got=$($KLEE --bind / / --bind "$FAKEAPP" /app -- /usr/bin/id -u 2>/dev/null || true)
-rm -rf "$FAKEAPP"
+want="$real_uid:$(id -g)"
+[ "$real_uid" = "0" ] && want=1000:1000
+got=$($KLEE --bind / / --bind "$FAKEAPP" /app -- /bin/sh -c \
+      'printf "%s:%s" "$(id -u)" "$(id -g)"' 2>/dev/null || true)
 if [ "$got" = "$want" ]; then
-    pass "zypak virtual uid == $want (real=$real_uid)"
+    pass "Zypak default IDs match $want"
 else
-    fail "zypak virtual uid (got: '$got', want: $want, real: $real_uid)"
+    fail "Zypak default IDs (got: '$got', want: $want)"
 fi
+got=$($KLEE --bind / / --bind "$FAKEAPP" /app --uid 2345 --gid 3456 -- /bin/sh -c \
+      'printf "%s:%s" "$(id -u)" "$(id -g)"' 2>/dev/null || true)
+if [ "$got" = "2345:3456" ]; then
+    pass "Zypak preserves explicit UID and GID"
+else
+    fail "Zypak explicit IDs (got: '$got', want: 2345:3456)"
+fi
+rm -rf "$FAKEAPP"
 
 
 # ---------------------------------------------------------------------------
@@ -1007,6 +1017,51 @@ else
     fail "--overlay (got: $out)"
 fi
 rm -rf "$OV"
+
+# ---------------------------------------------------------------------------
+# Fix 26: creat skipped path translation. fstatat with AT_EMPTY_PATH also
+# skipped it for nonempty paths, including paths relative to a guest dirfd.
+# ---------------------------------------------------------------------------
+echo "--- creat and fstatat translate guest paths ---"
+if command -v cc >/dev/null 2>&1; then
+    SP=$(mktemp -d /tmp/klee-path-syscalls.XXXXXX)
+    mkdir "$SP/writable"
+    printf 'keep\n' > "$SP/entry"
+    ln -s entry "$SP/writable/link"
+    if cc -std=c11 -Wall -Wextra -o "$SP/probe" tests/test_path_syscalls.c; then
+        if out=$($KLEE --bind / / --bind "$SP/writable" "$SP/view" \
+                  --ro-bind "$SP/entry" "$SP/view/entry" -- "$SP/probe" \
+                  creat "$SP/view/created" "$SP/view/entry" 2>&1) &&
+           [ -f "$SP/writable/created" ] && [ "$(cat "$SP/entry")" = "keep" ]; then
+            pass "creat translates creation and truncation and respects read-only binds"
+        else
+            fail "creat guest path (got: $out)"
+        fi
+        if out=$($KLEE --bind / / --bind "$SP/writable" "$SP/view" \
+                  --ro-bind "$SP/entry" "$SP/view/entry" -- "$SP/probe" \
+                  fstatat "$SP/view" "$SP/view/entry" 2>&1); then
+            pass "fstatat translates nonempty paths and preserves empty-path semantics"
+        else
+            fail "fstatat AT_EMPTY_PATH (got: $out)"
+        fi
+    else
+        fail "compile creat and fstatat probe"
+    fi
+    rm -rf "$SP"
+else
+    echo "  SKIP: C compiler unavailable (creat and fstatat test)"
+fi
+
+echo "--- Persistent overlay namespace and nested binds ---"
+if command -v python3 >/dev/null 2>&1; then
+    if out=$(python3 tests/test_overlay_persistence.py "$KLEE" 2>&1); then
+        pass "persistent overlay mutations and nested mounts"
+    else
+        fail "persistent overlay (got: $out)"
+    fi
+else
+    echo "  SKIP: python3 unavailable (persistent overlay test)"
+fi
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
