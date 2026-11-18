@@ -356,21 +356,29 @@ fi
 # (root containers included).  Expect: virtual uid == real uid, except
 # real root maps to 1000 (Chrome refuses euid 0).
 # ---------------------------------------------------------------------------
-echo "--- Zypak true-positive: virtual uid tracks real uid ---"
+echo "--- Zypak true-positive: virtual IDs track host credentials ---"
 FAKEAPP=$(mktemp -d /tmp/klee-zypakapp.XXXXXX)
 mkdir -p "$FAKEAPP/bin"
 printf "#!/bin/sh\nexit 0\n" > "$FAKEAPP/bin/zypak-helper"
 chmod +x "$FAKEAPP/bin/zypak-helper"
 real_uid=$(id -u)
-want=$real_uid
-[ "$real_uid" = "0" ] && want=1000
-got=$($KLEE --bind / / --bind "$FAKEAPP" /app -- /usr/bin/id -u 2>/dev/null || true)
-rm -rf "$FAKEAPP"
+want="$real_uid:$(id -g)"
+[ "$real_uid" = "0" ] && want=1000:1000
+got=$($KLEE --bind / / --bind "$FAKEAPP" /app -- /bin/sh -c \
+      'printf "%s:%s" "$(id -u)" "$(id -g)"' 2>/dev/null || true)
 if [ "$got" = "$want" ]; then
-    pass "zypak virtual uid == $want (real=$real_uid)"
+    pass "Zypak default IDs match $want"
 else
-    fail "zypak virtual uid (got: '$got', want: $want, real: $real_uid)"
+    fail "Zypak default IDs (got: '$got', want: $want)"
 fi
+got=$($KLEE --bind / / --bind "$FAKEAPP" /app --uid 2345 --gid 3456 -- /bin/sh -c \
+      'printf "%s:%s" "$(id -u)" "$(id -g)"' 2>/dev/null || true)
+if [ "$got" = "2345:3456" ]; then
+    pass "Zypak preserves explicit UID and GID"
+else
+    fail "Zypak explicit IDs (got: '$got', want: 2345:3456)"
+fi
+rm -rf "$FAKEAPP"
 
 
 # ---------------------------------------------------------------------------
