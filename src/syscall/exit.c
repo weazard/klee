@@ -14,11 +14,14 @@
 #include "ns/user_ns.h"
 #include "ns/uts_ns.h"
 #include "ns/ipc_ns.h"
+#include "fs/path_resolve.h"
 #include "compat/zypak_compat.h"
 #include "util/log.h"
 
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
+#include <stdio.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,6 +33,8 @@
 #include <sys/utsname.h>
 #include <sys/ioctl.h>
 #include <sys/prctl.h>
+#include <linux/close_range.h>
+#include <sched.h>
 
 /* ==================== Filesystem Exit Handlers ==================== */
 
@@ -215,60 +220,24 @@ int klee_exit_statx(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     return 0;
 }
 
-/* Check if a saved path is /proc/self/exe or /proc/<pid>/exe */
-static bool is_proc_exe_readlink(const char *path)
-{
-    if (strncmp(path, "/proc/", 6) != 0)
-        return false;
-    const char *p = path + 6;
-    if (strcmp(p, "self/exe") == 0)
-        return true;
-    /* /proc/<pid>/exe */
-    if (*p >= '1' && *p <= '9') {
-        while (*p >= '0' && *p <= '9')
-            p++;
-        return strcmp(p, "/exe") == 0;
-    }
-    return false;
-}
-
 int klee_exit_readlink(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
     if (ev->retval <= 0)
         return 0;
+    const char *exe = klee_process_exe_at(proc, proc->resolved_guest);
+    if (!exe)
+        return 0;
 
-    /* If this was a /proc/self/exe or /proc/<pid>/exe readlink, rewrite
-     * the result with the virtual exe path (proc->vexe).
-     *
-     * The exec interpreter handler rewrites execve to invoke ld-linux as
-     * the actual binary, so the kernel's /proc/self/exe points to ld-linux
-     * instead of the real program.  This breaks programs like Chromium that
-     * use readlink("/proc/self/exe") to find their data directory. */
-    if (proc->vexe[0] && proc->sandbox &&
-        is_proc_exe_readlink(proc->saved_path)) {
-        void *buf_addr;
-        size_t bufsiz;
-        if (ev->syscall_nr == KLEE_SYS_readlink) {
-            buf_addr = (void *)(uintptr_t)ev->args[1];
-            bufsiz = (size_t)ev->args[2];
-        } else { /* readlinkat */
-            buf_addr = (void *)(uintptr_t)ev->args[2];
-            bufsiz = (size_t)ev->args[3];
-        }
-
-        size_t vexe_len = strlen(proc->vexe);
-        if (vexe_len > bufsiz)
-            vexe_len = bufsiz;
-
-        int rc = klee_write_mem(ic, ev->pid, buf_addr, proc->vexe, vexe_len);
-        if (rc == 0) {
-            ev->retval = (long)vexe_len;
-            KLEE_TRACE("readlink exe: rewritten to %s", proc->vexe);
-            return 1; /* retval modified */
-        }
-    }
-
-    return 0;
+    int buf_arg = ev->syscall_nr == KLEE_SYS_readlink ? 1 : 2;
+    void *buf = (void *)(uintptr_t)ev->args[buf_arg];
+    size_t len = strlen(exe);
+    size_t buf_size = (size_t)ev->args[buf_arg + 1];
+    if (len > buf_size)
+        len = buf_size;
+    if (klee_write_mem(ic, ev->pid, buf, exe, len) < 0)
+        return 0;
+    ev->retval = (long)len;
+    return 1;
 }
 
 int klee_exit_chdir(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
@@ -277,7 +246,20 @@ int klee_exit_chdir(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     if (ev->retval == 0) {
         /* Update virtual CWD from the resolved absolute guest path,
          * not the raw (possibly relative) tracee path in saved_path. */
-        snprintf(proc->vcwd, PATH_MAX, "%s", proc->resolved_guest);
+        if (strncmp(proc->resolved_guest, "/proc/", 6) == 0 &&
+            strcmp(strrchr(proc->resolved_guest, '/'), "/cwd") == 0) {
+            char path[64], host[PATH_MAX];
+            snprintf(path, sizeof(path), "/proc/%d/cwd", proc->real_pid);
+            ssize_t n = readlink(path, host, sizeof(host));
+            proc->vcwd[0] = '\0';
+            if (n > 0 && n < (ssize_t)sizeof(host)) {
+                host[n] = '\0';
+                klee_mount_table_host_to_guest(proc->sandbox->mount_table, host,
+                                                proc->vcwd, PATH_MAX);
+            }
+        } else {
+            snprintf(proc->vcwd, PATH_MAX, "%s", proc->resolved_guest);
+        }
         KLEE_DEBUG("chdir: vcwd now %s", proc->vcwd);
     }
     return 0;
@@ -287,19 +269,20 @@ int klee_exit_fchdir(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
     (void)ic;
     if (ev->retval == 0) {
-        int fd = (int)ev->args[0];
-        const char *path = klee_fd_table_get(proc->fd_table, fd);
-        if (path) {
-            snprintf(proc->vcwd, PATH_MAX, "%s", path);
-            KLEE_DEBUG("fchdir: vcwd now %s", proc->vcwd);
-        }
+        KleeResolveCtx ctx = {
+            .mount_table = proc->sandbox ? proc->sandbox->mount_table : NULL,
+            .fd_table = proc->fd_table,
+            .tracee_pid = proc->real_pid,
+        };
+        if (klee_path_dirfd(&ctx, (int)ev->args[0], proc->vcwd) < 0)
+            proc->vcwd[0] = '\0';
     }
     return 0;
 }
 
 int klee_exit_getcwd(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    if (ev->retval <= 0)
+    if (!proc->vcwd[0] || (ev->retval <= 0 && ev->retval != -ERANGE))
         return 0;
 
     /* Overwrite the returned CWD with our virtual CWD */
@@ -307,14 +290,38 @@ int klee_exit_getcwd(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     size_t buf_len = (size_t)ev->args[1];
 
     size_t vcwd_len = strlen(proc->vcwd) + 1;
-    if (vcwd_len > buf_len)
-        return 0; /* Buffer too small */
-
-    ic->write_mem(ic, ev->pid, buf, proc->vcwd, vcwd_len);
-    return 0;
+    if (vcwd_len > buf_len) {
+        ev->retval = -ERANGE;
+    } else {
+        int rc = klee_write_mem(ic, ev->pid, buf, proc->vcwd, vcwd_len);
+        if (rc == 0 && ev->retval == (long)vcwd_len)
+            return 0;
+        ev->retval = rc == 0 ? (long)vcwd_len : -EFAULT;
+    }
+    return 1;
 }
 
 /* ==================== FD Tracking Exit Handlers ==================== */
+
+int klee_exit_close_range(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+{
+    (void)ic;
+    if (ev->retval < 0)
+        return 0;
+    unsigned flags = (unsigned)ev->args[2];
+    if (flags & CLOSE_RANGE_UNSHARE) {
+        klee_process_unshare(proc, CLONE_FILES);
+        if (proc->fd_table && proc->fd_table->refs > 1) {
+            /* Allocation failed after the kernel split the table. Recover
+             * dirfd paths from /proc instead of mutating a sibling's table. */
+            klee_fd_table_destroy(proc->fd_table);
+            proc->fd_table = NULL;
+        }
+    }
+    klee_fd_table_close_range(proc->fd_table, (unsigned)ev->args[0],
+                                (unsigned)ev->args[1], (flags & CLOSE_RANGE_CLOEXEC) != 0);
+    return 0;
+}
 
 int klee_exit_dup(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
@@ -418,9 +425,7 @@ int klee_exit_getppid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
      * that is expected and reads as 0; any other process has been orphaned
      * and reparented to klee, the subreaper, which in a real namespace
      * makes it init's. */
-    pid_t tgid = proc->real_pid;
-    klee_proc_status_ids(proc->real_pid, &tgid, NULL);
-    ev->retval = klee_pid_map_is_init(proc->sandbox->pid_map, tgid) ? 0 : 1;
+    ev->retval = klee_pid_map_is_init(proc->sandbox->pid_map, proc->real_tgid) ? 0 : 1;
     return 1;
 }
 
@@ -479,14 +484,7 @@ int klee_exit_ioctl(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 
     unsigned long request = ev->args[1];
 
-    if (request == TIOCSPGRP) {
-        /* Restore the original virtual pgid in tracee memory so the
-         * tracee's copy isn't left containing the real pgid. */
-        void *pgid_ptr = (void *)(uintptr_t)ev->args[2];
-        pid_t vpgid = (pid_t)(uintptr_t)proc->saved_args[2];
-        if (vpgid > 0)
-            ic->write_mem(ic, ev->pid, pgid_ptr, &vpgid, sizeof(vpgid));
-    } else if (request == TIOCGPGRP || request == TIOCGSID) {
+    if (request == TIOCGPGRP || request == TIOCGSID) {
         /* tcgetpgrp / TIOCGSID: kernel wrote a real pgid/sid into the
          * tracee's buffer.  Translate it to a virtual PID. */
         if (ev->retval < 0)
@@ -508,120 +506,81 @@ int klee_exit_ioctl(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     return 0;
 }
 
-/* ==================== /proc getdents64 Filtering ==================== */
-
-int klee_exit_getdents64(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
+int klee_exit_getdents(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 {
-    if (ev->retval <= 0)
+    if (ev->retval <= 0 || !proc->sandbox || !proc->sandbox->unshare_pid ||
+        !proc->sandbox->pid_map)
         return 0;
 
-    if (!proc->sandbox || !proc->sandbox->unshare_pid || !proc->sandbox->pid_map)
+    const char *path = klee_fd_table_get(proc->fd_table, (int)ev->args[0]);
+    if (!path || strcmp(path, "/proc") != 0)
         return 0;
 
-    /* Only filter the top-level /proc directory */
-    int dirfd = (int)ev->args[0];
-    const char *vpath = klee_fd_table_get(proc->fd_table, dirfd);
-    if (!vpath || strcmp(vpath, "/proc") != 0)
-        return 0;
-
-    size_t buf_len = (size_t)ev->retval;
-    if (buf_len > 65536)
-        return 0;
-
-    void *dirp_addr = (void *)(uintptr_t)ev->args[1];
-
-    uint8_t *in_buf = malloc(buf_len);
-    uint8_t *out_buf = malloc(buf_len);
-    if (!in_buf || !out_buf) {
-        free(in_buf);
-        free(out_buf);
-        return 0;
+    size_t len = (size_t)ev->retval;
+    unsigned char *buf = malloc(len);
+    if (!buf) {
+        ev->retval = -ENOMEM;
+        return 1;
     }
+    void *remote = (void *)(uintptr_t)ev->args[1];
+    int rc = klee_read_mem(ic, ev->pid, buf, remote, len);
+    if (rc < 0)
+        goto out;
 
-    int rc = klee_read_mem(ic, ev->pid, in_buf, dirp_addr, buf_len);
-    if (rc < 0) {
-        free(in_buf);
-        free(out_buf);
-        return 0;
-    }
-
-    /*
-     * linux_dirent64 layout:
-     *   uint64_t d_ino;      (0)
-     *   int64_t  d_off;      (8)
-     *   uint16_t d_reclen;   (16)
-     *   uint8_t  d_type;     (18)
-     *   char     d_name[];   (19)
-     */
-    size_t in_pos = 0;
-    size_t out_pos = 0;
-
-    while (in_pos + 19 < buf_len) {
+    bool wide = ev->syscall_nr == KLEE_SYS_getdents64;
+    size_t reclen_offset = wide ? 16 : 2 * klee_abi_ptr_size(proc->abi);
+    size_t name_offset = reclen_offset + (wide ? 3 : 2);
+    size_t in = 0, out = 0;
+    while (in < len) {
+        if (len - in <= name_offset) {
+            rc = -EIO;
+            goto out;
+        }
         uint16_t reclen;
-        memcpy(&reclen, in_buf + in_pos + 16, 2);
-        if (reclen < 19 || in_pos + reclen > buf_len)
-            break;
-
-        char *d_name = (char *)(in_buf + in_pos + 19);
-        size_t name_max = reclen - 19;
-
-        /* Check if entry name is purely numeric (a PID directory) */
-        bool is_numeric = (d_name[0] != '\0');
-        for (size_t i = 0; i < name_max && d_name[i]; i++) {
-            if (!isdigit((unsigned char)d_name[i])) {
-                is_numeric = false;
-                break;
-            }
+        memcpy(&reclen, buf + in + reclen_offset, sizeof(reclen));
+        if (reclen <= name_offset || reclen > len - in) {
+            rc = -EIO;
+            goto out;
         }
-
-        if (!is_numeric) {
-            /* Non-PID entry: copy as-is */
-            memcpy(out_buf + out_pos, in_buf + in_pos, reclen);
-            out_pos += reclen;
-        } else {
-            pid_t real_pid = (pid_t)atoi(d_name);
-            pid_t vpid = klee_pid_map_r2v(proc->sandbox->pid_map, real_pid);
-
-            if (vpid > 0) {
-                /* Translate: rewrite name to virtual PID */
-                char vpid_str[16];
-                int vpid_len = snprintf(vpid_str, sizeof(vpid_str), "%d", vpid);
-
-                /* New reclen: header(19) + name + null, 8-byte aligned */
-                size_t new_reclen = (19 + (size_t)vpid_len + 1 + 7) & ~(size_t)7;
-
-                if (out_pos + new_reclen <= buf_len) {
-                    memset(out_buf + out_pos, 0, new_reclen);
-                    /* Copy header (d_ino, d_off, d_type) */
-                    memcpy(out_buf + out_pos, in_buf + in_pos, 18);
-                    out_buf[out_pos + 18] = in_buf[in_pos + 18]; /* d_type */
-                    /* Write new reclen */
-                    uint16_t nr = (uint16_t)new_reclen;
-                    memcpy(out_buf + out_pos + 16, &nr, 2);
-                    /* Write translated name */
-                    memcpy(out_buf + out_pos + 19, vpid_str, (size_t)vpid_len + 1);
-                    out_pos += new_reclen;
-                }
-            }
-            /* else: PID not in namespace, filter out */
+        char *name = (char *)buf + in + name_offset;
+        size_t space = reclen - name_offset - (wide ? 0 : 1);
+        const char *end = memchr(name, '\0', space);
+        if (!end) {
+            rc = -EIO;
+            goto out;
         }
-
-        in_pos += reclen;
+        pid_t real = 0;
+        bool numeric = end != name;
+        for (const char *p = name; numeric && p < end; p++) {
+            if (!isdigit((unsigned char)*p) || real > (INT_MAX - 9) / 10)
+                numeric = false;
+            else
+                real = real * 10 + (*p - '0');
+        }
+        pid_t visible = numeric ? klee_pid_map_r2v(proc->sandbox->pid_map, real) : 0;
+        if (!numeric || visible > 0) {
+            if (visible > 0 && visible != real)
+                snprintf(name, space, "%d", visible);
+            memmove(buf + out, buf + in, reclen);
+            out += reclen;
+        }
+        in += reclen;
     }
 
-    /* Write filtered buffer back to tracee */
-    if (out_pos > 0) {
-        rc = klee_write_mem(ic, ev->pid, dirp_addr, out_buf, out_pos);
-        if (rc < 0) {
-            free(in_buf);
-            free(out_buf);
-            return 0;
-        }
+    if (out == 0) {
+        /* The directory offset advanced past this batch. Keep reading
+         * until the caller gets an entry or the kernel reports EOF. */
+        ev->repeat_syscall = true;
+        free(buf);
+        return 0;
     }
-
-    ev->retval = (long)out_pos;
-    free(in_buf);
-    free(out_buf);
+    rc = klee_write_mem(ic, ev->pid, remote, buf, out);
+    if (rc == 0)
+        ev->retval = (long)out;
+out:
+    free(buf);
+    if (rc < 0)
+        ev->retval = rc == -EIO ? -EIO : -EFAULT;
     return 1;
 }
 
@@ -634,7 +593,7 @@ int klee_exit_getuid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
         return 0;
     if (proc->skip_uid_virt)
         return 0;
-    ev->retval = proc->id_state->ruid;
+    ev->retval = klee_abi_id_result(proc, proc->id_state->ruid);
     return 1;
 }
 
@@ -645,7 +604,7 @@ int klee_exit_geteuid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
         return 0;
     if (proc->skip_uid_virt)
         return 0;
-    ev->retval = proc->id_state->euid;
+    ev->retval = klee_abi_id_result(proc, proc->id_state->euid);
     return 1;
 }
 
@@ -656,7 +615,7 @@ int klee_exit_getgid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
         return 0;
     if (proc->skip_uid_virt)
         return 0;
-    ev->retval = proc->id_state->rgid;
+    ev->retval = klee_abi_id_result(proc, proc->id_state->rgid);
     return 1;
 }
 
@@ -667,7 +626,7 @@ int klee_exit_getegid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
         return 0;
     if (proc->skip_uid_virt)
         return 0;
-    ev->retval = proc->id_state->egid;
+    ev->retval = klee_abi_id_result(proc, proc->id_state->egid);
     return 1;
 }
 
@@ -685,9 +644,9 @@ int klee_exit_getresuid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     uid_t euid = proc->id_state->euid;
     uid_t suid = proc->id_state->suid;
 
-    ic->write_mem(ic, ev->pid, (void *)(uintptr_t)ev->args[0], &ruid, sizeof(ruid));
-    ic->write_mem(ic, ev->pid, (void *)(uintptr_t)ev->args[1], &euid, sizeof(euid));
-    ic->write_mem(ic, ev->pid, (void *)(uintptr_t)ev->args[2], &suid, sizeof(suid));
+    klee_abi_write_ids(proc, ic, ev->args[0], &ruid, 1);
+    klee_abi_write_ids(proc, ic, ev->args[1], &euid, 1);
+    klee_abi_write_ids(proc, ic, ev->args[2], &suid, 1);
     return 0;
 }
 
@@ -704,22 +663,10 @@ int klee_exit_getresgid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     gid_t egid = proc->id_state->egid;
     gid_t sgid = proc->id_state->sgid;
 
-    ic->write_mem(ic, ev->pid, (void *)(uintptr_t)ev->args[0], &rgid, sizeof(rgid));
-    ic->write_mem(ic, ev->pid, (void *)(uintptr_t)ev->args[1], &egid, sizeof(egid));
-    ic->write_mem(ic, ev->pid, (void *)(uintptr_t)ev->args[2], &sgid, sizeof(sgid));
+    klee_abi_write_ids(proc, ic, ev->args[0], &rgid, 1);
+    klee_abi_write_ids(proc, ic, ev->args[1], &egid, 1);
+    klee_abi_write_ids(proc, ic, ev->args[2], &sgid, 1);
     return 0;
-}
-
-int klee_exit_getgroups(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
-{
-    (void)ic;
-    if (!proc->sandbox || !proc->sandbox->unshare_user)
-        return 0;
-    if (proc->skip_uid_virt)
-        return 0;
-    /* Return single group matching virtual gid */
-    ev->retval = 1;
-    return 1;
 }
 
 /* ==================== UTS Namespace Exit Handler ==================== */
@@ -792,7 +739,7 @@ int klee_exit_prctl(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
     int option = (int)ev->args[0];
 
     /* Fake capability support */
-    if (option == PR_CAPBSET_READ) {
+    if (option == PR_CAPBSET_READ && ev->retval >= 0) {
         if (proc->sandbox && proc->sandbox->unshare_user) {
             ev->retval = 1; /* All capabilities present */
             return 1;
@@ -817,11 +764,15 @@ int klee_exit_getsockopt(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
 
     /* Rewrite SO_PEERCRED */
     if (level == SOL_SOCKET && optname == SO_PEERCRED) {
-        struct ucred cred;
+        struct ucred cred = {0};
         void *optval = (void *)(uintptr_t)ev->args[3];
-
-        int rc = klee_read_mem(ic, ev->pid, &cred, optval, sizeof(cred));
-        if (rc < 0)
+        socklen_t size;
+        if (klee_read_mem(ic, ev->pid, &size, (void *)(uintptr_t)ev->args[4],
+                           sizeof(size)) < 0 || size == 0)
+            return 0;
+        if (size > sizeof(cred))
+            size = sizeof(cred);
+        if (klee_read_mem(ic, ev->pid, &cred, optval, size) < 0)
             return 0;
 
         /* Translate PID and UID/GID */
@@ -846,7 +797,7 @@ int klee_exit_getsockopt(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev)
         if (cred.gid == real_gid)
             cred.gid = proc->id_state->egid;
 
-        ic->write_mem(ic, ev->pid, optval, &cred, sizeof(cred));
+        ic->write_mem(ic, ev->pid, optval, &cred, size);
     }
     return 0;
 }

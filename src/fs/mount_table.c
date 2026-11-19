@@ -86,9 +86,12 @@ static void clone_mounts(const char *path, KleeMount *mount, void *data)
         entry->stacked = NULL;
         entry->source = mount->source ? klee_arena_strdup(copy->arena, mount->source) : NULL;
         entry->dest = klee_arena_strdup(copy->arena, mount->dest);
+        entry->link_path = mount->link_path ?
+            klee_arena_strdup(copy->arena, mount->link_path) : NULL;
         entry->overlay_prefix = mount->overlay_prefix
             ? klee_arena_strdup(copy->arena, mount->overlay_prefix) : NULL;
         if (!entry->dest || (mount->source && !entry->source) ||
+            (mount->link_path && !entry->link_path) ||
             (mount->overlay_prefix && !entry->overlay_prefix)) {
             clone->failed = true;
             return;
@@ -132,6 +135,28 @@ int klee_mount_table_add(KleeMountTable *mt, MountType type,
     mount->perms = perms;
     mount->id = next_mount_id++;
 
+    if (type == MOUNT_SYMLINK) {
+        if (!mt->link_dir) {
+            char *dir = klee_tmpfs_create("virtual symlinks");
+            if (!dir)
+                return -errno;
+            mt->link_dir = klee_arena_strdup(mt->arena, dir);
+            free(dir);
+            if (!mt->link_dir)
+                return -ENOMEM;
+        }
+        char backing[PATH_MAX];
+        int n = snprintf(backing, sizeof(backing), "%s/%llu", mt->link_dir,
+                         (unsigned long long)mount->id);
+        if (n < 0 || (size_t)n >= sizeof(backing))
+            return -ENAMETOOLONG;
+        mount->link_path = klee_arena_strdup(mt->arena, backing);
+        if (!mount->link_path)
+            return -ENOMEM;
+        if (symlink(source, backing) < 0)
+            return -errno;
+    }
+
     RadixNode *node = klee_radix_insert(mt->tree, dest, mount);
     if (!node)
         return -ENOMEM;
@@ -142,213 +167,167 @@ int klee_mount_table_add(KleeMountTable *mt, MountType type,
     return 0;
 }
 
-int klee_mount_table_populate(KleeMountTable *mt, const KleeConfig *cfg)
+static void clear_submounts(KleeMountTable *mt, RadixNode *node)
 {
-    for (KleeMountOp *op = cfg->mount_ops; op; op = op->next) {
-        bool readonly = false;
-        const char *source = op->source;
-        const char *dest = op->dest;
-
-        switch (op->type) {
-        case MOUNT_BIND_RW:
-        case MOUNT_BIND_TRY:
-        case MOUNT_DEV_BIND:
-        case MOUNT_DEV_BIND_TRY:
-            readonly = false;
-            break;
-
-        case MOUNT_BIND_RO:
-        case MOUNT_BIND_RO_TRY:
-            readonly = true;
-            break;
-
-        case MOUNT_TMPFS: {
-            char *tmpfs_path = klee_tmpfs_create(dest);
-            if (!tmpfs_path) {
-                KLEE_WARN("failed to create tmpfs backing for %s", dest);
-                continue;
-            }
-            int rc = klee_mount_table_add(mt, MOUNT_TMPFS, tmpfs_path, dest,
-                                           false, op->perms);
-            if (rc < 0)
-                return rc;
-            continue;
+    for (; node; node = node->sibling) {
+        for (KleeMount *mount = node->mount; mount; mount = mount->stacked) {
+            klee_overlay_destroy(mount->overlay);
+            mt->num_mounts--;
         }
+        node->mount = NULL;
+        clear_submounts(mt, node->children);
+    }
+}
 
-        case MOUNT_PROC:
-            /* /proc is special - backed by real /proc or FUSE */
-            klee_mount_table_add(mt, MOUNT_PROC, "/proc", dest, false, 0755);
+static int add_config_mount(KleeMountTable *mt, MountType type,
+                             const char *source, const char *dest, bool ro, int perms)
+{
+    int rc = klee_mount_table_add(mt, type, source, dest, ro, perms);
+    if (rc == 0)
+        clear_submounts(mt, klee_radix_find_exact(mt->tree, dest)->children);
+    return rc;
+}
+
+static int create_backed_mount(KleeMountTable *mt, MountType type,
+                               const char *dest, int perms)
+{
+    char *path = klee_tmpfs_create(dest);
+    if (!path)
+        return -errno;
+    int rc = chmod(path, perms) < 0 ? -errno :
+             add_config_mount(mt, type, path, dest, false, perms);
+    free(path);
+    return rc;
+}
+
+static int ensure_directory(KleeMountTable *mt, const char *dest, mode_t mode)
+{
+    char guest[PATH_MAX];
+    if (snprintf(guest, sizeof(guest), "%s", dest) >= (int)sizeof(guest))
+        return -ENAMETOOLONG;
+    for (char *end = guest + 1; ; end++) {
+        if (*end && *end != '/')
             continue;
+        char saved = *end;
+        *end = '\0';
 
-        case MOUNT_DEV:
-        {
-            /* Create a curated /dev matching bwrap's behavior:
-             * tmpfs-backed dir with only specific device nodes and symlinks */
-            char *dev_path = klee_tmpfs_create(dest);
-            if (!dev_path) {
-                KLEE_WARN("failed to create /dev backing for %s", dest);
-                continue;
-            }
-            klee_mount_table_add(mt, MOUNT_DEV, dev_path, dest, false, 0755);
-
-            /* Bind-mount device nodes from host /dev */
-            static const char *dev_nodes[] = {
-                "null", "zero", "full", "random", "urandom", "tty"
-            };
-            for (size_t d = 0; d < sizeof(dev_nodes)/sizeof(dev_nodes[0]); d++) {
-                char host_dev[PATH_MAX], guest_dev[PATH_MAX];
-                snprintf(host_dev, sizeof(host_dev), "/dev/%s", dev_nodes[d]);
-                snprintf(guest_dev, sizeof(guest_dev), "%s/%s", dest, dev_nodes[d]);
-                klee_mount_table_add(mt, MOUNT_DEV_BIND, host_dev, guest_dev,
-                                      false, 0666);
-            }
-
-            /* Create stdio symlinks */
-            char sl_path[PATH_MAX];
-            snprintf(sl_path, sizeof(sl_path), "%s/stdin", dest);
-            klee_mount_table_add(mt, MOUNT_SYMLINK, "/proc/self/fd/0", sl_path,
-                                  false, 0777);
-            snprintf(sl_path, sizeof(sl_path), "%s/stdout", dest);
-            klee_mount_table_add(mt, MOUNT_SYMLINK, "/proc/self/fd/1", sl_path,
-                                  false, 0777);
-            snprintf(sl_path, sizeof(sl_path), "%s/stderr", dest);
-            klee_mount_table_add(mt, MOUNT_SYMLINK, "/proc/self/fd/2", sl_path,
-                                  false, 0777);
-            /* Legacy symlinks */
-            snprintf(sl_path, sizeof(sl_path), "%s/fd", dest);
-            klee_mount_table_add(mt, MOUNT_SYMLINK, "/proc/self/fd", sl_path,
-                                  false, 0777);
-            snprintf(sl_path, sizeof(sl_path), "%s/core", dest);
-            klee_mount_table_add(mt, MOUNT_SYMLINK, "/proc/kcore", sl_path,
-                                  false, 0777);
-
-            /* Create /dev/shm and /dev/pts directories */
-            char sub_path[PATH_MAX];
-            snprintf(sub_path, sizeof(sub_path), "%s/shm", dev_path);
-            mkdir(sub_path, 0755);
-            snprintf(sub_path, sizeof(sub_path), "%s/pts", dev_path);
-            mkdir(sub_path, 0755);
-
-            /* ptmx -> pts/ptmx symlink */
-            snprintf(sl_path, sizeof(sl_path), "%s/ptmx", dest);
-            klee_mount_table_add(mt, MOUNT_SYMLINK, "pts/ptmx", sl_path,
-                                  false, 0777);
-            continue;
-        }
-
-        case MOUNT_DIR:
-            /* Create empty directory backed by tmpfs */
-        {
-            char *dir_path = klee_tmpfs_create(dest);
-            if (dir_path)
-                klee_mount_table_add(mt, MOUNT_DIR, dir_path, dest,
-                                      false, op->perms);
-            continue;
-        }
-
-        case MOUNT_SYMLINK:
-            klee_mount_table_add(mt, MOUNT_SYMLINK, source, dest, false, 0777);
-            continue;
-
-        case MOUNT_FILE:
-        case MOUNT_BIND_DATA:
-        case MOUNT_RO_BIND_DATA:
-        {
-            char *file_path = klee_tmpfs_create_file(dest, op->fd);
-            if (file_path) {
-                bool ro = (op->type == MOUNT_RO_BIND_DATA);
-                klee_mount_table_add(mt, op->type, file_path, dest,
-                                      ro, op->perms);
-            }
-            continue;
-        }
-
-        case MOUNT_REMOUNT_RO:
-        {
-            /* Find existing mount and set readonly */
-            KleeMount *existing = klee_mount_table_resolve(mt, dest);
-            if (existing)
-                existing->is_readonly = true;
-            else
-                KLEE_WARN("remount-ro: no mount at %s", dest);
-            continue;
-        }
-
-        case MOUNT_CHMOD:
-        {
-            /* Change permissions on existing mount */
-            KleeMount *existing = klee_mount_table_resolve(mt, dest);
-            if (existing)
-                existing->perms = op->perms;
-            continue;
-        }
-
-        case MOUNT_OVERLAY_SRC:
-            /* Overlay source is just collected for later use by --overlay */
-            continue;
-
-        case MOUNT_OVERLAY:
-        case MOUNT_TMP_OVERLAY:
-        case MOUNT_RO_OVERLAY:
-        {
-            bool ro = op->type == MOUNT_RO_OVERLAY;
-            const char *upper = op->type == MOUNT_OVERLAY ? source : NULL;
-            if (op->type == MOUNT_OVERLAY && !upper)
-                return -EINVAL;
-            KleeOverlayMount *ov = klee_overlay_create(
-                dest, upper, op->overlay_srcs, op->overlay_src_count, ro);
-            if (!ov) {
-                int error = errno;
-                KLEE_ERROR("overlay setup for %s failed: %s", dest, strerror(error));
-                return -error;
-            }
-            int rc = klee_mount_table_add(mt, op->type, ov->merged_dir, dest, ro, op->perms);
-            if (rc < 0) {
-                klee_overlay_destroy(ov);
-                return rc;
-            }
-            klee_mount_table_resolve(mt, dest)->overlay = ov;
-            continue;
-        }
-
-        case MOUNT_MQUEUE:
-            /* Mount mqueue backed by tmpfs for now */
-        {
-            char *mq_path = klee_tmpfs_create(dest);
-            if (mq_path)
-                klee_mount_table_add(mt, MOUNT_MQUEUE, mq_path, dest,
-                                      false, op->perms);
-            continue;
-        }
-
-        case MOUNT_BIND_FD:
-        case MOUNT_RO_BIND_FD:
-        {
-            /* FD-based bind mount - read path from /proc/self/fd/N */
-            char fd_path[64];
-            char resolved[PATH_MAX];
-            snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", op->fd);
-            ssize_t len = readlink(fd_path, resolved, sizeof(resolved) - 1);
-            if (len > 0) {
-                resolved[len] = '\0';
-                bool ro = (op->type == MOUNT_RO_BIND_FD);
-                klee_mount_table_add(mt, op->type, resolved, dest,
-                                      ro, op->perms);
-            } else {
-                KLEE_WARN("bind-fd: cannot resolve fd %d", op->fd);
-            }
-            continue;
-        }
-        }
-
-        int rc = klee_mount_table_add(mt, op->type, source, dest,
-                                       readonly, op->perms);
-        if (rc < 0 && op->type != MOUNT_BIND_TRY &&
-            op->type != MOUNT_BIND_RO_TRY &&
-            op->type != MOUNT_DEV_BIND_TRY) {
+        char host[PATH_MAX];
+        int rc = klee_mount_table_translate(mt, guest, host, sizeof(host));
+        if (rc < 0)
             return rc;
+        struct stat st;
+        if (stat(host, &st) == 0) {
+            if (!S_ISDIR(st.st_mode))
+                return -ENOTDIR;
+        } else {
+            if (errno != ENOENT)
+                return -errno;
+            if (klee_mount_table_is_readonly(mt, guest))
+                return -EROFS;
+
+            mode_t perms = saved ? 0755 : mode;
+            if (!klee_mount_table_resolve(mt, guest)) {
+                char *backing = klee_tmpfs_create(guest);
+                if (!backing)
+                    return -errno;
+                rc = chmod(backing, perms) < 0 ? -errno :
+                     klee_mount_table_add(mt, MOUNT_DIR, backing, guest, false, perms);
+                free(backing);
+                if (rc < 0)
+                    return rc;
+            } else {
+                rc = klee_mount_table_translate_access(mt, guest, host, sizeof(host),
+                                                        KLEE_OV_CREATE);
+                if (rc < 0)
+                    return rc;
+                if (mkdir(host, perms) < 0) {
+                    if (errno != EEXIST || stat(host, &st) < 0 || !S_ISDIR(st.st_mode))
+                        return -errno;
+                } else if (chmod(host, perms) < 0) {
+                    return -errno;
+                }
+            }
         }
-        if (rc == 0 && op->overlay_alias) {
+
+        *end = saved;
+        if (!saved)
+            return 0;
+    }
+}
+
+static int create_dev_mount(KleeMountTable *mt, const char *dest, mode_t perms)
+{
+    int rc = create_backed_mount(mt, MOUNT_DEV, dest, perms);
+    if (rc < 0)
+        return rc;
+    const KleeMount *dev = klee_mount_table_resolve(mt, dest);
+    static const char *const devices[] = {"null", "zero", "full", "random",
+                                          "urandom", "tty", "pts"};
+    for (size_t i = 0; i < sizeof(devices) / sizeof(devices[0]); i++) {
+        char host[32], guest[PATH_MAX], entry[PATH_MAX];
+        snprintf(host, sizeof(host), "/dev/%s", devices[i]);
+        if (access(host, F_OK) < 0)
+            continue;
+        if (snprintf(guest, sizeof(guest), "%s/%s", dest, devices[i]) >= (int)sizeof(guest) ||
+            snprintf(entry, sizeof(entry), "%s/%s", dev->source, devices[i]) >= (int)sizeof(entry))
+            return -ENAMETOOLONG;
+        if (symlink(host, entry) < 0)
+            return -errno;
+        rc = klee_mount_table_add(mt, MOUNT_DEV_BIND, host, guest, false, 0666);
+        if (rc < 0)
+            return rc;
+    }
+
+    static const struct { const char *name, *target; } links[] = {
+        {"stdin", "/proc/self/fd/0"}, {"stdout", "/proc/self/fd/1"},
+        {"stderr", "/proc/self/fd/2"}, {"fd", "/proc/self/fd"},
+        {"core", "/proc/kcore"}, {"ptmx", "pts/ptmx"},
+    };
+    for (size_t i = 0; i < sizeof(links) / sizeof(links[0]); i++) {
+        char path[PATH_MAX];
+        if (snprintf(path, sizeof(path), "%s/%s", dev->source, links[i].name) >= (int)sizeof(path))
+            return -ENAMETOOLONG;
+        if (symlink(links[i].target, path) < 0)
+            return -errno;
+    }
+
+    char shm[PATH_MAX];
+    if (snprintf(shm, sizeof(shm), "%s/shm", dev->source) >= (int)sizeof(shm))
+        return -ENAMETOOLONG;
+    if (mkdir(shm, 01777) < 0)
+        return -errno;
+    return chmod(shm, 01777) < 0 ? -errno : 0;
+}
+
+static int apply_mount_op(KleeMountTable *mt, const KleeMountOp *op)
+{
+    const char *dest = op->dest;
+    if (op->type == MOUNT_OVERLAY_SRC)
+        return 0;
+    if (!dest || dest[0] != '/')
+        return -EINVAL;
+    bool ro;
+    char source[PATH_MAX];
+    switch (op->type) {
+    case MOUNT_BIND_RW:
+    case MOUNT_BIND_TRY:
+    case MOUNT_DEV_BIND:
+    case MOUNT_DEV_BIND_TRY:
+    case MOUNT_BIND_RO:
+    case MOUNT_BIND_RO_TRY:
+        ro = op->type == MOUNT_BIND_RO || op->type == MOUNT_BIND_RO_TRY;
+        if (!realpath(op->source, source)) {
+            int error = errno;
+            if (error == ENOENT && (op->type == MOUNT_BIND_TRY ||
+                                    op->type == MOUNT_BIND_RO_TRY ||
+                                    op->type == MOUNT_DEV_BIND_TRY))
+                return 0;
+            return -error;
+        }
+        {
+            int rc = add_config_mount(mt, op->type, source, dest, ro, op->perms);
+            if (rc < 0 || !op->overlay_alias)
+                return rc;
             KleeMount *mount = klee_mount_table_resolve(mt, dest);
             mount->overlay_prefix = klee_arena_strdup(mt->arena, op->overlay_prefix);
             if (!mount->overlay_prefix)
@@ -356,9 +335,96 @@ int klee_mount_table_populate(KleeMountTable *mt, const KleeConfig *cfg)
             mount->overlay = op->overlay_alias;
             mount->is_readonly |= op->overlay_alias_readonly;
             klee_overlay_ref(mount->overlay);
+            return 0;
         }
+
+    case MOUNT_TMPFS:
+    case MOUNT_MQUEUE:
+        return create_backed_mount(mt, op->type, dest, op->perms);
+    case MOUNT_PROC:
+        return add_config_mount(mt, MOUNT_PROC, "/proc", dest, false, op->perms);
+    case MOUNT_DEV:
+        return create_dev_mount(mt, dest, op->perms);
+    case MOUNT_DIR:
+        return ensure_directory(mt, dest, op->perms);
+    case MOUNT_SYMLINK:
+        return add_config_mount(mt, MOUNT_SYMLINK, op->source, dest,
+                                 klee_mount_table_is_readonly(mt, dest), 0777);
+
+    case MOUNT_FILE:
+    case MOUNT_BIND_DATA:
+    case MOUNT_RO_BIND_DATA: {
+        char *path = klee_tmpfs_create_file(dest, op->fd, op->perms);
+        if (!path)
+            return -errno;
+        int rc = add_config_mount(mt, op->type, path, dest,
+                                   op->type == MOUNT_RO_BIND_DATA, op->perms);
+        free(path);
+        return rc;
     }
 
+    case MOUNT_REMOUNT_RO: {
+        RadixNode *node = klee_radix_find_exact(mt->tree, dest);
+        if (!node || !node->mount)
+            return -EINVAL;
+        node->mount->is_readonly = true;
+        return 0;
+    }
+
+    case MOUNT_CHMOD: {
+        if (klee_mount_table_is_readonly(mt, dest))
+            return -EROFS;
+        int rc = klee_mount_table_translate_access(mt, dest, source, sizeof(source),
+                                                     KLEE_OV_SETATTR);
+        if (rc < 0)
+            return rc;
+        return chmod(source, op->perms) < 0 ? -errno : 0;
+    }
+
+    case MOUNT_OVERLAY:
+    case MOUNT_TMP_OVERLAY:
+    case MOUNT_RO_OVERLAY: {
+        ro = op->type == MOUNT_RO_OVERLAY;
+        const char *upper = op->type == MOUNT_OVERLAY ? op->source : NULL;
+        if (op->type == MOUNT_OVERLAY && !upper)
+            return -EINVAL;
+        KleeOverlayMount *ov = klee_overlay_create(dest, upper, op->overlay_srcs,
+                                                    op->overlay_src_count, ro);
+        if (!ov)
+            return -errno;
+        int rc = add_config_mount(mt, op->type, ov->merged_dir, dest, ro, op->perms);
+        if (rc < 0) {
+            klee_overlay_destroy(ov);
+            return rc;
+        }
+        klee_mount_table_resolve(mt, dest)->overlay = ov;
+        return 0;
+    }
+
+    case MOUNT_BIND_FD:
+    case MOUNT_RO_BIND_FD: {
+        char fd_path[64];
+        snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", op->fd);
+        if (!realpath(fd_path, source))
+            return -errno;
+        return add_config_mount(mt, op->type, source, dest,
+                                 op->type == MOUNT_RO_BIND_FD, op->perms);
+    }
+    case MOUNT_OVERLAY_SRC:
+        break;
+    }
+    return -EINVAL;
+}
+
+int klee_mount_table_populate(KleeMountTable *mt, const KleeConfig *cfg)
+{
+    for (const KleeMountOp *op = cfg->mount_ops; op; op = op->next) {
+        int rc = apply_mount_op(mt, op);
+        if (rc < 0) {
+            KLEE_ERROR("mount setup failed at %s: %s", op->dest, strerror(-rc));
+            return rc;
+        }
+    }
     return 0;
 }
 
@@ -397,152 +463,78 @@ int klee_mount_table_overlay_relative(const KleeMountTable *mt, const char *gues
     return overlay_relative(node->mount, remainder, relative, size);
 }
 
-static int translate_depth(const KleeMountTable *mt,
-                            const char *guest_path,
-                            char *host_path_out, size_t out_size,
-                            int depth, KleeOvAccess access)
+static int translate_depth(const KleeMountTable *mt, const char *guest_path,
+                           char *out, size_t out_size, int depth,
+                           KleeOvAccess access, bool nofollow)
 {
-    if (!mt || !guest_path || !host_path_out)
+    if (!mt || !guest_path || !out)
         return -EINVAL;
 
-    size_t match_len;
     const char *remainder;
-    RadixNode *node = klee_radix_lookup(mt->tree, guest_path,
-                                         &match_len, &remainder);
-    if (!node || !node->mount) {
-        /* No mount covers this path - pass through */
-        snprintf(host_path_out, out_size, "%s", guest_path);
-        return 0;
-    }
+    RadixNode *node = klee_radix_lookup(mt->tree, guest_path, NULL, &remainder);
+    KleeMount *mount = node ? node->mount : NULL;
 
-    KleeMount *mount = node->mount;
-
-    if (mount->overlay) {
+    if (mount && mount->overlay) {
         if (mount->is_readonly && access != KLEE_OV_LOOKUP && access != KLEE_OV_LIST)
             access = KLEE_OV_READ;
         char relative[PATH_MAX];
         int rc = overlay_relative(mount, remainder, relative, sizeof(relative));
         if (rc < 0)
             return rc;
-        return klee_overlay_resolve(mount->overlay, relative, host_path_out, out_size, access);
+        return klee_overlay_resolve(mount->overlay, relative, out, out_size, access);
     }
 
-    switch (mount->type) {
-    case MOUNT_BIND_RW:
-    case MOUNT_BIND_RO:
-    case MOUNT_BIND_TRY:
-    case MOUNT_BIND_RO_TRY:
-    case MOUNT_DEV_BIND:
-    case MOUNT_DEV_BIND_TRY:
-    case MOUNT_BIND_DATA:
-    case MOUNT_RO_BIND_DATA:
-    case MOUNT_BIND_FD:
-    case MOUNT_RO_BIND_FD:
-        /* Prefix substitution: replace mount dest with mount source */
-        if (mount->source) {
-            /* Skip over matched prefix, append remainder to source */
-            while (*remainder == '/')
-                remainder++;
-            if (*remainder) {
-                /* Avoid double slashes when source ends with / */
-                size_t slen = strlen(mount->source);
-                if (slen > 0 && mount->source[slen - 1] == '/')
-                    snprintf(host_path_out, out_size, "%s%s",
-                             mount->source, remainder);
-                else
-                    snprintf(host_path_out, out_size, "%s/%s",
-                             mount->source, remainder);
-            } else {
-                snprintf(host_path_out, out_size, "%s", mount->source);
-            }
-        } else {
-            snprintf(host_path_out, out_size, "%s", guest_path);
-        }
-        break;
-
-    case MOUNT_TMPFS:
-    case MOUNT_DIR:
-    case MOUNT_FILE:
-    case MOUNT_PROC:
-    case MOUNT_DEV:
-    case MOUNT_MQUEUE:
-        /* Backed by a tmpfs directory or special mount */
-        if (mount->source) {
-            while (*remainder == '/')
-                remainder++;
-            if (*remainder) {
-                size_t slen = strlen(mount->source);
-                if (slen > 0 && mount->source[slen - 1] == '/')
-                    snprintf(host_path_out, out_size, "%s%s",
-                             mount->source, remainder);
-                else
-                    snprintf(host_path_out, out_size, "%s/%s",
-                             mount->source, remainder);
-            } else {
-                snprintf(host_path_out, out_size, "%s", mount->source);
-            }
-        } else {
-            snprintf(host_path_out, out_size, "%s", guest_path);
-        }
-        break;
-
-    case MOUNT_SYMLINK: {
-        /* Symlinks: source is a guest-path target; append remainder and
-         * recursively re-translate since the result is still a guest path.
-         * Relative targets are resolved against the parent of dest,
-         * matching kernel symlink semantics. */
-        if (depth >= 40)
-            return -ELOOP;
-        char new_guest[PATH_MAX];
-        const char *target = mount->source;
-        char resolved[PATH_MAX];
-        if (target[0] != '/') {
-            /* Relative symlink — prepend parent directory of dest */
-            char parent[PATH_MAX];
-            snprintf(parent, PATH_MAX, "%s", mount->dest);
-            char *slash = strrchr(parent, '/');
-            if (slash && slash != parent)
-                *slash = '\0';
-            else if (slash)
-                parent[1] = '\0';  /* parent is "/" */
-            if (snprintf(resolved, PATH_MAX, "%s/%s", parent, target) >= PATH_MAX)
-                return -ENAMETOOLONG;
-            target = resolved;
-        }
+    const char *source = mount ? mount->source : NULL;
+    if (source) {
         while (*remainder == '/')
             remainder++;
-        if (*remainder) {
-            if (snprintf(new_guest, PATH_MAX, "%s/%s", target, remainder) >= PATH_MAX)
-                return -ENAMETOOLONG;
-        } else {
-            snprintf(new_guest, PATH_MAX, "%s", target);
+        if (mount->type == MOUNT_SYMLINK) {
+            source = mount->link_path;
+            if (!nofollow || *remainder) {
+                char target[PATH_MAX];
+                ssize_t len = readlink(source, target, sizeof(target));
+                if (len >= (ssize_t)sizeof(target))
+                    return -ENAMETOOLONG;
+                if (len >= 0) {
+                    if (depth >= 40)
+                        return -ELOOP;
+                    target[len] = '\0';
+                    const char *parent = "";
+                    size_t parent_len = 0;
+                    if (target[0] != '/') {
+                        parent = mount->dest;
+                        parent_len = (size_t)(strrchr(parent, '/') - parent);
+                    }
+                    char next[PATH_MAX];
+                    int n = snprintf(next, sizeof(next), "%.*s%s%s%s%s",
+                                     (int)parent_len, parent, target[0] == '/' ? "" : "/",
+                                     target, *remainder ? "/" : "", remainder);
+                    if (n < 0 || (size_t)n >= sizeof(next))
+                        return -ENAMETOOLONG;
+                    return translate_depth(mt, next, out, out_size, depth + 1, access, false);
+                }
+                if (errno != ENOENT && errno != EINVAL)
+                    return -errno;
+            }
         }
-        return translate_depth(mt, new_guest, host_path_out, out_size,
-                               depth + 1, access);
     }
 
-    case MOUNT_OVERLAY:
-    case MOUNT_TMP_OVERLAY:
-    case MOUNT_RO_OVERLAY:
-        return -EIO;
-
-    case MOUNT_REMOUNT_RO:
-    case MOUNT_CHMOD:
-    case MOUNT_OVERLAY_SRC:
-    default:
-        snprintf(host_path_out, out_size, "%s", guest_path);
-        break;
+    int n;
+    if (!source) {
+        n = snprintf(out, out_size, "%s", guest_path);
+    } else {
+        size_t len = strlen(source);
+        const char *separator = *remainder && len && source[len - 1] != '/' ? "/" : "";
+        n = snprintf(out, out_size, "%s%s%s", source, separator, remainder);
     }
-
-    return 0;
+    return n < 0 || (size_t)n >= out_size ? -ENAMETOOLONG : 0;
 }
 
 int klee_mount_table_translate(const KleeMountTable *mt,
                                 const char *guest_path,
                                 char *host_path_out, size_t out_size)
 {
-    return translate_depth(mt, guest_path, host_path_out, out_size, 0,
-                           KLEE_OV_LOOKUP);
+    return translate_depth(mt, guest_path, host_path_out, out_size, 0, KLEE_OV_LOOKUP, false);
 }
 
 int klee_mount_table_translate_access(const KleeMountTable *mt,
@@ -550,8 +542,68 @@ int klee_mount_table_translate_access(const KleeMountTable *mt,
                                        char *host_path_out, size_t out_size,
                                        KleeOvAccess access)
 {
-    return translate_depth(mt, guest_path, host_path_out, out_size, 0,
-                           access);
+    return translate_depth(mt, guest_path, host_path_out, out_size, 0, access, false);
+}
+
+int klee_mount_table_translate_nofollow(const KleeMountTable *mt,
+                                         const char *guest_path,
+                                         char *host_path_out, size_t out_size,
+                                         KleeOvAccess access)
+{
+    return translate_depth(mt, guest_path, host_path_out, out_size, 0, access, true);
+}
+
+typedef struct {
+    const KleeMountTable *table;
+    const char *host;
+    char *guest;
+    size_t size;
+    size_t matched;
+} ReversePath;
+
+static void reverse_mount(const char *path, KleeMount *mount, void *data)
+{
+    ReversePath *rev = data;
+    const char *src = mount->source;
+    if (!src || src[0] != '/' || mount->link_path)
+        return;
+    size_t len = strlen(src);
+    if (len <= rev->matched || strncmp(rev->host, src, len) != 0 ||
+        (src[len - 1] != '/' && rev->host[len] && rev->host[len] != '/'))
+        return;
+    const char *suffix = rev->host + len;
+    while (*suffix == '/')
+        suffix++;
+    char candidate[PATH_MAX], check[PATH_MAX];
+    int n = snprintf(candidate, sizeof(candidate), "%s%s%s", path,
+                     *suffix && path[strlen(path) - 1] != '/' ? "/" : "", suffix);
+    if (n < 0 || (size_t)n >= sizeof(candidate) || (size_t)n >= rev->size)
+        return;
+    if (klee_mount_table_translate(rev->table, candidate, check, sizeof(check)) < 0 ||
+        strcmp(check, rev->host) != 0)
+        return;
+    memcpy(rev->guest, candidate, (size_t)n + 1);
+    rev->matched = len;
+}
+
+int klee_mount_table_host_to_guest(const KleeMountTable *mt, const char *host_path,
+                                    char *guest, size_t size)
+{
+    if (!mt || host_path[0] != '/')
+        return -EINVAL;
+    ReversePath rev = {.table = mt, .host = host_path, .guest = guest, .size = size};
+    klee_radix_walk(mt->tree, reverse_mount, &rev);
+    if (rev.matched)
+        return 0;
+
+    char check[PATH_MAX];
+    int rc = klee_mount_table_translate(mt, host_path, check, sizeof(check));
+    if (rc < 0)
+        return rc;
+    if (strcmp(check, host_path) != 0)
+        return -ENOENT;
+    int n = snprintf(guest, size, "%s", host_path);
+    return n < 0 || (size_t)n >= size ? -ENAMETOOLONG : 0;
 }
 
 KleeOverlayMount *klee_mount_table_overlay_at(const KleeMountTable *mt,
@@ -657,7 +709,7 @@ void klee_mount_table_create_host_mirrors(const KleeMountTable *mt)
         return;
 
     /* Only act if there are mounts under /run/host */
-    KleeMount *probe = klee_mount_table_resolve(mt, "/run/host");
+    RadixNode *probe = klee_radix_find_exact(mt->tree, "/run/host");
     if (!probe)
         return;
 

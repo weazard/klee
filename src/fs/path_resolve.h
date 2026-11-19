@@ -28,6 +28,7 @@
 typedef struct klee_resolve_ctx {
     const KleeMountTable *mount_table;
     const KleeFdTable *fd_table;
+    pid_t tracee_pid;        /* /proc fallback for inherited or received FDs */
     const char *vcwd;        /* virtual current working directory */
     const char *vroot;       /* virtual root (/) */
     const char *dirfd_path;  /* resolved dirfd path for RESOLVE_BENEATH */
@@ -48,6 +49,7 @@ typedef struct klee_resolve_ctx {
  * path when klee does not know what dirfd refers to. */
 int klee_path_resolve(KleeResolveCtx *ctx, const char *guest_path,
                        char *resolved, int dirfd);
+int klee_path_dirfd(const KleeResolveCtx *ctx, int dirfd, char *guest);
 
 /* Translate a guest path all the way to a host path.
  * First canonicalizes, then translates through mount table.

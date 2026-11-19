@@ -95,8 +95,10 @@ void *klee_ht_put(KleeHashTable *ht, uint64_t key, void *value)
         return NULL;
 
     /* Check load factor */
-    if ((ht->count + ht->tombstones + 1) > (size_t)(ht->capacity * KLEE_HT_MAX_LOAD_FACTOR)) {
-        if (ht_resize(ht, ht->capacity * 2) < 0)
+    size_t limit = (size_t)(ht->capacity * KLEE_HT_MAX_LOAD_FACTOR);
+    if (ht->count + ht->tombstones + 1 > limit) {
+        size_t capacity = ht->count + 1 > limit ? ht->capacity * 2 : ht->capacity;
+        if (capacity < ht->capacity || ht_resize(ht, capacity) < 0)
             return NULL;
     }
 

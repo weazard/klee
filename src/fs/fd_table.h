@@ -61,5 +61,7 @@ int klee_fd_table_dup(KleeFdTable *ft, int old_fd, int new_fd, bool cloexec);
 
 /* Handle execve: remove all cloexec FDs */
 void klee_fd_table_exec(KleeFdTable *ft);
+void klee_fd_table_close_range(KleeFdTable *ft, unsigned first, unsigned last,
+                                bool cloexec);
 
 #endif /* KLEE_FD_TABLE_H */

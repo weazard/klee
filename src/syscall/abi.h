@@ -19,6 +19,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/socket.h>
 
 static inline size_t klee_abi_ptr_size(KleeAbi abi)
 {
@@ -28,8 +29,15 @@ static inline size_t klee_abi_ptr_size(KleeAbi abi)
 /* Pointer-sized loads and stores in the tracee's ABI. */
 int klee_abi_read_ptr(KleeInterceptor *ic, pid_t pid, KleeAbi abi,
                       uint64_t addr, uint64_t *out);
-int klee_abi_write_ptr(KleeInterceptor *ic, pid_t pid, KleeAbi abi,
-                       uint64_t addr, uint64_t value);
+int klee_abi_read_strv(KleeProcess *proc, KleeInterceptor *ic, uint64_t base,
+                        char ***out, int *count);
+int klee_abi_stage_strv(KleeProcess *proc, KleeInterceptor *ic, char *const *strs,
+                         int count, uint64_t *addr);
+void klee_abi_free_strv(char **strs, int count);
+
+uint32_t klee_abi_id_result(const KleeProcess *proc, uint32_t id);
+int klee_abi_write_ids(KleeProcess *proc, KleeInterceptor *ic, uint64_t addr,
+                       const uint32_t *ids, size_t count);
 
 /* socketcall(2) / ipc(2): rewrite ev so it describes the real call and
  * remember how to get at its arguments.  Returns true if it did. */
@@ -38,13 +46,11 @@ bool klee_abi_demux_enter(KleeProcess *proc, KleeInterceptor *ic,
 /* After the enter handlers: if they changed arguments that live in the
  * socketcall argument array, stage a new array below the stack and point
  * the real syscall at it. */
-void klee_abi_demux_commit(KleeProcess *proc, KleeInterceptor *ic,
-                           KleeEvent *ev);
-/* Present the demultiplexed arguments to the exit handlers. */
-void klee_abi_demux_exit_args(const KleeProcess *proc, KleeEvent *ev);
-/* Undo what commit did to the registers.  Returns true if they changed;
- * the caller fetches before and pushes after. */
-bool klee_abi_demux_restore(KleeProcess *proc);
+int klee_abi_demux_commit(KleeProcess *proc, KleeInterceptor *ic);
+
+/* Stage a pointer array using the tracee's pointer size. Count includes NUL. */
+int klee_abi_stage_ptrs(KleeProcess *proc, KleeInterceptor *ic,
+                         const uint64_t *ptrs, size_t count, uint64_t *addr);
 
 /* Field offsets of the stat buffer a stat/fstat/lstat/newfstatat call
  * fills in the tracee's ABI (struct stat64 for i386). */
@@ -52,6 +58,14 @@ void klee_abi_stat_layout(KleeAbi abi, size_t *mode_off, size_t *uid_off,
                           size_t *gid_off);
 
 /* Where a msghdr's control buffer is. */
+typedef union {
+    struct msghdr native;
+    struct {
+        uint32_t name, namelen, iov, iovlen, control, controllen, flags;
+    } compat;
+} KleeAbiMsg;
+
+size_t klee_abi_msg_size(KleeAbi abi);
 int klee_abi_read_msg_control(KleeInterceptor *ic, pid_t pid, KleeAbi abi,
                               uint64_t msg_addr, uint64_t *ctrl_addr,
                               size_t *ctrl_len);
@@ -61,11 +75,5 @@ int klee_abi_read_msg_control(KleeInterceptor *ic, pid_t pid, KleeAbi abi,
 bool klee_abi_cmsg_next(KleeAbi abi, const uint8_t *buf, size_t len,
                         size_t *off, int *level, int *type,
                         size_t *data_off, size_t *data_len);
-
-/* struct sock_fprog in the tracee's ABI. */
-int klee_abi_read_fprog(KleeInterceptor *ic, pid_t pid, KleeAbi abi,
-                        uint64_t addr, uint16_t *len, uint64_t *filter_addr);
-int klee_abi_write_fprog(KleeInterceptor *ic, pid_t pid, KleeAbi abi,
-                         uint64_t addr, uint16_t len, uint64_t filter_addr);
 
 #endif /* KLEE_ABI_H */

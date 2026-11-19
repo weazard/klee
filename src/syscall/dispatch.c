@@ -91,12 +91,14 @@ void klee_dispatch_init(void)
     register_handler(KLEE_SYS_umount2,   "umount2",   klee_enter_umount, NULL);
 
     /* FD tracking */
+    register_handler(KLEE_SYS_close_range, "close_range", NULL, klee_exit_close_range);
     register_handler(KLEE_SYS_close,     "close",     klee_enter_close, NULL);
     register_handler(KLEE_SYS_dup,       "dup",       NULL, klee_exit_dup);
     register_handler(KLEE_SYS_dup2,      "dup2",      NULL, klee_exit_dup2);
     register_handler(KLEE_SYS_dup3,      "dup3",      NULL, klee_exit_dup3);
     register_handler(KLEE_SYS_fcntl,     "fcntl",     NULL, klee_exit_fcntl);
-    register_handler(KLEE_SYS_getdents64, "getdents64", NULL, klee_exit_getdents64);
+    register_handler(KLEE_SYS_getdents, "getdents", NULL, klee_exit_getdents);
+    register_handler(KLEE_SYS_getdents64, "getdents64", NULL, klee_exit_getdents);
 
     /* PID namespace */
     register_handler(KLEE_SYS_getpid,    "getpid",    NULL, klee_exit_getpid);
@@ -136,7 +138,7 @@ void klee_dispatch_init(void)
     register_handler(KLEE_SYS_setfsuid,  "setfsuid",  klee_enter_setfsuid, NULL);
     register_handler(KLEE_SYS_setfsgid,  "setfsgid",  klee_enter_setfsgid, NULL);
     register_handler(KLEE_SYS_setgroups, "setgroups", klee_enter_setgroups, NULL);
-    register_handler(KLEE_SYS_getgroups, "getgroups", NULL, klee_exit_getgroups);
+    register_handler(KLEE_SYS_getgroups, "getgroups", klee_enter_getgroups, NULL);
 
     /* UTS namespace */
     register_handler(KLEE_SYS_uname,     "uname",     NULL, klee_exit_uname);
@@ -150,6 +152,7 @@ void klee_dispatch_init(void)
     /* Socket AF_UNIX path translation */
     register_handler(KLEE_SYS_bind,      "bind",      klee_enter_bind, NULL);
     register_handler(KLEE_SYS_connect,   "connect",   klee_enter_connect, NULL);
+    register_handler(KLEE_SYS_sendto,    "sendto",    klee_enter_sendto, NULL);
     register_handler(KLEE_SYS_sendmsg,   "sendmsg",   klee_enter_sendmsg, NULL);
     register_handler(KLEE_SYS_recvmsg,   "recvmsg",   NULL, klee_exit_recvmsg);
     register_handler(KLEE_SYS_recvfrom,  "recvfrom",  NULL, NULL);
@@ -157,7 +160,6 @@ void klee_dispatch_init(void)
     /* Misc */
     register_handler(KLEE_SYS_ptrace,    "ptrace",    klee_enter_ptrace, NULL);
     register_handler(KLEE_SYS_prctl,     "prctl",     klee_enter_prctl, klee_exit_prctl);
-    register_handler(KLEE_SYS_seccomp,   "seccomp",   klee_enter_seccomp, NULL);
     register_handler(KLEE_SYS_getsockopt,"getsockopt", NULL, klee_exit_getsockopt);
     register_handler(KLEE_SYS_inotify_add_watch, "inotify_add_watch",
                      klee_enter_inotify_add_watch, NULL);

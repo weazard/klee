@@ -38,14 +38,18 @@ ALIASES = {
     "ftruncate64": ("ftruncate", ""), "statfs64": ("statfs", ""),
     "fstatfs64": ("fstatfs", ""), "umount": ("umount2", ""),
     "waitpid": ("wait4", ""), "ugetrlimit": ("getrlimit", ""),
+    "sched_rr_get_interval_time64": ("sched_rr_get_interval", ""),
     "utimensat_time64": ("utimensat", ""), "sendfile64": ("sendfile", ""),
     "olduname": ("uname", "OLDSTRUCT"), "oldolduname": ("uname", "OLDSTRUCT"),
     "socketcall": (None, "DEMUX"), "ipc": (None, "DEMUX"),
 }
 
-# i386 syscalls that share a name with x86_64 but use a 16-bit uid ABI or an
-# old struct; they map by name, flagged so handlers skip struct rewriting.
 OLDSTRUCT_SAME_NAME = {"stat", "lstat", "fstat"}
+UID16 = {
+    "getuid", "geteuid", "getgid", "getegid", "getresuid", "getresgid",
+    "getgroups", "setgroups", "setuid", "setgid", "setreuid", "setregid",
+    "setresuid", "setresgid", "setfsuid", "setfsgid",
+}
 
 
 LOOKUP = """#define SYS32_INDEX_SIZE 512
@@ -116,6 +120,8 @@ def main():
             target = name
             if name in OLDSTRUCT_SAME_NAME:
                 flags.append("OLDSTRUCT")
+            if name in UID16:
+                flags.append("UID16")
         else:
             continue
         if target is None:

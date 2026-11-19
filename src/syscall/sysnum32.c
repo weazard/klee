@@ -29,8 +29,8 @@ const KleeSysnum32Entry klee_sysnum32_table[] = {
     {   20,   39, 0                      }, /* getpid */
     {   21,  165, 0                      }, /* mount */
     {   22,  166, 0                      }, /* umount */
-    {   23,  105, 0                      }, /* setuid */
-    {   24,  102, 0                      }, /* getuid */
+    {   23,  105, KLEE_SYS32_UID16       }, /* setuid */
+    {   24,  102, KLEE_SYS32_UID16       }, /* getuid */
     {   26,  101, 0                      }, /* ptrace */
     {   27,   37, 0                      }, /* alarm */
     {   28,    5, KLEE_SYS32_OLDSTRUCT   }, /* oldfstat */
@@ -46,10 +46,10 @@ const KleeSysnum32Entry klee_sysnum32_table[] = {
     {   42,   22, 0                      }, /* pipe */
     {   43,  100, 0                      }, /* times */
     {   45,   12, 0                      }, /* brk */
-    {   46,  106, 0                      }, /* setgid */
-    {   47,  104, 0                      }, /* getgid */
-    {   49,  107, 0                      }, /* geteuid */
-    {   50,  108, 0                      }, /* getegid */
+    {   46,  106, KLEE_SYS32_UID16       }, /* setgid */
+    {   47,  104, KLEE_SYS32_UID16       }, /* getgid */
+    {   49,  107, KLEE_SYS32_UID16       }, /* geteuid */
+    {   50,  108, KLEE_SYS32_UID16       }, /* getegid */
     {   51,  163, 0                      }, /* acct */
     {   52,  166, 0                      }, /* umount2 */
     {   54,   16, 0                      }, /* ioctl */
@@ -63,16 +63,16 @@ const KleeSysnum32Entry klee_sysnum32_table[] = {
     {   64,  110, 0                      }, /* getppid */
     {   65,  111, 0                      }, /* getpgrp */
     {   66,  112, 0                      }, /* setsid */
-    {   70,  113, 0                      }, /* setreuid */
-    {   71,  114, 0                      }, /* setregid */
+    {   70,  113, KLEE_SYS32_UID16       }, /* setreuid */
+    {   71,  114, KLEE_SYS32_UID16       }, /* setregid */
     {   74,  170, 0                      }, /* sethostname */
     {   75,  160, 0                      }, /* setrlimit */
     {   76,   97, 0                      }, /* getrlimit */
     {   77,   98, 0                      }, /* getrusage */
     {   78,   96, 0                      }, /* gettimeofday */
     {   79,  164, 0                      }, /* settimeofday */
-    {   80,  115, 0                      }, /* getgroups */
-    {   81,  116, 0                      }, /* setgroups */
+    {   80,  115, KLEE_SYS32_UID16       }, /* getgroups */
+    {   81,  116, KLEE_SYS32_UID16       }, /* setgroups */
     {   82,   23, 0                      }, /* select */
     {   83,   88, 0                      }, /* symlink */
     {   84,    6, KLEE_SYS32_OLDSTRUCT   }, /* oldlstat */
@@ -122,8 +122,8 @@ const KleeSysnum32Entry klee_sysnum32_table[] = {
     {  135,  139, 0                      }, /* sysfs */
     {  136,  135, 0                      }, /* personality */
     {  137,  183, 0                      }, /* afs_syscall */
-    {  138,  122, 0                      }, /* setfsuid */
-    {  139,  123, 0                      }, /* setfsgid */
+    {  138,  122, KLEE_SYS32_UID16       }, /* setfsuid */
+    {  139,  123, KLEE_SYS32_UID16       }, /* setfsgid */
     {  141,   78, 0                      }, /* getdents */
     {  143,   73, 0                      }, /* flock */
     {  144,   26, 0                      }, /* msync */
@@ -146,13 +146,13 @@ const KleeSysnum32Entry klee_sysnum32_table[] = {
     {  161,  148, 0                      }, /* sched_rr_get_interval */
     {  162,   35, 0                      }, /* nanosleep */
     {  163,   25, 0                      }, /* mremap */
-    {  164,  117, 0                      }, /* setresuid */
-    {  165,  118, 0                      }, /* getresuid */
+    {  164,  117, KLEE_SYS32_UID16       }, /* setresuid */
+    {  165,  118, KLEE_SYS32_UID16       }, /* getresuid */
     {  167,  178, 0                      }, /* query_module */
     {  168,    7, 0                      }, /* poll */
     {  169,  180, 0                      }, /* nfsservctl */
-    {  170,  119, 0                      }, /* setresgid */
-    {  171,  120, 0                      }, /* getresgid */
+    {  170,  119, KLEE_SYS32_UID16       }, /* setresgid */
+    {  171,  120, KLEE_SYS32_UID16       }, /* getresgid */
     {  172,  157, 0                      }, /* prctl */
     {  173,   15, 0                      }, /* rt_sigreturn */
     {  174,   13, 0                      }, /* rt_sigaction */
@@ -373,6 +373,7 @@ const KleeSysnum32Entry klee_sysnum32_table[] = {
     {  401,   70, 0                      }, /* msgrcv */
     {  402,   71, 0                      }, /* msgctl */
     {  412,  280, 0                      }, /* utimensat_time64 */
+    {  423,  148, 0                      }, /* sched_rr_get_interval_time64 */
     {  424,  424, 0                      }, /* pidfd_send_signal */
     {  425,  425, 0                      }, /* io_uring_setup */
     {  426,  426, 0                      }, /* io_uring_enter */

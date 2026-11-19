@@ -11,6 +11,9 @@
 #include "util/log.h"
 
 #include <limits.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <unistd.h>
 #include <string.h>
 #include <sys/syscall.h>
 
@@ -32,15 +35,122 @@ int klee_abi_read_ptr(KleeInterceptor *ic, pid_t pid, KleeAbi abi,
                          sizeof(*out));
 }
 
-int klee_abi_write_ptr(KleeInterceptor *ic, pid_t pid, KleeAbi abi,
-                       uint64_t addr, uint64_t value)
+void klee_abi_free_strv(char **strs, int count)
 {
-    if (abi == KLEE_ABI_I386) {
-        uint32_t v = (uint32_t)value;
-        return klee_write_mem(ic, pid, (void *)(uintptr_t)addr, &v, sizeof(v));
+    for (int i = 0; i < count; i++)
+        free(strs[i]);
+    free(strs);
+}
+
+int klee_abi_read_strv(KleeProcess *proc, KleeInterceptor *ic, uint64_t base,
+                        char ***out, int *out_count)
+{
+    *out = NULL;
+    *out_count = 0;
+    if (!base)
+        return 0;
+
+    enum { MAX_STRLEN = 32 * 4096 };  /* Linux x86 exec limit per string */
+    size_t ptr_size = klee_abi_ptr_size(proc->abi);
+    long limit = sysconf(_SC_ARG_MAX);
+    size_t budget = limit > 0 ? (size_t)limit : MAX_STRLEN;
+    char *buf = malloc(MAX_STRLEN);
+    char **strs = NULL;
+    int count = 0;
+    int capacity = 0;
+    if (!buf)
+        return -ENOMEM;
+
+    int rc = -E2BIG;
+    while (budget >= ptr_size) {
+        uint64_t ptr;
+        rc = klee_abi_read_ptr(ic, proc->real_pid, proc->abi,
+                              base + (uint64_t)count * ptr_size, &ptr);
+        if (rc < 0)
+            break;
+        if (!ptr) {
+            free(buf);
+            *out = strs;
+            *out_count = count;
+            return 0;
+        }
+        rc = klee_read_string(ic, proc->real_pid, buf, MAX_STRLEN,
+                              (const void *)(uintptr_t)ptr);
+        if (rc < 0) {
+            if (rc == -ENAMETOOLONG)
+                rc = -E2BIG;
+            break;
+        }
+        size_t size = (size_t)rc + 1 + ptr_size;
+        rc = -E2BIG;
+        if (size > budget)
+            break;
+        budget -= size;
+
+        if (count == capacity) {
+            capacity = capacity ? 2 * capacity : 32;
+            char **larger = realloc(strs, (size_t)capacity * sizeof(*strs));
+            if (!larger) {
+                rc = -ENOMEM;
+                break;
+            }
+            strs = larger;
+        }
+        strs[count] = strdup(buf);
+        if (!strs[count]) {
+            rc = -ENOMEM;
+            break;
+        }
+        count++;
     }
-    return klee_write_mem(ic, pid, (void *)(uintptr_t)addr, &value,
-                          sizeof(value));
+    klee_abi_free_strv(strs, count);
+    free(buf);
+    return rc;
+}
+
+int klee_abi_stage_strv(KleeProcess *proc, KleeInterceptor *ic, char *const *strs,
+                         int count, uint64_t *addr)
+{
+    uint64_t *ptrs = calloc((size_t)count + 1, sizeof(*ptrs));
+    if (!ptrs)
+        return -ENOMEM;
+    int rc = 0;
+    for (int i = 0; i < count; i++) {
+        rc = klee_scratch_string(proc, ic, strs[i], &ptrs[i]);
+        if (rc < 0)
+            break;
+    }
+    if (rc == 0)
+        rc = klee_abi_stage_ptrs(proc, ic, ptrs, (size_t)count + 1, addr);
+    free(ptrs);
+    return rc;
+}
+
+uint32_t klee_abi_id_result(const KleeProcess *proc, uint32_t id)
+{
+    if ((proc->sys32_flags & KLEE_SYS32_UID16) && id > UINT16_MAX)
+        return 65534;
+    return id;
+}
+
+int klee_abi_write_ids(KleeProcess *proc, KleeInterceptor *ic, uint64_t addr,
+                       const uint32_t *ids, size_t count)
+{
+    if (count == 0)
+        return 0;
+    void *remote = (void *)(uintptr_t)addr;
+    if (!(proc->sys32_flags & KLEE_SYS32_UID16))
+        return klee_write_mem(ic, proc->real_pid, remote, ids, count * sizeof(*ids));
+    uint16_t single;
+    uint16_t *legacy = count == 1 ? &single : malloc(count * sizeof(*legacy));
+    if (!legacy)
+        return -ENOMEM;
+    for (size_t i = 0; i < count; i++)
+        legacy[i] = (uint16_t)klee_abi_id_result(proc, ids[i]);
+    int rc = klee_write_mem(ic, proc->real_pid, remote, legacy, count * sizeof(*legacy));
+    if (legacy != &single)
+        free(legacy);
+    return rc;
 }
 
 /* ==================== socketcall / ipc ==================== */
@@ -91,7 +201,6 @@ bool klee_abi_demux_enter(KleeProcess *proc, KleeInterceptor *ic,
             proc->demux_mem = true;
             proc->demux_dirty = false;
             proc->demux_nargs = nargs;
-            proc->demux_saved_ptr = ev->args[1];
             for (int a = 0; a < 6; a++)
                 proc->demux_args[a] = ev->args[a] = arr[a];
             ev->syscall_nr = socketcalls[i].nr64;
@@ -120,51 +229,37 @@ bool klee_abi_demux_enter(KleeProcess *proc, KleeInterceptor *ic,
     return false;
 }
 
-void klee_abi_demux_commit(KleeProcess *proc, KleeInterceptor *ic,
-                           KleeEvent *ev)
+int klee_abi_demux_commit(KleeProcess *proc, KleeInterceptor *ic)
 {
     if (!proc->demux_mem || !proc->demux_dirty)
-        return;
+        return 0;
 
     uint32_t arr[6];
     for (int a = 0; a < 6; a++)
         arr[a] = (uint32_t)proc->demux_args[a];
 
-    klee_regs_fetch(ic, proc);
-    uint64_t sp = klee_regs_get_sp(proc);
-    /* Below every path scratch slot a handler may have used. */
-    uint64_t scratch = (sp - 128 - (uint64_t)PATH_MAX *
-                        (uint64_t)(proc->path_arg_count + 1) - 64) & ~7ULL;
-    if (klee_write_mem(ic, ev->pid, (void *)(uintptr_t)scratch, arr,
-                       (size_t)proc->demux_nargs * sizeof(uint32_t)) < 0) {
-        KLEE_DEBUG("socketcall: cannot stage argument array for pid %d",
-                   ev->pid);
-        proc->demux_dirty = false;
-        return;
-    }
+    uint64_t scratch;
+    int rc = klee_scratch_write(proc, ic, arr,
+                                 (size_t)proc->demux_nargs * sizeof(uint32_t), &scratch);
+    if (rc < 0)
+        return rc;
     klee_regs_set_arg_raw(proc, 1, scratch);
-    klee_regs_push(ic, proc);
-    proc->path_modified = true;   /* make sure the exit stop restores ecx */
+    return klee_regs_push(ic, proc);
 }
 
-void klee_abi_demux_exit_args(const KleeProcess *proc, KleeEvent *ev)
+int klee_abi_stage_ptrs(KleeProcess *proc, KleeInterceptor *ic,
+                         const uint64_t *ptrs, size_t count, uint64_t *addr)
 {
-    if (proc->demux_mem) {
-        for (int a = 0; a < 6; a++)
-            ev->args[a] = proc->demux_args[a];
-    } else if (proc->arg_shift) {
-        for (int a = 0; a + proc->arg_shift < 6; a++)
-            ev->args[a] = ev->args[a + proc->arg_shift];
-    }
-}
-
-bool klee_abi_demux_restore(KleeProcess *proc)
-{
-    if (!proc->demux_mem || !proc->demux_dirty)
-        return false;
-    klee_regs_set_arg_raw(proc, 1, proc->demux_saved_ptr);
-    proc->demux_dirty = false;
-    return true;
+    if (proc->abi == KLEE_ABI_X86_64)
+        return klee_scratch_write(proc, ic, ptrs, count * sizeof(*ptrs), addr);
+    uint32_t *compat = malloc(count * sizeof(*compat));
+    if (!compat)
+        return -ENOMEM;
+    for (size_t i = 0; i < count; i++)
+        compat[i] = (uint32_t)ptrs[i];
+    int rc = klee_scratch_write(proc, ic, compat, count * sizeof(*compat), addr);
+    free(compat);
+    return rc;
 }
 
 /* ==================== Struct layouts ==================== */
@@ -185,6 +280,11 @@ void klee_abi_stat_layout(KleeAbi abi, size_t *mode_off, size_t *uid_off,
         *uid_off = 28;
         *gid_off = 32;
     }
+}
+
+size_t klee_abi_msg_size(KleeAbi abi)
+{
+    return abi == KLEE_ABI_I386 ? sizeof(((KleeAbiMsg *)0)->compat) : sizeof(struct msghdr);
 }
 
 int klee_abi_read_msg_control(KleeInterceptor *ic, pid_t pid, KleeAbi abi,
@@ -242,47 +342,4 @@ bool klee_abi_cmsg_next(KleeAbi abi, const uint8_t *buf, size_t len,
     *data_len = (size_t)cmsg_len - hdr;
     *off += ((size_t)cmsg_len + align - 1) & ~(align - 1);
     return true;
-}
-
-int klee_abi_read_fprog(KleeInterceptor *ic, pid_t pid, KleeAbi abi,
-                        uint64_t addr, uint16_t *len, uint64_t *filter_addr)
-{
-    if (abi == KLEE_ABI_I386) {
-        /* struct compat_sock_fprog: u16 len; pad(2); u32 filter */
-        uint8_t raw[8];
-        int rc = klee_read_mem(ic, pid, raw, (const void *)(uintptr_t)addr,
-                               sizeof(raw));
-        if (rc < 0)
-            return rc;
-        uint32_t f;
-        memcpy(len, raw, sizeof(*len));
-        memcpy(&f, raw + 4, sizeof(f));
-        *filter_addr = f;
-        return 0;
-    }
-    uint8_t raw[16];
-    int rc = klee_read_mem(ic, pid, raw, (const void *)(uintptr_t)addr,
-                           sizeof(raw));
-    if (rc < 0)
-        return rc;
-    memcpy(len, raw, sizeof(*len));
-    memcpy(filter_addr, raw + 8, sizeof(*filter_addr));
-    return 0;
-}
-
-int klee_abi_write_fprog(KleeInterceptor *ic, pid_t pid, KleeAbi abi,
-                         uint64_t addr, uint16_t len, uint64_t filter_addr)
-{
-    if (abi == KLEE_ABI_I386) {
-        uint8_t raw[8] = { 0 };
-        uint32_t f = (uint32_t)filter_addr;
-        memcpy(raw, &len, sizeof(len));
-        memcpy(raw + 4, &f, sizeof(f));
-        return klee_write_mem(ic, pid, (void *)(uintptr_t)addr, raw,
-                              sizeof(raw));
-    }
-    uint8_t raw[16] = { 0 };
-    memcpy(raw, &len, sizeof(len));
-    memcpy(raw + 8, &filter_addr, sizeof(filter_addr));
-    return klee_write_mem(ic, pid, (void *)(uintptr_t)addr, raw, sizeof(raw));
 }

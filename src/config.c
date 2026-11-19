@@ -100,24 +100,16 @@ KleeMountOp *klee_config_add_mount(KleeConfig *cfg, MountType type,
         return NULL;
 
     op->type = type;
-    if (source) {
-        /* Symlink targets are container-internal paths, not host paths.
-         * realpath() would resolve them on the host filesystem, which
-         * corrupts paths like /run/host/monitor/resolv.conf that only
-         * exist inside the container's mount namespace. */
-        if (type == MOUNT_SYMLINK) {
-            op->source = strdup(source);
-        } else {
-            char resolved[PATH_MAX];
-            if (realpath(source, resolved))
-                op->source = strdup(resolved);
-            else
-                op->source = strdup(source); /* keep original on failure */
-        }
-    } else {
-        op->source = NULL;
-    }
+    /* Source lookup uses the caller's view. Nested callers translate their
+     * sources before mount population resolves them on the host. */
+    op->source = source ? strdup(source) : NULL;
     op->dest = dest ? strdup(dest) : NULL;
+    if ((source && !op->source) || (dest && !op->dest)) {
+        free(op->source);
+        free(op->dest);
+        free(op);
+        return NULL;
+    }
     /* Per-type default permissions matching bwrap:
      * --file defaults to 0666, --bind-data/--ro-bind-data to 0600,
      * everything else defaults to 0755. */

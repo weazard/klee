@@ -11,6 +11,7 @@
  */
 #include "compat/zypak_compat.h"
 #include "process/memory.h"
+#include "syscall/abi.h"
 #include "process/regs.h"
 #include "fs/path_resolve.h"
 #include "fs/mount_table.h"
@@ -31,65 +32,6 @@
 /* ------------------------------------------------------------------ */
 /* Tracee memory helpers (duplicated from nested.c for module isolation) */
 /* ------------------------------------------------------------------ */
-
-static void free_argv(char **argv, int argc)
-{
-    if (!argv)
-        return;
-    for (int i = 0; i < argc; i++)
-        free(argv[i]);
-    free(argv);
-}
-
-static int read_tracee_argv(KleeInterceptor *ic, pid_t pid,
-                            uint64_t argv_addr,
-                            char ***out_argv, int *out_argc)
-{
-    char **argv = NULL;
-    int argc = 0;
-    int cap = 0;
-
-    for (int i = 0; i < MAX_ARGV; i++) {
-        uint64_t ptr = 0;
-        int rc = klee_read_mem(ic, pid, &ptr,
-                               (const void *)(uintptr_t)(argv_addr + (uint64_t)i * 8),
-                               sizeof(ptr));
-        if (rc < 0) {
-            free_argv(argv, argc);
-            return rc;
-        }
-        if (ptr == 0)
-            break;
-
-        char buf[PATH_MAX];
-        rc = klee_read_string(ic, pid, buf, sizeof(buf),
-                              (const void *)(uintptr_t)ptr);
-        if (rc < 0) {
-            free_argv(argv, argc);
-            return rc;
-        }
-
-        if (argc >= cap) {
-            cap = cap ? cap * 2 : 32;
-            char **tmp = realloc(argv, (size_t)cap * sizeof(char *));
-            if (!tmp) {
-                free_argv(argv, argc);
-                return -ENOMEM;
-            }
-            argv = tmp;
-        }
-        argv[argc] = strdup(buf);
-        if (!argv[argc]) {
-            free_argv(argv, argc);
-            return -ENOMEM;
-        }
-        argc++;
-    }
-
-    *out_argv = argv;
-    *out_argc = argc;
-    return 0;
-}
 
 /* ------------------------------------------------------------------ */
 /* Detection                                                           */
@@ -227,30 +169,24 @@ bool klee_zypak_is_chrome_sandbox(const char *exe_path)
 /* ------------------------------------------------------------------ */
 
 void klee_zypak_nullify_sandbox_env(KleeInterceptor *ic, pid_t pid,
-                                     uint64_t envp_addr)
+                                     KleeAbi abi, uint64_t envp_addr)
 {
+    if (!envp_addr)
+        return;
+    static const char name[] = "CHROME_DEVEL_SANDBOX=";
+    const size_t name_len = sizeof(name) - 1;
     for (int i = 0; i < MAX_ARGV; i++) {
-        uint64_t env_ptr = 0;
-        int rc = klee_read_mem(ic, pid, &env_ptr,
-                               (const void *)(uintptr_t)(envp_addr + (uint64_t)i * 8),
-                               sizeof(env_ptr));
-        if (rc < 0 || env_ptr == 0)
-            break;
-
-        char prefix[32];
-        rc = klee_read_string(ic, pid, prefix, sizeof(prefix),
-                              (const void *)(uintptr_t)env_ptr);
-        if (rc < 0)
-            continue;
-
-        if (strncmp(prefix, "CHROME_DEVEL_SANDBOX=", 21) == 0 &&
-            prefix[21] != '\0') {
+        uint64_t ptr;
+        if (klee_abi_read_ptr(ic, pid, abi, envp_addr + i * klee_abi_ptr_size(abi),
+                              &ptr) < 0 || !ptr)
+            return;
+        char prefix[sizeof(name)];
+        if (klee_read_mem(ic, pid, prefix, (const void *)(uintptr_t)ptr,
+                          sizeof(prefix)) == 0 &&
+            memcmp(prefix, name, name_len) == 0 && prefix[name_len] != '\0') {
             char nul = '\0';
-            klee_write_mem(ic, pid,
-                           (void *)(uintptr_t)(env_ptr + 21),
-                           &nul, 1);
-            KLEE_DEBUG("zypak: nullified CHROME_DEVEL_SANDBOX in tracee envp");
-            break;
+            klee_write_mem(ic, pid, (void *)(uintptr_t)(ptr + name_len), &nul, 1);
+            return;
         }
     }
 }
@@ -392,7 +328,7 @@ static int apply_fps_env(const FlatpakSpawnOpts *opts,
     for (int i = 0; i < envc; i++) {
         env[i] = strdup(envp[i]);
         if (!env[i]) {
-            free_argv(env, i);
+            klee_abi_free_strv(env, i);
             return -ENOMEM;
         }
     }
@@ -412,7 +348,7 @@ static int apply_fps_env(const FlatpakSpawnOpts *opts,
                 free(env[i]);
                 env[i] = strdup(entry);
                 if (!env[i]) {
-                    free_argv(env, count);
+                    klee_abi_free_strv(env, count);
                     return -ENOMEM;
                 }
                 found = true;
@@ -424,14 +360,14 @@ static int apply_fps_env(const FlatpakSpawnOpts *opts,
                 cap *= 2;
                 char **tmp = realloc(env, (size_t)cap * sizeof(char *));
                 if (!tmp) {
-                    free_argv(env, count);
+                    klee_abi_free_strv(env, count);
                     return -ENOMEM;
                 }
                 env = tmp;
             }
             env[count] = strdup(entry);
             if (!env[count]) {
-                free_argv(env, count);
+                klee_abi_free_strv(env, count);
                 return -ENOMEM;
             }
             count++;
@@ -457,13 +393,13 @@ int klee_zypak_handle_flatpak_spawn(KleeProcess *proc, KleeInterceptor *ic,
     char **new_envp = NULL;
     int new_envc = 0;
     bool env_modified = false;
-    FlatpakSpawnOpts opts;
+    FlatpakSpawnOpts opts = {0};
     int ret = 0;
 
     KLEE_INFO("zypak: intercepting flatpak-spawn execve from pid=%d", pid);
 
     /* 1. Read tracee argv from memory */
-    rc = read_tracee_argv(ic, pid, ev->args[1], &raw_argv, &raw_argc);
+    rc = klee_abi_read_strv(proc, ic, ev->args[1], &raw_argv, &raw_argc);
     if (rc < 0 || raw_argc < 2) {
         KLEE_WARN("zypak: failed to read tracee argv (rc=%d argc=%d)",
                   rc, raw_argc);
@@ -494,7 +430,7 @@ int klee_zypak_handle_flatpak_spawn(KleeProcess *proc, KleeInterceptor *ic,
     if (opts.env_count > 0) {
         char **cur_envp = NULL;
         int cur_envc = 0;
-        rc = read_tracee_argv(ic, pid, ev->args[2],
+        rc = klee_abi_read_strv(proc, ic, ev->args[2],
                               &cur_envp, &cur_envc);
         if (rc == 0 && cur_envc >= 0) {
             rc = apply_fps_env(&opts, cur_envp, cur_envc,
@@ -504,7 +440,7 @@ int klee_zypak_handle_flatpak_spawn(KleeProcess *proc, KleeInterceptor *ic,
                 KLEE_DEBUG("zypak: env modified (%d -> %d vars)",
                            cur_envc, new_envc);
             }
-            free_argv(cur_envp, cur_envc);
+            klee_abi_free_strv(cur_envp, cur_envc);
         } else {
             KLEE_WARN("zypak: failed to read tracee envp: %d", rc);
         }
@@ -519,7 +455,7 @@ int klee_zypak_handle_flatpak_spawn(KleeProcess *proc, KleeInterceptor *ic,
              * Read the tracee's current env to get a mutable copy. */
             char **cur_envp = NULL;
             int cur_envc = 0;
-            rc = read_tracee_argv(ic, pid, ev->args[2],
+            rc = klee_abi_read_strv(proc, ic, ev->args[2],
                                   &cur_envp, &cur_envc);
             if (rc == 0 && cur_envc >= 0) {
                 new_envp = cur_envp;
@@ -580,6 +516,7 @@ int klee_zypak_handle_flatpak_spawn(KleeProcess *proc, KleeInterceptor *ic,
                 KleeResolveCtx ctx = {
                     .mount_table = proc->sandbox->mount_table,
                     .fd_table = proc->fd_table,
+                    .tracee_pid = proc->real_pid,
                     .vcwd = proc->vcwd,
                     .vroot = klee_mount_table_get_root(
                                  proc->sandbox->mount_table),
@@ -622,6 +559,7 @@ int klee_zypak_handle_flatpak_spawn(KleeProcess *proc, KleeInterceptor *ic,
             KleeResolveCtx ctx = {
                 .mount_table = proc->sandbox->mount_table,
                 .fd_table = proc->fd_table,
+                .tracee_pid = proc->real_pid,
                 .vcwd = proc->vcwd,
                 .vroot = klee_mount_table_get_root(
                              proc->sandbox->mount_table),
@@ -641,158 +579,34 @@ int klee_zypak_handle_flatpak_spawn(KleeProcess *proc, KleeInterceptor *ic,
 
     KLEE_INFO("zypak: resolved %s -> %s", target_guest, target_host);
 
-    /* 6. Write new exec path + argv + envp to tracee stack scratch,
-     *    update registers (ptrace backend) */
     if (ic->backend == INTERCEPT_PTRACE) {
-        uint64_t *str_addrs = calloc((size_t)target_argc, sizeof(uint64_t));
-        if (!str_addrs) {
-            ret = -ENOMEM;
+        uint64_t filename, argv, envp;
+        ret = klee_scratch_string(proc, ic, target_host, &filename);
+        if (ret < 0)
             goto out;
-        }
-
-        klee_regs_fetch(ic, proc);
-        uint64_t rsp = klee_regs_get_sp(proc);
-
-        /* Save original arg values for exit-time restore */
-        proc->saved_args[0] = ev->args[0];
-        proc->saved_args[1] = ev->args[1];
-
-        /*
-         * Scratch layout below tracee RSP:
-         *   RSP - 128 (red zone) - PATH_MAX : exec path (arg0)
-         *   below that                       : argv strings
-         *   below that (8-byte aligned)      : argv pointer array
-         */
-        uint64_t exec_addr = rsp - 128 - PATH_MAX;
-
-        /* Write exec host path */
-        rc = klee_write_string(ic, pid,
-                               (void *)(uintptr_t)exec_addr,
-                               target_host);
-        if (rc < 0) {
-            KLEE_WARN("zypak: failed to write exec path: %d", rc);
-            free(str_addrs);
+        ret = klee_abi_stage_strv(proc, ic, target_argv, target_argc, &argv);
+        if (ret < 0)
             goto out;
-        }
-
-        /* Write argv strings below the exec path */
-        uint64_t cursor = exec_addr;
-
-        for (int i = 0; i < target_argc; i++) {
-            const char *s = target_argv[i];
-            size_t slen = strlen(s) + 1;
-            cursor -= slen;
-            str_addrs[i] = cursor;
-
-            rc = klee_write_string(ic, pid,
-                                   (void *)(uintptr_t)cursor, s);
-            if (rc < 0) {
-                KLEE_WARN("zypak: failed to write argv[%d]: %d", i, rc);
-                free(str_addrs);
+        if (env_modified) {
+            ret = klee_abi_stage_strv(proc, ic, new_envp, new_envc, &envp);
+            if (ret < 0)
                 goto out;
-            }
+            klee_regs_set_arg(proc, 2, envp);
         }
-
-        /* Align cursor down to 8 bytes for pointer array */
-        cursor &= ~(uint64_t)7;
-
-        /* Write argv pointer array + NULL terminator */
-        uint64_t argv_array = cursor - (uint64_t)(target_argc + 1) * 8;
-
-        for (int i = 0; i < target_argc; i++) {
-            rc = klee_write_mem(ic, pid,
-                    (const void *)(uintptr_t)(argv_array + (uint64_t)i * 8),
-                    &str_addrs[i], 8);
-            if (rc < 0) {
-                KLEE_WARN("zypak: failed to write argv ptr[%d]: %d", i, rc);
-                free(str_addrs);
-                goto out;
-            }
-        }
-        /* NULL terminator */
-        uint64_t null_val = 0;
-        rc = klee_write_mem(ic, pid,
-                (const void *)(uintptr_t)(argv_array + (uint64_t)target_argc * 8),
-                &null_val, 8);
-        if (rc < 0) {
-            KLEE_WARN("zypak: failed to write argv NULL: %d", rc);
-            free(str_addrs);
+        klee_regs_set_arg(proc, 0, filename);
+        klee_regs_set_arg(proc, 1, argv);
+        ret = klee_regs_push(ic, proc);
+        if (ret < 0)
             goto out;
-        }
-
-        free(str_addrs);
-
-        /* Write envp strings and pointer array below argv array */
-        uint64_t envp_array = 0;
-        if (env_modified && new_envp && new_envc > 0) {
-            uint64_t *env_addrs = calloc((size_t)new_envc, sizeof(uint64_t));
-            if (!env_addrs) {
-                ret = -ENOMEM;
-                goto out;
-            }
-
-            uint64_t ecursor = argv_array;
-            for (int i = 0; i < new_envc; i++) {
-                size_t slen = strlen(new_envp[i]) + 1;
-                ecursor -= slen;
-                env_addrs[i] = ecursor;
-                rc = klee_write_string(ic, pid,
-                        (void *)(uintptr_t)ecursor, new_envp[i]);
-                if (rc < 0) {
-                    KLEE_WARN("zypak: failed to write env[%d]: %d", i, rc);
-                    free(env_addrs);
-                    goto out;
-                }
-            }
-
-            ecursor &= ~(uint64_t)7;
-            envp_array = ecursor - (uint64_t)(new_envc + 1) * 8;
-
-            for (int i = 0; i < new_envc; i++) {
-                rc = klee_write_mem(ic, pid,
-                        (const void *)(uintptr_t)(envp_array + (uint64_t)i * 8),
-                        &env_addrs[i], 8);
-                if (rc < 0) {
-                    free(env_addrs);
-                    goto out;
-                }
-            }
-            uint64_t env_null = 0;
-            klee_write_mem(ic, pid,
-                    (const void *)(uintptr_t)(envp_array + (uint64_t)new_envc * 8),
-                    &env_null, 8);
-            free(env_addrs);
-        }
-
-        /* Update registers: arg0 = exec path, arg1 = argv array */
-        klee_regs_set_arg(proc, 0, exec_addr);
-        klee_regs_set_arg(proc, 1, argv_array);
-        if (env_modified && envp_array) {
-            proc->saved_args[2] = ev->args[2];
-            klee_regs_set_arg(proc, 2, envp_array);
-        }
-        klee_regs_push(ic, proc);
-
-        /* Track modified args for exit-time restore (if exec fails) */
-        proc->path_arg_idx[0] = 0;
-        proc->path_arg_idx[1] = 1;
-        proc->path_arg_count = 2;
-        if (env_modified && envp_array) {
-            proc->path_arg_idx[2] = 2;
-            proc->path_arg_count = 3;
-        }
-        proc->path_modified = true;
     }
 
-    /* 7. Set vexe to the target command's resolved guest path */
-    snprintf(proc->vexe, PATH_MAX, "%s", target_abs);
     snprintf(proc->saved_path, PATH_MAX, "%s", target_abs);
     snprintf(proc->resolved_guest, PATH_MAX, "%s", target_abs);
     snprintf(proc->translated_path, PATH_MAX, "%s", target_host);
 
 out:
     fps_opts_destroy(&opts);
-    free_argv(new_envp, new_envc);
-    free_argv(raw_argv, raw_argc);
+    klee_abi_free_strv(new_envp, new_envc);
+    klee_abi_free_strv(raw_argv, raw_argc);
     return ret;
 }

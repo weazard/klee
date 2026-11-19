@@ -113,7 +113,7 @@ static int resolve_components(ResolveState *state, const char *path)
 
             if (strlen(state->guest_path) > strlen(boundary))
                 path_pop(state->guest_path);
-            else if (state->ctx->flags & (KLEE_RESOLVE_BENEATH | KLEE_RESOLVE_IN_ROOT))
+            else if (state->ctx->flags & KLEE_RESOLVE_BENEATH)
                 return -EXDEV;
             continue;
         }
@@ -124,9 +124,10 @@ static int resolve_components(ResolveState *state, const char *path)
             return rc;
 
         /* Translate through mount table to get host path */
-        rc = klee_mount_table_translate(state->ctx->mount_table,
-                                         state->guest_path,
-                                         state->host_path, PATH_MAX);
+        rc = klee_mount_table_translate_nofollow(state->ctx->mount_table,
+                                                  state->guest_path,
+                                                  state->host_path, PATH_MAX,
+                                                  KLEE_OV_LOOKUP);
         if (rc < 0)
             return rc;
 
@@ -140,36 +141,21 @@ static int resolve_components(ResolveState *state, const char *path)
             is_last_component = (*rest == '\0');
         }
 
-        /* Check for virtual symlink (MOUNT_SYMLINK in the mount table).
-         * These are synthesized from bwrap --symlink and don't exist on the
-         * host filesystem, so the lstat check below would miss them. */
-        if (!(state->ctx->flags & KLEE_RESOLVE_NO_SYMLINKS) &&
-            !is_last_component) {
-            KleeMount *vmount = klee_mount_table_resolve(
-                state->ctx->mount_table, state->guest_path);
-            if (vmount && vmount->type == MOUNT_SYMLINK &&
-                vmount->dest && strcmp(vmount->dest, state->guest_path) == 0) {
-                state->depth++;
-                if (state->depth > KLEE_MAX_SYMLINK_DEPTH)
-                    return -ELOOP;
-                path_pop(state->guest_path);
-                rc = resolve_symlink(state, vmount->source, p);
-                if (rc < 0)
-                    return rc;
-                return 0;
-            }
-        }
-
         /* Check if this is a symlink (on the host filesystem) */
-        if (!(state->ctx->flags & KLEE_RESOLVE_NO_SYMLINKS) &&
-            !is_last_component) {
+        if (!is_last_component) {
             struct stat st;
             if (lstat(state->host_path, &st) == 0 && S_ISLNK(st.st_mode)) {
+                bool in_proc = strncmp(state->host_path, "/proc/", 6) == 0;
+                if ((state->ctx->flags & KLEE_RESOLVE_NO_SYMLINKS) ||
+                    (in_proc && (state->ctx->flags & KLEE_RESOLVE_NO_MAGICLINKS)))
+                    return -ELOOP;
                 char link_target[PATH_MAX];
                 ssize_t link_len = readlink(state->host_path, link_target,
-                                            PATH_MAX - 1);
+                                            sizeof(link_target));
                 if (link_len < 0)
                     return -errno;
+                if (link_len == (ssize_t)sizeof(link_target))
+                    return -ENAMETOOLONG;
                 link_target[link_len] = '\0';
 
                 /* Don't follow symlinks under /proc/.  All /proc symlinks
@@ -178,7 +164,7 @@ static int resolve_components(ResolveState *state, const char *path)
                  * paths.  Following them in userspace resolution would
                  * produce incorrect mount table translations.  Let the
                  * kernel resolve them at syscall time. */
-                if (strncmp(state->host_path, "/proc/", 6) != 0) {
+                if (!in_proc) {
                     state->depth++;
                     if (state->depth > KLEE_MAX_SYMLINK_DEPTH)
                         return -ELOOP;
@@ -223,6 +209,9 @@ static int resolve_components(ResolveState *state, const char *path)
             char parent_path[PATH_MAX];
             snprintf(parent_path, sizeof(parent_path), "%s", state->guest_path);
             path_pop(parent_path);
+            if (klee_mount_table_resolve(state->ctx->mount_table, parent_path) !=
+                klee_mount_table_resolve(state->ctx->mount_table, state->guest_path))
+                return -EXDEV;
             char parent_host[PATH_MAX];
             if (klee_mount_table_translate(state->ctx->mount_table,
                                             parent_path, parent_host,
@@ -246,12 +235,8 @@ static int resolve_symlink(ResolveState *state, const char *link_target,
     char combined[PATH_MAX * 2];
 
     if (link_target[0] == '/') {
-        /* RESOLVE_NO_MAGICLINKS: reject magic proc symlinks */
-        if (state->ctx->flags & KLEE_RESOLVE_NO_MAGICLINKS) {
-            /* Check if the host path is under /proc - magic symlinks */
-            if (strncmp(state->host_path, "/proc/", 6) == 0)
-                return -ELOOP;
-        }
+        if (state->ctx->flags & KLEE_RESOLVE_BENEATH)
+            return -EXDEV;
 
         /* Absolute symlink: restart from virtual root.
          * For RESOLVE_IN_ROOT, this enforces the constraint that
@@ -283,22 +268,10 @@ int klee_path_resolve(KleeResolveCtx *ctx, const char *guest_path,
         /* Absolute path */
         const char *vroot = ctx->vroot ? ctx->vroot : "/";
         snprintf(state.guest_path, PATH_MAX, "%s", vroot);
-    } else if (dirfd == AT_FDCWD || dirfd == -100) {
-        /* Relative to vcwd */
-        if (ctx->vcwd)
-            snprintf(state.guest_path, PATH_MAX, "%s", ctx->vcwd);
-        else
-            strcpy(state.guest_path, "/");
     } else {
-        /* Relative to dirfd - look up in FD table.  An untracked one
-         * (inherited, received, or from a call klee does not follow) must
-         * not be taken for "/": the caller leaves the path to the kernel. */
-        const char *dir_path = NULL;
-        if (ctx->fd_table)
-            dir_path = klee_fd_table_get(ctx->fd_table, dirfd);
-        if (!dir_path)
-            return -EBADF;
-        snprintf(state.guest_path, PATH_MAX, "%s", dir_path);
+        int rc = klee_path_dirfd(ctx, dirfd, state.guest_path);
+        if (rc < 0)
+            return rc;
     }
 
     int rc = resolve_components(&state, guest_path);
@@ -306,6 +279,42 @@ int klee_path_resolve(KleeResolveCtx *ctx, const char *guest_path,
         return rc;
 
     snprintf(resolved, PATH_MAX, "%s", state.guest_path);
+    return 0;
+}
+
+int klee_path_dirfd(const KleeResolveCtx *ctx, int dirfd, char *guest)
+{
+    if (dirfd == AT_FDCWD) {
+        if (ctx->vcwd && !ctx->vcwd[0])
+            return -EBADF;
+        snprintf(guest, PATH_MAX, "%s", ctx->vcwd ? ctx->vcwd : "/");
+        return 0;
+    }
+    const char *saved = klee_fd_table_get(ctx->fd_table, dirfd);
+    if (saved) {
+        snprintf(guest, PATH_MAX, "%s", saved);
+        return 0;
+    }
+    if (ctx->tracee_pid <= 0 || dirfd < 0)
+        return -EBADF;
+
+    char proc_fd[64], host[PATH_MAX];
+    snprintf(proc_fd, sizeof(proc_fd), "/proc/%d/fd/%d", ctx->tracee_pid, dirfd);
+    struct stat st;
+    if (stat(proc_fd, &st) < 0)
+        return -EBADF;
+    if (!S_ISDIR(st.st_mode))
+        return -ENOTDIR;
+    ssize_t n = readlink(proc_fd, host, sizeof(host));
+    if (n < 0 || n == (ssize_t)sizeof(host))
+        return -EBADF;
+    host[n] = '\0';
+    struct stat current;
+    if (stat(host, &current) < 0 ||
+        st.st_ino != current.st_ino || st.st_dev != current.st_dev)
+        return -EBADF;
+    if (klee_mount_table_host_to_guest(ctx->mount_table, host, guest, PATH_MAX) < 0)
+        return -EBADF;  /* no equivalent guest path; keep kernel dirfd semantics */
     return 0;
 }
 
@@ -343,7 +352,7 @@ int klee_path_guest_to_host_nofollow(KleeResolveCtx *ctx, const char *guest_path
     if (rc < 0)
         return rc;
 
-    return klee_mount_table_translate_access(ctx->mount_table, resolved,
+    return klee_mount_table_translate_nofollow(ctx->mount_table, resolved,
                                               host_path, PATH_MAX,
                                               ctx->ov_access);
 }

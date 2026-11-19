@@ -17,6 +17,13 @@ KleeIdState *klee_id_state_create(uid_t uid, gid_t gid)
 
     ids->ruid = ids->euid = ids->suid = ids->fsuid = uid;
     ids->rgid = ids->egid = ids->sgid = ids->fsgid = gid;
+    ids->groups = malloc(sizeof(*ids->groups));
+    if (!ids->groups) {
+        free(ids);
+        return NULL;
+    }
+    ids->groups[0] = gid;
+    ids->group_count = 1;
     return ids;
 }
 
@@ -25,13 +32,26 @@ KleeIdState *klee_id_state_clone(const KleeIdState *src)
     if (!src)
         return NULL;
     KleeIdState *ids = malloc(sizeof(KleeIdState));
-    if (ids)
-        memcpy(ids, src, sizeof(KleeIdState));
+    if (!ids)
+        return NULL;
+    *ids = *src;
+    ids->groups = NULL;
+    if (src->group_count) {
+        size_t bytes = src->group_count * sizeof(*src->groups);
+        ids->groups = malloc(bytes);
+        if (!ids->groups) {
+            free(ids);
+            return NULL;
+        }
+        memcpy(ids->groups, src->groups, bytes);
+    }
     return ids;
 }
 
 void klee_id_state_destroy(KleeIdState *ids)
 {
+    if (ids)
+        free(ids->groups);
     free(ids);
 }
 

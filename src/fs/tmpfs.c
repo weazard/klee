@@ -11,112 +11,116 @@
 #include <errno.h>
 #include <unistd.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 #include <fcntl.h>
+#include <ftw.h>
 #include <linux/limits.h>
 
-#define MAX_TMPFS_DIRS 256
-
-static char *tmpfs_dirs[MAX_TMPFS_DIRS];
-static int tmpfs_count = 0;
-static pid_t tmpfs_pid = 0;
-
-static void register_tmpfs(const char *path)
-{
-    if (tmpfs_count < MAX_TMPFS_DIRS) {
-        tmpfs_dirs[tmpfs_count++] = strdup(path);
-        if (tmpfs_pid == 0)
-            tmpfs_pid = getpid();
-    }
-}
+static char backing_root[sizeof("/tmp/klee-tmp.XXXXXX")];
+static pid_t backing_owner;
+static unsigned long next_backing;
 
 char *klee_tmpfs_create(const char *guest_dest)
 {
-    char path[PATH_MAX];
-    snprintf(path, sizeof(path), "/tmp/klee-%d-%d", getpid(), tmpfs_count);
-
-    if (mkdir(path, 0755) < 0 && errno != EEXIST) {
-        KLEE_WARN("failed to create tmpfs dir %s: %s", path, strerror(errno));
-        return NULL;
+    pid_t own_pid = getpid();
+    if (backing_owner != own_pid) {
+        strcpy(backing_root, "/tmp/klee-tmp.XXXXXX");
+        if (!mkdtemp(backing_root))
+            return NULL;
+        /* A guest can change its real UID. Keep the mount's permissions
+         * authoritative while restricting writes to the session root. */
+        if (chmod(backing_root, 0711) < 0) {
+            int error = errno;
+            rmdir(backing_root);
+            errno = error;
+            return NULL;
+        }
+        backing_owner = own_pid;
+        next_backing = 0;
     }
 
-    register_tmpfs(path);
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%lu", backing_root, next_backing++);
+    if (mkdir(path, 0755) < 0)
+        return NULL;
+
     KLEE_DEBUG("tmpfs: created %s for guest %s", path, guest_dest);
     return strdup(path);
 }
 
-char *klee_tmpfs_create_file(const char *guest_dest, int fd)
+char *klee_tmpfs_create_file(const char *guest_dest, int fd, mode_t mode)
 {
-    char dir_path[PATH_MAX];
-    snprintf(dir_path, sizeof(dir_path), "/tmp/klee-%d-%d", getpid(), tmpfs_count);
-
-    if (mkdir(dir_path, 0755) < 0 && errno != EEXIST) {
-        KLEE_WARN("failed to create tmpfs dir: %s", strerror(errno));
+    char *dir = klee_tmpfs_create(guest_dest);
+    if (!dir)
         return NULL;
-    }
 
-    char file_path[PATH_MAX];
-    /* Use basename of guest_dest */
     const char *base = strrchr(guest_dest, '/');
     base = base ? base + 1 : guest_dest;
-    if (!*base)
+    if (!*base || strcmp(base, ".") == 0 || strcmp(base, "..") == 0)
         base = "data";
-    int n = snprintf(file_path, sizeof(file_path), "%s/%s", dir_path, base);
-    if (n < 0 || (size_t)n >= sizeof(file_path)) {
-        KLEE_WARN("file path too long: %s/%s", dir_path, base);
+
+    char path[PATH_MAX];
+    int length = snprintf(path, sizeof(path), "%s/%s", dir, base);
+    free(dir);
+    if (length < 0 || (size_t)length >= sizeof(path)) {
+        errno = ENAMETOOLONG;
         return NULL;
     }
 
-    /* Read from fd and write to file */
-    int out_fd = open(file_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (out_fd < 0) {
-        KLEE_WARN("failed to create file %s: %s", file_path, strerror(errno));
+    int out = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (out < 0)
         return NULL;
-    }
 
-    if (fd >= 0) {
-        char buf[4096];
-        ssize_t n;
-        while ((n = read(fd, buf, sizeof(buf))) > 0) {
-            ssize_t written = 0;
-            while (written < n) {
-                ssize_t w = write(out_fd, buf + written, (size_t)(n - written));
-                if (w < 0) {
-                    close(out_fd);
-                    return NULL;
-                }
-                written += w;
+    int error = 0;
+    char buf[8192];
+    ssize_t nread;
+    while ((nread = read(fd, buf, sizeof(buf))) > 0) {
+        size_t written = 0;
+        while (written < (size_t)nread) {
+            ssize_t n = write(out, buf + written, (size_t)nread - written);
+            if (n <= 0) {
+                error = n < 0 ? errno : EIO;
+                break;
             }
+            written += (size_t)n;
         }
+        if (error)
+            break;
+    }
+    if (nread < 0)
+        error = errno;
+    if (!error && fchmod(out, mode) < 0)
+        error = errno;
+    if (close(out) < 0 && !error)
+        error = errno;
+    if (error) {
+        unlink(path);
+        errno = error;
+        return NULL;
     }
 
-    close(out_fd);
-    register_tmpfs(dir_path);
-    KLEE_DEBUG("tmpfs file: created %s for guest %s", file_path, guest_dest);
-    return strdup(file_path);
+    KLEE_DEBUG("tmpfs file: created %s for guest %s", path, guest_dest);
+    return strdup(path);
 }
 
-static int rm_rf(const char *path)
+static int remove_backing(const char *path, const struct stat *st, int type,
+                          struct FTW *info)
 {
-    /* Simple recursive delete using system rm */
-    char cmd[PATH_MAX + 16];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", path);
-    return system(cmd);
+    (void)st;
+    (void)type;
+    (void)info;
+    if (remove(path) < 0 && errno != ENOENT) {
+        KLEE_WARN("cannot remove backing path %s: %s", path, strerror(errno));
+        return 1;
+    }
+    return 0;
 }
 
 void klee_tmpfs_cleanup(void)
 {
-    /* Only clean up from the process that created them */
-    if (tmpfs_pid != 0 && tmpfs_pid != getpid())
+    if (backing_owner != getpid())
         return;
-
-    for (int i = 0; i < tmpfs_count; i++) {
-        if (tmpfs_dirs[i]) {
-            KLEE_DEBUG("tmpfs cleanup: %s", tmpfs_dirs[i]);
-            rm_rf(tmpfs_dirs[i]);
-            free(tmpfs_dirs[i]);
-            tmpfs_dirs[i] = NULL;
-        }
-    }
-    tmpfs_count = 0;
+    if (nftw(backing_root, remove_backing, 16, FTW_DEPTH | FTW_PHYS | FTW_MOUNT) < 0 &&
+        errno != ENOENT)
+        KLEE_WARN("cannot clean up %s: %s", backing_root, strerror(errno));
+    backing_owner = 0;
 }

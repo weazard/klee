@@ -44,6 +44,10 @@ int main(void)
     unsigned flags = 0;
     klee_sysnum_i386_to_x64(102, &flags);
     CHECK("socketcall flagged as demux", flags & KLEE_SYS32_DEMUX);
+    klee_sysnum_i386_to_x64(165, &flags);
+    CHECK("legacy i386 getresuid uses 16-bit IDs", flags & KLEE_SYS32_UID16);
+    CHECK("i386 time64 sched_rr_get_interval is mapped",
+          klee_sysnum_i386_to_x64(423, NULL) == SYS_sched_rr_get_interval);
     size_t n = klee_sysnum_x64_to_i386(SYS_stat, nrs, 256);
     CHECK("stat has several i386 spellings", n >= 2);
 
@@ -67,6 +71,9 @@ int main(void)
     CHECK("x86_64 getpgrp trapped", r == -1 && errno == ENOSYS);
     r = syscall(SYS_gettimeofday, 0, 0);
     CHECK("x86_64 gettimeofday allowed", r == 0);
+    errno = 0;
+    r = syscall(SYS_sendto, -1, NULL, 0, 0, NULL, 0);
+    CHECK("connected sendto is passed through", r == -1 && errno == EBADF);
 
     CHECK("i386 getpid (20) trapped", sys32(20, 0) == -ENOSYS);
     CHECK("i386 open (5) trapped", sys32(5, 0) == -ENOSYS);

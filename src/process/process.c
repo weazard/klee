@@ -5,11 +5,13 @@
 #include "process/process.h"
 #include "fs/mount_table.h"
 #include "ns/ipc_ns.h"
+#include "ns/user_ns.h"
 #include "util/log.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <sched.h>
+#include <limits.h>
 
 KleeProcessTable *klee_proctable_create(void)
 {
@@ -26,18 +28,24 @@ KleeProcessTable *klee_proctable_create(void)
     return pt;
 }
 
+static void free_process(KleeProcess *proc)
+{
+    klee_sandbox_unref(proc->sandbox);
+    klee_sandbox_unref(proc->exec_previous_sandbox);
+    klee_id_state_destroy(proc->id_state);
+    klee_arena_destroy(proc->event_arena);
+    klee_arena_destroy(proc->life_arena);
+    klee_fd_table_destroy(proc->fd_table);
+    if (proc->fs && --proc->fs->refs == 0)
+        free(proc->fs);
+    free(proc);
+}
+
 static int free_process_iter(uint64_t key, void *value, void *ctx)
 {
     (void)key;
     (void)ctx;
-    KleeProcess *proc = value;
-    if (proc->event_arena)
-        klee_arena_destroy(proc->event_arena);
-    if (proc->life_arena)
-        klee_arena_destroy(proc->life_arena);
-    if (proc->fd_table)
-        klee_fd_table_destroy(proc->fd_table);
-    free(proc);
+    free_process(value);
     return 0;
 }
 
@@ -58,6 +66,8 @@ KleeProcess *klee_process_create(KleeProcessTable *pt, pid_t real_pid,
         return NULL;
 
     proc->real_pid = real_pid;
+    proc->real_tgid = real_pid;
+    proc->table = pt;
     proc->virtual_pid = real_pid; /* default; PID NS will remap */
     proc->state = PROC_STATE_NEW;
     proc->sandbox = sandbox;
@@ -105,6 +115,25 @@ KleeProcess *klee_process_find(KleeProcessTable *pt, pid_t real_pid)
     return klee_ht_get(pt->by_pid, (uint64_t)real_pid);
 }
 
+const char *klee_process_exe_at(const KleeProcess *proc, const char *path)
+{
+    if (strncmp(path, "/proc/", 6) != 0 || path[6] < '1' || path[6] > '9')
+        return NULL;
+    char *end;
+    unsigned long id = strtoul(path + 6, &end, 10);
+    if (id > INT_MAX)
+        return NULL;
+    pid_t tgid = (pid_t)id;
+    bool task_path = strncmp(end, "/task/", 6) == 0 && end[6] >= '1' && end[6] <= '9';
+    if (task_path)
+        id = strtoul(end + 6, &end, 10);
+    if (id > INT_MAX || strcmp(end, "/exe") != 0)
+        return NULL;
+    KleeProcess *target = klee_process_find(proc->table, (pid_t)id);
+    return target && (!task_path || target->real_tgid == tgid) && target->vexe[0] ?
+           target->vexe : NULL;
+}
+
 void klee_process_remove(KleeProcessTable *pt, pid_t real_pid)
 {
     KleeProcess *proc = klee_ht_remove(pt->by_pid, (uint64_t)real_pid);
@@ -137,21 +166,31 @@ void klee_process_remove(KleeProcessTable *pt, pid_t real_pid)
         child = next;
     }
 
-    if (proc->sandbox)
-        klee_sandbox_unref(proc->sandbox);
-    klee_sandbox_unref(proc->exec_previous_sandbox);
-    if (proc->event_arena)
-        klee_arena_destroy(proc->event_arena);
-    if (proc->life_arena)
-        klee_arena_destroy(proc->life_arena);
-    if (proc->fd_table)
-        klee_fd_table_destroy(proc->fd_table);
-    if (proc->fs && --proc->fs->refs <= 0)
-        free(proc->fs);
-    free(proc);
+    free_process(proc);
 
     pt->count--;
     KLEE_DEBUG("removed process pid=%d", real_pid);
+}
+
+KleeProcess *klee_process_exec_rekey(KleeProcessTable *pt, pid_t former_tid,
+                                     pid_t leader_pid)
+{
+    KleeProcess *proc = klee_process_find(pt, former_tid);
+    if (!proc)
+        return NULL;
+    KleeProcess *leader = klee_process_find(pt, leader_pid);
+    if (leader) {
+        proc->virtual_pid = leader->virtual_pid;
+        proc->virtual_ppid = leader->virtual_ppid;
+        klee_process_remove(pt, leader_pid);
+    }
+    klee_ht_put(pt->by_pid, (uint64_t)leader_pid, proc);
+    if (klee_process_find(pt, leader_pid) != proc)
+        return NULL;
+    klee_ht_remove(pt->by_pid, (uint64_t)former_tid);
+    proc->real_pid = leader_pid;
+    proc->real_tgid = leader_pid;
+    return proc;
 }
 
 KleeProcess *klee_process_fork(KleeProcessTable *pt, KleeProcess *parent,
@@ -177,6 +216,8 @@ KleeProcess *klee_process_fork(KleeProcessTable *pt, KleeProcess *parent,
     }
 
     /* Copy state from parent */
+    if (clone_flags & CLONE_THREAD)
+        child->real_tgid = parent->real_tgid;
     memcpy(child->vexe, parent->vexe, PATH_MAX);
     child->skip_uid_virt = parent->skip_uid_virt;
 
@@ -241,12 +282,11 @@ void klee_process_finish_mount_exec(KleeProcess *proc, bool success)
 void klee_process_exec(KleeProcess *proc, const char *new_exe)
 {
     klee_process_finish_mount_exec(proc, true);
-    /* Avoid UB: caller often passes proc->vexe as new_exe (overlapping
-     * src/dst in snprintf).  Only copy when it's a different buffer. */
-    if (new_exe && new_exe != proc->vexe)
-        snprintf(proc->vexe, PATH_MAX, "%s", new_exe);
+    snprintf(proc->vexe, PATH_MAX, "%s", new_exe);
+    proc->skip_uid_virt = proc->next_skip_uid_virt;
 
     /* Remove cloexec FDs */
+    klee_process_unshare(proc, CLONE_FILES);
     klee_fd_table_exec(proc->fd_table);
 
     /* Reset event arena */

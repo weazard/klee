@@ -19,10 +19,10 @@ typedef struct {
     uint64_t interp_size;     /* p_filesz of PT_INTERP, including the NUL */
 } KleeElfInfo;
 
-/* Read the PT_INTERP of the ELF file at host_path (32- or 64-bit).
+/* Read the PT_INTERP of the open regular ELF file (32- or 64-bit).
  * Returns 0 and fills info when the file is an ELF with a program
  * interpreter the kernel would accept, -1 otherwise. */
-int klee_elf_read_interp(const char *host_path, KleeElfInfo *info);
+int klee_elf_read_interp(int fd, KleeElfInfo *info);
 
 typedef struct klee_exec_shim KleeExecShim;
 
@@ -37,7 +37,7 @@ KleeExecShim *klee_exec_shim_get(void);
  * caller: the kernel loads the right loader by itself.
  * Returns 0 on success, -1 when the shim cannot be used for this binary
  * (disabled, no usable directory, binary too large, PT_INTERP too short...). */
-int klee_exec_shim_prepare(KleeExecShim *shim, const char *binary_host,
+int klee_exec_shim_prepare(KleeExecShim *shim, int fd, const char *binary_host,
                            const KleeElfInfo *elf, const char *loader_host,
                            const char *name, char *out_path, size_t out_size);
 

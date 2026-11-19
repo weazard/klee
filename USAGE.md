@@ -6,14 +6,14 @@ making it possible to run Steam, Flatpak, and pressure-vessel inside
 Docker containers or other restricted environments that lack
 `CAP_SYS_ADMIN` or unprivileged user namespaces.
 
-Klee intercepts syscalls via `seccomp_unotify` (Linux 5.0+) or `ptrace`
-(fallback) and simulates namespace isolation entirely in userspace.
+Klee intercepts syscalls with ptrace and uses a seccomp BPF pre-filter
+to reduce stops. It simulates namespace behavior in userspace.
 
 ## Building
 
 ### Requirements
 
-- Linux >= 5.0 (for `seccomp_unotify`; ptrace fallback works on older kernels)
+- Linux 5.0+ on x86-64
 - GCC or Clang with C11 support
 - GNU Make
 
@@ -45,7 +45,6 @@ The build system automatically detects available features:
 
 | Feature              | Macro                  | Effect                                     |
 |----------------------|------------------------|--------------------------------------------|
-| seccomp_unotify      | `HAVE_SECCOMP_UNOTIFY` | Primary interception backend               |
 | process_vm_readv     | `HAVE_PROCESS_VM`      | Fast tracee memory access                  |
 | libfuse3             | `HAVE_FUSE3`           | FUSE /proc overlay                         |
 
@@ -171,8 +170,8 @@ These affect the next mount operation only:
 |-----------------------|-----------|---------------------------------------------|
 | `--info-fd FD`        | 1         | Write `{ "child-pid": N }` JSON to FD      |
 | `--json-status-fd FD` | 1         | Write JSON status updates to FD             |
-| `--sync-fd FD`        | 1         | Close FD when sandbox setup is complete     |
-| `--block-fd FD`       | 1         | Block startup until FD is closed            |
+| `--sync-fd FD`        | 1         | Close FD when the sandbox exits     |
+| `--block-fd FD`       | 1         | Block startup until data or EOF arrives            |
 | `--seccomp FD`        | 1         | Apply child seccomp filter from FD          |
 | `--add-seccomp-fd FD` | 1         | Add additional seccomp filter from FD       |
 | `--lock-file PATH`    | 1         | Hold a lock on PATH while running           |
@@ -202,12 +201,16 @@ These affect the next mount operation only:
 | Variable                 | Values                                    | Description                                                        |
 |--------------------------|-------------------------------------------|--------------------------------------------------------------------|
 | `KLEE_LOG`               | `error`, `warn`, `info`, `debug`, `trace` | Set log verbosity level                                            |
+| `KLEE_FILE_LOG`          | `off`, `error`, `warn`, `info`, `debug`, `trace` | Enable capped per-session file logs |
+| `KLEE_LOG_DIR`           | directory                                 | Set the session log directory and enable file logging at `warn` by default |
 | `KLEE_EXEC_SHIM`         | `0`                                       | Never stage copies of sandbox binaries; start them through `ld.so` |
 | `KLEE_EXEC_DIR`          | directory                                 | Where staged copies live (default `$TMPDIR`, `/tmp`, `/var/tmp`)   |
 | `KLEE_EXEC_COPY_MAX_MB`  | number                                    | Binaries larger than this run through `ld.so` (default 512, 0 = none) |
 
-Default log level is `warn`. Set `KLEE_LOG=debug` for detailed operation
-tracing, or `KLEE_LOG=trace` for full syscall-level output.
+The default stderr log level is `warn`. Set `KLEE_LOG=debug` for detailed
+operation tracing or `KLEE_LOG=trace` for syscall-level output. Setting
+`KLEE_FILE_LOG` to a level enables a per-session log capped at approximately
+16 MiB. The default file log directory is `/tmp/klee-logs-<uid>`.
 
 ```sh
 KLEE_LOG=debug klee --bind / / -- /usr/bin/id
@@ -215,42 +218,19 @@ KLEE_LOG=debug klee --bind / / -- /usr/bin/id
 
 ## How It Works
 
-### Architecture Overview
+### Syscall interception
 
-```
- Parent (klee supervisor)              Child (sandboxed process)
- +---------------------------+         +-------------------------+
- |  Event Loop (epoll)       |         |  execvp(COMMAND)        |
- |    seccomp notif fd  <----+-- IPC --+--> seccomp filter       |
- |    signalfd(SIGCHLD)      |         |    (SECCOMP_RET_        |
- |                           |         |     USER_NOTIF)         |
- |  Syscall Dispatch Table   |         |                         |
- |    enter handlers         |         |  All syscalls with path |
- |    exit handlers          |         |  args are intercepted   |
- |                           |         +-------------------------+
- |  Virtual Mount Table      |
- |    (radix tree)           |
- |                           |
- |  PID Map (real <-> virt)  |
- |  UID/GID State            |
- |  FD Table                 |
- |  Virtual CWD              |
- +---------------------------+
-```
+The supervisor attaches with `PTRACE_SEIZE` before the child installs its
+BPF pre-filter. The filter requests ptrace stops for translated syscalls.
+If the filter is unavailable, the supervisor requests syscall stops
+with `PTRACE_SYSCALL`. It sets up descendants from fork and clone events,
+uses `PTRACE_LISTEN` for job-control stops, and reports the original
+command's exit status. The supervisor owns the tracees for the session
+and ends the session when the original command's thread group exits.
 
-### Interception Backends
-
-**seccomp_unotify** (preferred, Linux 5.0+): The child installs a BPF
-filter returning `SECCOMP_RET_USER_NOTIF` for intercepted syscalls. The
-parent supervisor receives notifications via `ioctl()` on the
-notification fd, performs path translation, and responds. Memory access
-uses `/proc/pid/mem`.
-
-**ptrace** (fallback): The child calls `PTRACE_TRACEME`. The parent uses
-`waitpid()` with `PTRACE_O_TRACESYSGOOD` to intercept syscalls at entry
-and exit. Path arguments are rewritten in tracee memory before the
-syscall executes. Memory access uses `process_vm_readv`/`writev` (fast)
-or `PTRACE_PEEKDATA`/`POKEDATA` (fallback).
+The supervisor reads and writes tracee memory with `process_vm_readv`
+and `process_vm_writev`, with ptrace word access as a fallback. It
+restores rewritten argument registers at syscall exit.
 
 ### Filesystem Virtualization
 
@@ -261,8 +241,8 @@ paths to host paths. When a syscall references a path:
 2. It is canonicalized (resolving `.`, `..`, symlinks, relative paths)
 3. The radix tree performs longest-prefix matching to find the mount
 4. The guest path prefix is replaced with the host source path
-5. The translated path is written back to tracee memory (ptrace) or
-   used directly for the syscall (seccomp_unotify)
+5. The supervisor stages the translated path in tracee memory and points
+   the syscall at it.
 
 Read-only mounts are enforced by checking write-mode syscalls against
 the mount table and returning `-EROFS`, following the kernel's own rules
@@ -288,15 +268,15 @@ Klee handles this without changing how the process looks:
    loads that loader itself.
 2. The copy is executed through a path whose last component is the name
    the program was called by, so `comm` is right (`sleep`, or the script's
-   own name for a script). `argv`, the environment and the auxiliary
-   vector are passed through untouched, so `ps`, `pgrep`, `pidof`,
-   `killall` and the program's own `argv[0]` all see the real program.
-3. `/proc/<pid>/exe` and `readlink` on it report the guest path.
+   own name for a script). ELF copies receive the caller's argument
+   vector and environment. `AT_EXECFN` reflects the staged path.
+3. Guest reads of `/proc/<pid>/exe` report the original executable's
+   guest path.
 
 Copies are keyed by device, inode, size and timestamps, live under
 `KLEE_EXEC_DIR` (or `$TMPDIR`, `/tmp`, `/var/tmp`; the directory must
 allow `exec`) and are removed when klee exits. A session that dies
-without cleaning up (SIGKILL, `docker stop`) leaves its directories
+without cleaning up, for example after SIGKILL, leaves its directories
 behind until the next klee start, which reclaims any session directory
 whose lock is no longer held.
 
@@ -351,7 +331,9 @@ works in another; `unshare(2)` splits them again.
 
 ### Steam Compatibility
 
-Klee automatically exposes paths needed by the Steam overlay:
+For launches with Steam runtime environment variables, Klee exposes
+overlay paths where the mount configuration permits them. Explicit
+mounts take precedence.
 
 - `/dev/shm` (shared memory segments)
 - `$XDG_RUNTIME_DIR/steam-overlay-*` (overlay IPC)
@@ -534,8 +516,6 @@ diff <(bwrap --bind / / -- /usr/bin/id) \
 - **Directory listings** do not synthesize mount points that have no
   directory in the underlying rootfs (`ls /` after `--bind rootfs /
   --ro-bind /usr /usr` does not show `usr` unless `rootfs/usr` exists).
-- The ptrace backend has higher overhead than seccomp_unotify due to
-  context switches per syscall.
 
 ## Project Structure
 
@@ -547,8 +527,8 @@ src/
 
   intercept/                Syscall interception backends
     intercept.c               Backend-agnostic API
-    seccomp_notif.c           seccomp_unotify backend
-    ptrace_backend.c          ptrace fallback backend
+    seccomp_notif.c           Experimental seccomp notification backend
+    ptrace_backend.c          Active ptrace backend
     filter.c                  Raw BPF filter generation
 
   process/                  Process management
@@ -586,7 +566,6 @@ src/
     fuse_pidns.c              /proc PID filtering
 
   compat/                   Compatibility layer
-    seccomp_filter.c          Child seccomp filter handling
     io_uring_block.c          io_uring blocking
     edge_cases.c              openat2, memfd, handle_at
     nested.c                  Nested bwrap detection

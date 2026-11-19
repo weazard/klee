@@ -32,6 +32,7 @@ typedef enum {
     KLEE_EVENT_EXIT,
     KLEE_EVENT_SIGNAL,
     KLEE_EVENT_CLONE,
+    KLEE_EVENT_STOP,
 } KleeEventType;
 
 typedef struct {
@@ -44,9 +45,12 @@ typedef struct {
     uint64_t args[6];
     long retval;
     bool emulated;        /* the supervisor completed the syscall */
+    bool repeat_syscall;  /* continue a directory read after filtering its whole batch */
+    bool unclassified_stop; /* older ptrace without GET_SYSCALL_INFO */
     int signal;
     uint64_t notif_id;     /* seccomp_unotify notification ID */
     pid_t new_child_pid;   /* for fork/clone events */
+    pid_t former_tid;      /* for exec from a non-leader thread */
 } KleeEvent;
 
 typedef struct klee_interceptor KleeInterceptor;
@@ -63,7 +67,13 @@ struct klee_interceptor {
         struct {
             unsigned long options;
             bool seccomp_filter;    /* true if SECCOMP_RET_TRACE filter active */
-            int status_pipe[2];     /* child→parent filter install notification */
+            int startup_fd[2];      /* seize gate and filter install status */
+            bool no_syscall_info;
+            bool batch_wait;
+            struct klee_wait_status *wait_statuses;
+            size_t wait_next;
+            size_t wait_count;
+            size_t wait_capacity;
         } ptrace;
     };
 
@@ -94,11 +104,11 @@ int klee_interceptor_get_seccomp_fd(KleeInterceptor *interceptor);
 
 /* Install BPF filter for the child process (called before exec).
  * For seccomp: installs SECCOMP_RET_USER_NOTIF filter.
- * For ptrace: sets up PTRACE_TRACEME. */
+ * For ptrace: waits for the supervisor to attach before installing the filter. */
 int klee_interceptor_install_child(KleeInterceptor *interceptor);
 
 /* Setup parent side after child is started.
- * For ptrace: set PTRACE_SETOPTIONS. */
+ * For ptrace: attach and leave the child stopped after filter installation. */
 int klee_interceptor_setup_parent(KleeInterceptor *interceptor, pid_t child_pid);
 
 #endif /* KLEE_INTERCEPT_H */

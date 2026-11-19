@@ -17,21 +17,14 @@
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/ptrace.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <linux/seccomp.h>
 #include <linux/filter.h>
 
 KleeInterceptor *klee_interceptor_create(void)
 {
-#ifdef HAVE_SECCOMP_UNOTIFY
-    if (klee_seccomp_notif_available()) {
-        KLEE_INFO("using seccomp_unotify interception backend");
-        return klee_seccomp_notif_create();
-    }
-    KLEE_INFO("seccomp_unotify not available, falling back to ptrace");
-#else
-    KLEE_INFO("seccomp_unotify not compiled in, using ptrace backend");
-#endif
+    /* Path and syscall argument translation requires ptrace register access. */
     return klee_ptrace_create();
 }
 
@@ -86,15 +79,16 @@ int klee_interceptor_install_child(KleeInterceptor *interceptor)
         return -ENOTSUP;
 #endif
     } else {
-        /* ptrace: TRACEME + SIGSTOP, then install seccomp pre-filter.
-         *
-         * Sequence: child does TRACEME + SIGSTOP → parent catches the stop,
-         * sets PTRACE_O_TRACESECCOMP, and resumes us → we install the BPF
-         * filter (SECCOMP_RET_TRACE for intercepted syscalls) → write status
-         * to pipe so parent knows whether the filter is active. */
-        if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) < 0)
-            return -errno;
-        raise(SIGSTOP);
+        close(interceptor->ptrace.startup_fd[0]);
+        interceptor->ptrace.startup_fd[0] = -1;
+        int fd = interceptor->ptrace.startup_fd[1];
+        char ready;
+        ssize_t n;
+        do {
+            n = read(fd, &ready, 1);
+        } while (n < 0 && errno == EINTR);
+        if (n != 1)
+            return n < 0 ? -errno : -EPIPE;
 
         /* Parent has set PTRACE_O_TRACESECCOMP and resumed us.
          * Now install the BPF filter. */
@@ -119,16 +113,17 @@ int klee_interceptor_install_child(KleeInterceptor *interceptor)
             }
         }
 
-        /* Signal status to parent via pipe */
-        if (interceptor->ptrace.status_pipe[1] >= 0) {
-            (void)!write(interceptor->ptrace.status_pipe[1], &filter_ok, 1);
-            close(interceptor->ptrace.status_pipe[1]);
-            interceptor->ptrace.status_pipe[1] = -1;
-        }
-        if (interceptor->ptrace.status_pipe[0] >= 0) {
-            close(interceptor->ptrace.status_pipe[0]);
-            interceptor->ptrace.status_pipe[0] = -1;
-        }
+        do {
+            n = write(fd, &filter_ok, 1);
+        } while (n < 0 && errno == EINTR);
+        if (n != 1)
+            return n < 0 ? -errno : -EIO;
+
+        /* Stop before any guest setup. A breakpoint gives a ptrace stop
+         * without issuing a syscall through the filter we just installed. */
+        __asm__ volatile("int3" ::: "memory");
+        close(fd);
+        interceptor->ptrace.startup_fd[1] = -1;
         return 0;
     }
 }
@@ -143,82 +138,33 @@ int klee_interceptor_setup_parent(KleeInterceptor *interceptor, pid_t child_pid)
         interceptor->seccomp.notif_fd = interceptor->seccomp.listener_fd;
         return 0;
     } else {
-        /* ptrace: wait for child's SIGSTOP, set options (including
-         * TRACESECCOMP), resume child so it can install the BPF filter,
-         * then drain ptrace stops until we read the status from the pipe. */
+        close(interceptor->ptrace.startup_fd[1]);
+        interceptor->ptrace.startup_fd[1] = -1;
+        int fd = interceptor->ptrace.startup_fd[0];
+        if (ptrace(PTRACE_SEIZE, child_pid, NULL, interceptor->ptrace.options) < 0)
+            return -errno;
+
+        const char ready = 1;
+        if (send(fd, &ready, 1, MSG_NOSIGNAL) != 1)
+            return -errno;
+
         int status;
-        pid_t p = waitpid(child_pid, &status, 0);
+        pid_t p;
+        do {
+            p = waitpid(child_pid, &status, __WALL);
+        } while (p < 0 && errno == EINTR);
         if (p < 0)
             return -errno;
+        if (!WIFSTOPPED(status))
+            return -ECHILD;
+        if (WSTOPSIG(status) != SIGTRAP || status >> 16)
+            return -EIO;
 
-        if (ptrace(PTRACE_SETOPTIONS, child_pid, NULL,
-                   (void *)(unsigned long)interceptor->ptrace.options) < 0)
-            return -errno;
-
-        /* Resume child — it will install the BPF filter and write to the pipe */
-        if (ptrace(PTRACE_SYSCALL, child_pid, NULL, NULL) < 0)
-            return -errno;
-
-        /* Close our copy of the write end */
-        if (interceptor->ptrace.status_pipe[1] >= 0) {
-            close(interceptor->ptrace.status_pipe[1]);
-            interceptor->ptrace.status_pipe[1] = -1;
-        }
-
-        /* Drain ptrace stops from the child (it makes syscalls to
-         * install the filter: prctl, seccomp, write, close).
-         * We do NOT dispatch these through the event loop — handling
-         * them here avoids the compat seccomp rewriter seeing klee's
-         * own seccomp() call. */
         char filter_status = 0;
-        bool got_status = false;
-
-        if (interceptor->ptrace.status_pipe[0] < 0) {
-            /* No pipe — can't use seccomp pre-filter */
-            got_status = true;
-        }
-
-        while (!got_status) {
-            p = waitpid(child_pid, &status, 0);
-            if (p < 0) {
-                if (errno == EINTR)
-                    continue;
-                break;
-            }
-
-            KLEE_TRACE("drain: status=%#x stopped=%d sig=%d event=%d",
-                        status, WIFSTOPPED(status),
-                        WIFSTOPPED(status) ? WSTOPSIG(status) : -1,
-                        (status >> 16) & 0xffff);
-
-            /* Try to read filter status from pipe */
-            if (interceptor->ptrace.status_pipe[0] >= 0) {
-                ssize_t n = read(interceptor->ptrace.status_pipe[0],
-                                  &filter_status, 1);
-                if (n == 1) {
-                    KLEE_TRACE("drain: got pipe status=%d, breaking", filter_status);
-                    got_status = true;
-                    /* Continue the child past its current stop */
-                    if (WIFSTOPPED(status))
-                        ptrace(PTRACE_SYSCALL, child_pid, NULL, NULL);
-                    break;
-                }
-            }
-
-            /* Child hasn't finished yet — continue past this stop */
-            if (WIFSTOPPED(status)) {
-                ptrace(PTRACE_SYSCALL, child_pid, NULL, NULL);
-            } else {
-                /* Child exited/signaled during setup */
-                break;
-            }
-        }
-
-        /* Close read end of status pipe */
-        if (interceptor->ptrace.status_pipe[0] >= 0) {
-            close(interceptor->ptrace.status_pipe[0]);
-            interceptor->ptrace.status_pipe[0] = -1;
-        }
+        if (recv(fd, &filter_status, 1, MSG_DONTWAIT) != 1)
+            return -EIO;
+        close(fd);
+        interceptor->ptrace.startup_fd[0] = -1;
 
         if (filter_status) {
             interceptor->ptrace.seccomp_filter = true;
