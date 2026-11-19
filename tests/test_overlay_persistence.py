@@ -32,6 +32,7 @@ def expect_error(expected, operation, *args):
 
 def mutate(view):
     os.chdir(view)
+    os.chmod("sparse", 0o600)
     expect_error(errno.EEXIST, renameat2, "upper-source", "existing", RENAME_NOREPLACE)
     expect_error(errno.EISDIR, os.rename, "file-source", "directory")
     assert Path("file-source").read_text() == "file-source"
@@ -123,6 +124,18 @@ def run(klee):
         (upper / "upper-source").write_text("source")
         (upper / "upper-shadow").write_text("shadow")
         (upper / "descriptor-source").write_text("descriptor")
+        with (lower / "sparse").open("wb") as source:
+            source.write(b"first")
+            source.seek(4 * 1024 * 1024)
+            source.write(b"last")
+        has_xattrs = False
+        try:
+            os.setxattr(upper / "legacy", "user.klee-test", b"probe")
+            os.setxattr(lower / "sparse", "user.klee-test", b"preserved")
+            has_xattrs = True
+        except OSError as error:
+            if error.errno != errno.EOPNOTSUPP:
+                raise
         os.mkfifo(lower / "pipe")
         view = str(root / "view")
         launcher = [
@@ -131,6 +144,12 @@ def run(klee):
             sys.executable, str(Path(__file__).resolve()),
         ]
         subprocess.run(launcher + ["mutate", view], check=True)
+        with (upper / "sparse").open("rb") as copied:
+            assert copied.read(5) == b"first"
+            copied.seek(4 * 1024 * 1024)
+            assert copied.read() == b"last"
+        if has_xattrs:
+            assert os.getxattr(upper / "sparse", "user.klee-test") == b"preserved"
         assert (upper / "upper-source").read_text() == "source"
         assert not (upper / "file-source").exists()
         for name in ("delete-me", "upper-shadow", "move-me", "link-source"):

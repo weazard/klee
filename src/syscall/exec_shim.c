@@ -15,8 +15,8 @@
  *
  * Instead, exec a private copy of the binary whose PT_INTERP string names a
  * short symlink to the sandbox's loader.  The kernel then loads the right
- * loader itself; argv, envp and the auxiliary vector are exactly what the
- * caller supplied, and comm comes from the name of the path we exec.
+ * loader itself. The caller supplies argv and envp, and the staged path
+ * controls comm and AT_EXECFN.
  *
  * Layout, all per klee session and removed on exit:
  *
@@ -67,15 +67,14 @@
 
 /* ==================== ELF ==================== */
 
-int klee_elf_read_interp(const char *host_path, KleeElfInfo *info)
+int klee_elf_read_interp(int fd, KleeElfInfo *info)
 {
     memset(info, 0, sizeof(*info));
 
-    int fd = open(host_path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0)
-        return -1;
-
     int found = -1;
+    struct stat st;
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode))
+        goto out;
     unsigned char ident[EI_NIDENT];
     uint64_t phoff;
     uint16_t phentsize, phnum;
@@ -152,7 +151,6 @@ int klee_elf_read_interp(const char *host_path, KleeElfInfo *info)
     }
 
 out:
-    close(fd);
     return found;
 }
 
@@ -255,8 +253,10 @@ static bool make_session_dir(const char *base, const char *prefix,
     if (!base || !*base)
         return false;
 
+    /* Publish the session name after the lock is held. The stale-session
+     * scanner ignores the temporary name while setup is in progress. */
     char path[PATH_MAX];
-    int n = snprintf(path, sizeof(path), "%s/%sXXXXXX", base, prefix);
+    int n = snprintf(path, sizeof(path), "%s/.%sXXXXXX", base, prefix);
     if (n < 0 || (size_t)n >= sizeof(path))
         return false;
     if (!mkdtemp(path))
@@ -282,7 +282,15 @@ static bool make_session_dir(const char *base, const char *prefix,
         return false;
     }
 
-    snprintf(out, out_size, "%s", path);
+    int length = snprintf(out, out_size, "%s/%s", base, strrchr(path, '/') + 2);
+    if (length < 0 || (size_t)length >= out_size ||
+        renameat2(AT_FDCWD, path, AT_FDCWD, out, RENAME_NOREPLACE) < 0) {
+        close(lock);
+        close(fd);
+        rm_tree_at(AT_FDCWD, path);
+        out[0] = '\0';
+        return false;
+    }
     *lock_out = lock;
     if (dirfd_out)
         *dirfd_out = fd;
@@ -519,7 +527,7 @@ static int make_copy(KleeExecShim *s, const char *binary_host, int in,
     return rc;
 }
 
-int klee_exec_shim_prepare(KleeExecShim *s, const char *binary_host,
+int klee_exec_shim_prepare(KleeExecShim *s, int in, const char *binary_host,
                            const KleeElfInfo *elf, const char *loader_host,
                            const char *name, char *out_path, size_t out_size)
 {
@@ -536,15 +544,9 @@ int klee_exec_shim_prepare(KleeExecShim *s, const char *binary_host,
     }
     size_t idx = (size_t)(t - s->targets);
 
-    int in = open(binary_host, O_RDONLY | O_CLOEXEC);
-    if (in < 0)
-        return -1;
-
     struct stat st;
-    if (fstat(in, &st) < 0 || !S_ISREG(st.st_mode)) {
-        close(in);
+    if (fstat(in, &st) < 0 || !S_ISREG(st.st_mode))
         return -1;
-    }
 
     char key[NAME_MAX + 1];
     snprintf(key, sizeof(key),
@@ -556,15 +558,11 @@ int klee_exec_shim_prepare(KleeExecShim *s, const char *binary_host,
              (uintmax_t)st.st_ctim.tv_sec, (unsigned long)st.st_ctim.tv_nsec,
              idx);
 
-    if (mkdirat(s->copy_dirfd, key, 0711) < 0 && errno != EEXIST) {
-        close(in);
+    if (mkdirat(s->copy_dirfd, key, 0711) < 0 && errno != EEXIST)
         return -1;
-    }
     int key_fd = openat(s->copy_dirfd, key, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (key_fd < 0) {
-        close(in);
+    if (key_fd < 0)
         return -1;
-    }
 
     /* The copy is named after the program so /proc/<pid>/exe stays
      * readable from the host.  Everything in a key directory is a copy of
@@ -581,7 +579,6 @@ int klee_exec_shim_prepare(KleeExecShim *s, const char *binary_host,
     if (fstatat(key_fd, copy_name, &cst, AT_SYMLINK_NOFOLLOW) != 0)
         rc = make_copy(s, binary_host, in, &st, elf, t->link, key_fd,
                        copy_name);
-    close(in);
     if (rc < 0) {
         close(key_fd);
         return -1;

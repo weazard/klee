@@ -18,6 +18,7 @@ typedef struct klee_mount {
     MountType type;
     char *source;       /* host path (for binds) */
     char *dest;         /* guest path */
+    char *link_path;    /* backing directory entry for a virtual symlink */
     unsigned long flags;
     bool is_readonly;
     int perms;
@@ -31,6 +32,7 @@ typedef struct klee_mount_table {
     KleeRadixTree *tree;
     size_t num_mounts;
     char *virtual_root;    /* pivot_root prefix, default "/" */
+    char *link_dir;
     KleeArena *arena;
 } KleeMountTable;
 
@@ -71,6 +73,12 @@ int klee_mount_table_translate_access(const KleeMountTable *mt,
                                        const char *guest_path,
                                        char *host_path_out, size_t out_size,
                                        KleeOvAccess access);
+int klee_mount_table_translate_nofollow(const KleeMountTable *mt,
+                                         const char *guest_path,
+                                         char *host_path_out, size_t out_size,
+                                         KleeOvAccess access);
+int klee_mount_table_host_to_guest(const KleeMountTable *mt, const char *host_path,
+                                    char *guest, size_t size);
 
 /* The overlay a guest path is in, or NULL */
 KleeOverlayMount *klee_mount_table_overlay_at(const KleeMountTable *mt,

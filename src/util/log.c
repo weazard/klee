@@ -13,12 +13,15 @@
 #include <sys/types.h>
 #include <linux/limits.h>
 #include <errno.h>
+#include <fcntl.h>
 
 static KleeLogLevel current_level = LOG_WARN;
 
 /* File logging state */
 static FILE *log_file = NULL;
-static KleeLogLevel file_level = LOG_TRACE;
+static KleeLogLevel file_level = LOG_WARN;
+static size_t file_bytes;
+static const size_t file_limit = 16 * 1024 * 1024;
 static char log_path[PATH_MAX];
 
 static const char *level_names[] = {
@@ -50,11 +53,11 @@ KleeLogLevel klee_log_get_level(void)
     return current_level;
 }
 
-static KleeLogLevel parse_file_log_level(void)
+static KleeLogLevel parse_file_log_level(const char *log_dir)
 {
     const char *env = getenv("KLEE_FILE_LOG");
     if (!env)
-        return LOG_TRACE;
+        return log_dir && *log_dir ? LOG_WARN : (KleeLogLevel)-1;
     if (strcmp(env, "off") == 0)   return (KleeLogLevel)-1;
     if (strcmp(env, "error") == 0) return LOG_ERROR;
     if (strcmp(env, "warn") == 0)  return LOG_WARN;
@@ -64,35 +67,38 @@ static KleeLogLevel parse_file_log_level(void)
     return LOG_DEBUG;
 }
 
-/* Recursive mkdir -p with world-writable base (multi-user safe) */
-static void mkdirp(const char *path)
+static int mkdirp(const char *path)
 {
     char tmp[PATH_MAX];
-    snprintf(tmp, sizeof(tmp), "%s", path);
+    if (snprintf(tmp, sizeof(tmp), "%s", path) >= (int)sizeof(tmp))
+        return -1;
     for (char *p = tmp + 1; *p; p++) {
         if (*p == '/') {
             *p = '\0';
-            mkdir(tmp, 0777);
+            if (mkdir(tmp, 0700) < 0 && errno != EEXIST)
+                return -1;
             *p = '/';
         }
     }
-    mkdir(tmp, 0777);
+    return mkdir(tmp, 0700) == 0 || errno == EEXIST ? 0 : -1;
 }
 
 void klee_log_open_file(const char *app_name, pid_t pid)
 {
-    file_level = parse_file_log_level();
-    if ((int)file_level < 0)
-        return;  /* KLEE_FILE_LOG=off */
-
     const char *log_dir = getenv("KLEE_LOG_DIR");
-    if (!log_dir || !log_dir[0])
-        log_dir = "/tmp/klee-logs";
+    file_level = parse_file_log_level(log_dir);
+    if ((int)file_level < 0)
+        return;
 
-    /* Sanitize app name — use only the basename, replace weird chars */
+    char default_dir[64];
+    if (!log_dir || !log_dir[0]) {
+        snprintf(default_dir, sizeof(default_dir), "/tmp/klee-logs-%u", (unsigned)geteuid());
+        log_dir = default_dir;
+    }
+
     const char *base = strrchr(app_name, '/');
     base = base ? base + 1 : app_name;
-    if (!base[0])
+    if (!base[0] || strcmp(base, ".") == 0 || strcmp(base, "..") == 0)
         base = "unknown";
 
     char safe_name[256];
@@ -107,51 +113,68 @@ void klee_log_open_file(const char *app_name, pid_t pid)
     }
     safe_name[j] = '\0';
 
-    /* Create app directory — leave room for the filename suffix */
-    char app_dir[PATH_MAX - 64];
-    snprintf(app_dir, sizeof(app_dir), "%s/%s", log_dir, safe_name);
-    mkdirp(app_dir);
+    if (mkdirp(log_dir) < 0)
+        return;
+    int base_fd = open(log_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (base_fd < 0)
+        return;
+    struct stat st;
+    if (fstat(base_fd, &st) < 0 || st.st_uid != geteuid() || (st.st_mode & 0022))
+        goto out_base;
+    if (mkdirat(base_fd, safe_name, 0700) < 0 && errno != EEXIST)
+        goto out_base;
+    int app_fd = openat(base_fd, safe_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (app_fd < 0)
+        goto out_base;
+    if (fstat(app_fd, &st) < 0 || st.st_uid != geteuid() || (st.st_mode & 0022))
+        goto out_app;
 
-    /* Generate timestamped filename */
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     struct tm tm;
     localtime_r(&ts.tv_sec, &tm);
-
-    int year = tm.tm_year + 1900;
-    if (year < 0) year = 0;
-    if (year > 9999) year = 9999;
-    snprintf(log_path, sizeof(log_path),
-             "%s/%04d-%02d-%02d_%02d-%02d-%02d_%d.log",
-             app_dir, year, tm.tm_mon + 1, tm.tm_mday,
-             tm.tm_hour, tm.tm_min, tm.tm_sec,
-             (int)pid);
-
-    /* Use "we" to set O_CLOEXEC so children don't inherit the fd */
-    log_file = fopen(log_path, "we");
-    if (!log_file) {
+    char timestamp[64], name[128];
+    if (strftime(timestamp, sizeof(timestamp), "%Y-%m-%d_%H-%M-%S", &tm) == 0)
+        goto out_app;
+    snprintf(name, sizeof(name), "%s_%d_%09ld.log", timestamp, (int)pid, ts.tv_nsec);
+    int length = snprintf(log_path, sizeof(log_path), "%s/%s/%s", log_dir, safe_name, name);
+    if (length < 0 || (size_t)length >= sizeof(log_path)) {
         log_path[0] = '\0';
-        return;
+        goto out_app;
+    }
+    int fd = openat(app_fd, name, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        log_path[0] = '\0';
+        goto out_app;
+    }
+    log_file = fdopen(fd, "w");
+    if (!log_file) {
+        close(fd);
+        unlinkat(app_fd, name, 0);
+        log_path[0] = '\0';
+        goto out_app;
     }
 
-    /* Write session header */
-    fprintf(log_file,
-            "=== klee session PID=%d ===\n"
-            "time: %04d-%02d-%02d %02d:%02d:%02d\n"
-            "command: %s\n"
-            "===\n\n",
-            (int)pid,
-            tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-            tm.tm_hour, tm.tm_min, tm.tm_sec,
-            app_name);
+    file_bytes = 0;
+    fprintf(log_file, "=== klee session PID=%d ===\n", (int)pid);
     fflush(log_file);
 
-    /* Update latest symlink */
-    char latest[PATH_MAX];
-    snprintf(latest, sizeof(latest), "%s/latest", log_dir);
-    unlink(latest);
-    if (symlink(log_path, latest) < 0)
-        { /* best-effort, ignore */ }
+    /* Update the pointer atomically when it is absent or already a symlink. */
+    int rc = fstatat(base_fd, "latest", &st, AT_SYMLINK_NOFOLLOW);
+    if ((rc == 0 && S_ISLNK(st.st_mode)) || (rc < 0 && errno == ENOENT)) {
+        char latest[160], target[sizeof(safe_name) + sizeof(name) + 1];
+        snprintf(latest, sizeof(latest), ".latest-%s", name);
+        snprintf(target, sizeof(target), "%s/%s", safe_name, name);
+        if (symlinkat(target, base_fd, latest) == 0) {
+            if (renameat(base_fd, latest, base_fd, "latest") < 0)
+                unlinkat(base_fd, latest, 0);
+        }
+    }
+
+out_app:
+    close(app_fd);
+out_base:
+    close(base_fd);
 }
 
 void klee_log_close_file(void)
@@ -203,28 +226,34 @@ void klee_log(KleeLogLevel level, const char *file, int line,
             fputc('\n', stderr);
     }
 
-    /* File output */
     if (want_file) {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        struct tm tm;
-        localtime_r(&ts.tv_sec, &tm);
+        flockfile(log_file);
+        if (file_bytes < file_limit) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            struct tm tm;
+            localtime_r(&ts.tv_sec, &tm);
 
-        fprintf(log_file,
-                "[%04d-%02d-%02d %02d:%02d:%02d.%03ld] [%s] %s:%d: ",
-                tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                tm.tm_hour, tm.tm_min, tm.tm_sec,
-                ts.tv_nsec / 1000000,
-                level_names[level], basename, line);
-
-        va_list ap3;
-        va_copy(ap3, ap);
-        vfprintf(log_file, fmt, ap3);
-        va_end(ap3);
-
-        if (fmt[0] && fmt[strlen(fmt) - 1] != '\n')
-            fputc('\n', log_file);
-        fflush(log_file);
+            int prefix = fprintf(log_file,
+                    "[%04d-%02d-%02d %02d:%02d:%02d.%03ld] [%s] %s:%d: ",
+                    tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                    tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec / 1000000,
+                    level_names[level], basename, line);
+            int body = vfprintf(log_file, fmt, ap);
+            if (fmt[0] && fmt[strlen(fmt) - 1] != '\n') {
+                fputc('\n', log_file);
+                file_bytes++;
+            }
+            if (prefix < 0 || body < 0)
+                file_bytes = file_limit;
+            else {
+                file_bytes += (size_t)prefix + (size_t)body;
+                if (file_bytes >= file_limit)
+                    fputs("Session log size limit reached.\n", log_file);
+            }
+            fflush(log_file);
+        }
+        funlockfile(log_file);
     }
 
     va_end(ap);

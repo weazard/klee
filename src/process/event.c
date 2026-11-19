@@ -21,7 +21,44 @@
 #include <sys/epoll.h>
 #include <sys/ptrace.h>
 #include <sys/signalfd.h>
+#include <linux/ptrace.h>
 #include <sys/wait.h>
+
+static volatile sig_atomic_t shutdown_signal;
+static volatile sig_atomic_t watched_child;
+
+static void request_shutdown(int sig)
+{
+    int saved_errno = errno;
+    shutdown_signal = sig;
+    /* Wake a blocking waitpid even if the signal arrived just before it. */
+    if (watched_child > 0)
+        kill(watched_child, SIGKILL);
+    errno = saved_errno;
+}
+
+int klee_event_install_shutdown_handlers(void)
+{
+    struct sigaction sa = {.sa_handler = request_shutdown};
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGTERM, &sa, NULL) < 0 ||
+        sigaction(SIGINT, &sa, NULL) < 0 ||
+        sigaction(SIGHUP, &sa, NULL) < 0)
+        return -errno;
+    return 0;
+}
+
+void klee_event_watch_child(pid_t pid)
+{
+    watched_child = pid;
+    if (pid > 0 && shutdown_signal)
+        kill(pid, SIGKILL);
+}
+
+int klee_event_shutdown_status(void)
+{
+    return shutdown_signal ? 128 + shutdown_signal : 0;
+}
 
 KleeEventLoop *klee_event_loop_create(KleeInterceptor *ic,
                                         KleeProcessTable *pt,
@@ -40,6 +77,9 @@ KleeEventLoop *klee_event_loop_create(KleeInterceptor *ic,
     el->exit_status = 0;
     el->epoll_fd = -1;
     el->signal_fd = -1;
+
+    if (ic->backend == INTERCEPT_PTRACE)
+        return el;
 
     /* Block SIGCHLD and create signalfd */
     sigset_t mask;
@@ -87,6 +127,7 @@ void klee_event_loop_destroy(KleeEventLoop *el)
         close(el->epoll_fd);
     if (el->signal_fd >= 0)
         close(el->signal_fd);
+    klee_ht_destroy(el->early_child_stops);
     free(el);
 }
 
@@ -99,28 +140,10 @@ static void handle_process_exit(KleeEventLoop *el, KleeProcess *proc,
     KLEE_DEBUG("process exit: pid=%d vpid=%d status=%d",
                real_pid, proc->virtual_pid, exit_status);
 
-    /* If this is vpid 1 (init), kill all namespace processes */
-    if (el->sandbox && el->sandbox->unshare_pid &&
-        el->sandbox->pid_map &&
-        klee_pid_map_is_init(el->sandbox->pid_map, real_pid)) {
-        KLEE_INFO("PID 1 exited, terminating namespace");
-        el->exit_status = exit_status;
-        el->running = false;
-    }
-
-    /* If this is the initial child (the command klee launched), stop the
-     * event loop.  Daemon children like gpg-agent may still be alive —
-     * they will be cleaned up by SIGKILL below.  This matches real
-     * bwrap behavior: bwrap exits when its direct child exits. */
+    /* A final wait status for the leader arrives after its thread group
+     * has exited. An exec from another thread reuses the leader's PID. */
     if (real_pid == el->initial_child_pid) {
-        KLEE_INFO("initial child exited (pid=%d status=%d), stopping",
-                   real_pid, exit_status);
-        el->exit_status = exit_status;
-        el->running = false;
-    }
-
-    /* If this is the only/last process, stop */
-    if (el->proctable->count <= 1) {
+        klee_event_watch_child(0);
         el->exit_status = exit_status;
         el->running = false;
     }
@@ -139,26 +162,15 @@ static void handle_process_exit(KleeEventLoop *el, KleeProcess *proc,
     klee_process_remove(el->proctable, real_pid);
 }
 
-static void handle_fork(KleeEventLoop *el, KleeProcess *parent,
-                         pid_t child_pid)
+static int handle_fork(KleeEventLoop *el, KleeProcess *parent, pid_t child_pid)
 {
-    if (child_pid <= 0) {
-        KLEE_WARN("fork event with invalid child pid");
-        return;
-    }
-
-    /* Already set up because the child's initial stop was reported before
-     * this fork event.  Re-creating it would throw away state the child has
-     * built up since it was resumed. */
-    if (klee_process_find(el->proctable, child_pid))
-        return;
+    if (child_pid <= 0)
+        return -EINVAL;
 
     KleeProcess *child = klee_process_fork(el->proctable, parent, child_pid,
                                            parent->pending_clone_flags);
-    if (!child) {
-        KLEE_ERROR("failed to create child process %d", child_pid);
-        return;
-    }
+    if (!child)
+        return -ENOMEM;
 
     /* Assign virtual PID */
     if (el->sandbox && el->sandbox->pid_map) {
@@ -173,14 +185,15 @@ static void handle_fork(KleeEventLoop *el, KleeProcess *parent,
                                     el->sandbox->mount_table);
 
     /* Clone ID state */
-    if (parent->id_state)
+    if (parent->id_state) {
         child->id_state = klee_id_state_clone(parent->id_state);
-
-    child->state = PROC_STATE_RUNNING;
-    child->suppress_initial_stop = true;
+        if (!child->id_state)
+            return -ENOMEM;
+    }
 
     KLEE_DEBUG("fork: parent=%d child=%d vpid=%d",
                parent->real_pid, child_pid, child->virtual_pid);
+    return 0;
 }
 
 /* The kernel fills si_pid with the sender's host PID.  Present it the way
@@ -224,88 +237,87 @@ static void rewrite_siginfo_pid(KleeEventLoop *el, KleeProcess *proc, int sig)
     ptrace(PTRACE_SETSIGINFO, proc->real_pid, 0, &si);
 }
 
-/* Find the tracee a brand-new task inherits from: its thread group for a
- * thread, otherwise its parent process. */
-static KleeProcess *find_creator(KleeProcessTable *pt, pid_t pid)
+static int resume_tracee(KleeEventLoop *el, KleeProcess *proc, int sig)
 {
-    pid_t tgid, ppid;
-    if (klee_proc_status_ids(pid, &tgid, &ppid) < 0)
-        return NULL;
-    pid_t creator = tgid != pid ? tgid : ppid;
-    return creator > 0 ? klee_process_find(pt, creator) : NULL;
+    KleeInterceptor *ic = el->interceptor;
+    if (proc->state == PROC_STATE_SYSCALL_ENTER)
+        return ic->continue_syscall(ic, proc->real_pid, sig);
+    return ic->continue_running(ic, proc->real_pid, sig);
+}
+
+static bool needs_syscall_exit(const KleeProcess *proc, int nr)
+{
+    const KleeSyscallHandler *handler = klee_dispatch_get(nr);
+    if (!handler || !handler->exit)
+        return false;
+    const KleeSandbox *sb = proc->sandbox;
+    bool ids = sb && sb->unshare_user && proc->id_state;
+    switch (nr) {
+    case KLEE_SYS_stat: case KLEE_SYS_lstat: case KLEE_SYS_fstat:
+    case KLEE_SYS_newfstatat: case KLEE_SYS_statx:
+        return ids;
+    case KLEE_SYS_getuid: case KLEE_SYS_geteuid: case KLEE_SYS_getgid:
+    case KLEE_SYS_getegid: case KLEE_SYS_getresuid: case KLEE_SYS_getresgid:
+    case KLEE_SYS_recvmsg: case KLEE_SYS_getsockopt:
+        return ids && !proc->skip_uid_virt;
+    case KLEE_SYS_getpid: case KLEE_SYS_getppid: case KLEE_SYS_gettid:
+    case KLEE_SYS_getsid: case KLEE_SYS_setsid: case KLEE_SYS_getpgrp:
+    case KLEE_SYS_getpgid: case KLEE_SYS_getdents: case KLEE_SYS_getdents64:
+    case KLEE_SYS_ioctl:
+        return sb && sb->unshare_pid;
+    case KLEE_SYS_shmget: case KLEE_SYS_msgget: case KLEE_SYS_semget:
+        return sb && sb->unshare_ipc;
+    case KLEE_SYS_uname:
+        return sb && sb->unshare_uts;
+    default:
+        return true;
+    }
 }
 
 int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
 {
-    KleeProcess *proc = klee_process_find(el->proctable, event->pid);
-
-    /* New process we haven't seen yet */
-    if (!proc && event->type != KLEE_EVENT_EXIT) {
-        /* A new tracee's initial SIGSTOP can be reported before its
-         * creator's PTRACE_EVENT_FORK/CLONE.  Inherit from the creator now
-         * so the child never runs with blank state (no id_state, empty fd
-         * table, cwd "/"); the fork event later finds the entry in place. */
-        KleeProcess *creator = find_creator(el->proctable, event->pid);
-        if (creator) {
-            handle_fork(el, creator, event->pid);
-            proc = klee_process_find(el->proctable, event->pid);
-        }
-    }
-    if (!proc && event->type != KLEE_EVENT_EXIT) {
-        proc = klee_process_create(el->proctable, event->pid, el->sandbox);
-        if (!proc) {
-            KLEE_ERROR("failed to create process for pid %d", event->pid);
-            return -ENOMEM;
-        }
+    KleeInterceptor *ic = el->interceptor;
+    KleeProcess *proc;
+    if (event->type == KLEE_EVENT_EXEC && event->former_tid > 0 &&
+        event->former_tid != event->pid) {
+        proc = klee_process_exec_rekey(el->proctable, event->former_tid, event->pid);
+        if (!proc)
+            return -ECHILD;
         if (el->sandbox && el->sandbox->pid_map)
-            proc->virtual_pid = klee_pid_map_add(el->sandbox->pid_map, event->pid);
-        proc->state = PROC_STATE_RUNNING;
-        /* New process from PTRACE_O_TRACEFORK — its initial SIGSTOP
-         * must be suppressed to avoid a spurious group-stop that
-         * makes the parent's waitpid report it as "Stopped". */
-        proc->suppress_initial_stop = true;
+            klee_pid_map_remove(el->sandbox->pid_map, event->former_tid);
+    } else {
+        proc = klee_process_find(el->proctable, event->pid);
     }
 
-    if (!proc)
-        return 0;
+    if (!proc) {
+        if (event->type == KLEE_EVENT_EXIT) {
+            klee_ht_remove(el->early_child_stops, (uint64_t)event->pid);
+            return 0;
+        }
+        if (event->type != KLEE_EVENT_STOP) {
+            if (ic->backend == INTERCEPT_PTRACE)
+                return -ECHILD;
+            proc = klee_process_create(el->proctable, event->pid, el->sandbox);
+            if (!proc)
+                return -ENOMEM;
+        } else {
+            /* An auto-attached child's initial stop can precede the fork
+             * event. Its exact creator and sharing flags come from that
+             * event, so keep the child stopped until we receive it. */
+            if (!el->early_child_stops)
+                el->early_child_stops = klee_ht_create();
+            klee_ht_put(el->early_child_stops, (uint64_t)event->pid, el);
+            return klee_ht_get(el->early_child_stops, (uint64_t)event->pid) ?
+                   0 : -ENOMEM;
+        }
+    }
+
+    if (event->type == KLEE_EVENT_SYSCALL_ENTER && event->unclassified_stop &&
+        proc->state == PROC_STATE_SYSCALL_ENTER)
+        event->type = KLEE_EVENT_SYSCALL_EXIT;
 
     switch (event->type) {
     case KLEE_EVENT_SYSCALL_ENTER:
-        /* The ptrace backend uses an rax == -ENOSYS heuristic to tell
-         * syscall-enter from syscall-exit stops.  When we deny a syscall
-         * (orig_rax = -1), the kernel returns -ENOSYS, so the subsequent
-         * exit stop is misclassified as another enter.  Detect this using
-         * the per-process state: if we already processed an enter, the
-         * next syscall stop MUST be the corresponding exit.
-         *
-         * With the seccomp pre-filter, PTRACE_EVENT_SECCOMP is the real
-         * enter, and PTRACE_SYSCALL generates an extra SIGTRAP|0x80
-         * enter-stop before the exit-stop.  Skip that extra stop. */
-        if (proc->state == PROC_STATE_SYSCALL_ENTER &&
-            el->interceptor->backend == INTERCEPT_PTRACE) {
-            if (proc->deny_errno || proc->emulated_syscall) {
-                /* A syscall skipped on enter returns -ENOSYS from the
-                 * injected invalid syscall, so its exit-stop looks like an
-                 * enter-stop.  Route to the exit path so the intended errno
-                 * override runs — this must take priority over the seccomp
-                 * "extra enter-stop" skip below, which would otherwise
-                 * swallow the exit and leak ENOSYS (e.g. EROFS on ro-bind). */
-                proc->seccomp_entered = false;
-                event->type = KLEE_EVENT_SYSCALL_EXIT;
-                event->syscall_nr = proc->current_syscall;
-                goto handle_syscall_exit;
-            }
-            if (proc->seccomp_entered) {
-                /* Extra enter-stop after PTRACE_EVENT_SECCOMP — skip it */
-                proc->seccomp_entered = false;
-                el->interceptor->continue_syscall(el->interceptor, event->pid, 0);
-                break;
-            }
-            /* Denied-exit misdetection (rax == -ENOSYS looks like enter) */
-            event->type = KLEE_EVENT_SYSCALL_EXIT;
-            event->syscall_nr = proc->current_syscall;
-            goto handle_syscall_exit;
-        }
         proc->state = PROC_STATE_SYSCALL_ENTER;
         proc->abi = event->abi;
         proc->raw_nr = event->raw_nr;
@@ -313,219 +325,121 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
         proc->arg_shift = 0;
         proc->demux_mem = false;
         proc->demux_dirty = false;
-        proc->path_modified = false;
+        proc->changed_args = 0;
+        proc->scratch_top = 0;
+        proc->next_exe[0] = '\0';
+        proc->next_skip_uid_virt = proc->skip_uid_virt;
         proc->pending_clone_flags = 0;
         /* A 32-bit socketcall/ipc becomes the real call it carries. */
         if (event->abi == KLEE_ABI_I386 && event->syscall_nr < 0)
             klee_abi_demux_enter(proc, el->interceptor, event);
         proc->current_syscall = event->syscall_nr;
-        proc->seccomp_entered = el->interceptor->backend == INTERCEPT_PTRACE &&
-                                 el->interceptor->ptrace.seccomp_filter;
-        proc->path_arg_count = 0;
-        proc->deny_errno = 0;
         proc->emulated_syscall = false;
         event->emulated = false;
         proc->resolved_guest[0] = '\0';
+        proc->saved_path[0] = '\0';
         klee_arena_reset(proc->event_arena);
 
         int rc = klee_dispatch_enter(proc, el->interceptor, event);
+        if (rc == 0 && !event->emulated && ic->backend == INTERCEPT_PTRACE)
+            rc = klee_abi_demux_commit(proc, ic);
+        memcpy(proc->syscall_args, event->args, sizeof(proc->syscall_args));
         if (rc < 0 || event->emulated) {
             /* Skip the tracee syscall and deliver its result. */
-            proc->deny_errno = rc < 0 ? -rc : 0;
-            proc->emulated_syscall = event->emulated;
-            int reply = el->interceptor->respond(el->interceptor, event,
-                                               rc < 0 ? -1 : 0, proc->deny_errno);
-            if (reply < 0 && reply != -ESRCH) {
-                KLEE_ERROR("failed to return syscall result to %d: %s",
-                           event->pid, strerror(-reply));
-                kill(event->pid, SIGKILL);
-            }
-            return 0;
+            proc->emulated_result = rc < 0 ? rc : event->retval;
+            proc->emulated_syscall = true;
+            return ic->respond(ic, event, event->retval, rc < 0 ? -rc : 0);
         }
-        if (el->interceptor->backend == INTERCEPT_PTRACE)
-            klee_abi_demux_commit(proc, el->interceptor, event);
-        /* Continue the syscall */
-        if (el->interceptor->backend == INTERCEPT_SECCOMP_UNOTIFY) {
-            el->interceptor->respond(el->interceptor, event, 0, 0);
-        } else {
-            /* Optimization for ptrace+seccomp: when the exit handler will
-             * be a no-op, use PTRACE_CONT to skip the exit-stop (and the
-             * extra enter-stop from seccomp).  This reduces from 3 ptrace
-             * stops to 1, which is critical for Chrome's recvmsg spin
-             * (~600K+ non-blocking calls that monopolize the event loop). */
-            bool need_exit = true;
-            if (!proc->path_modified) {
-                const KleeSyscallHandler *h = klee_dispatch_get(event->syscall_nr);
-                if (!h || !h->exit) {
-                    /* No exit handler -> exit stop is wasted */
-                    need_exit = false;
-                } else if (proc->skip_uid_virt) {
-                    /* UID-only exit handlers are no-ops when skip_uid_virt */
-                    int nr = event->syscall_nr;
-                    if (nr == KLEE_SYS_recvmsg || nr == KLEE_SYS_getsockopt)
-                        need_exit = false;
-                }
-            }
-            if (need_exit) {
-                el->interceptor->continue_syscall(el->interceptor, event->pid, 0);
-            } else {
-                proc->state = PROC_STATE_RUNNING;
-                proc->seccomp_entered = false;
-                el->interceptor->continue_running(el->interceptor, event->pid, 0);
-            }
-        }
-        break;
+        if (ic->backend != INTERCEPT_PTRACE)
+            return ic->respond(ic, event, 0, 0);
 
-    handle_syscall_exit:
+        if (ic->ptrace.seccomp_filter && !proc->changed_args &&
+            !needs_syscall_exit(proc, event->syscall_nr))
+            proc->state = PROC_STATE_RUNNING;
+        return resume_tracee(el, proc, 0);
+
     case KLEE_EVENT_SYSCALL_EXIT: {
-        proc->state = PROC_STATE_SYSCALL_EXIT;
+        /* A just-attached child or an exec can report an exit for a call
+         * whose entry we did not handle. */
+        if (proc->state != PROC_STATE_SYSCALL_ENTER)
+            return resume_tracee(el, proc, 0);
         event->syscall_nr = proc->current_syscall;
+        memcpy(event->args, proc->syscall_args, sizeof(event->args));
         if (proc->exec_previous_sandbox && event->retval < 0 &&
             (event->syscall_nr == KLEE_SYS_execve || event->syscall_nr == KLEE_SYS_execveat))
             klee_process_finish_mount_exec(proc, false);
-        klee_abi_demux_exit_args(proc, event);
 
-        /* Consolidate all register modifications into a single push */
-        bool need_reg_push = false;
-
-        /* If the syscall was skipped on enter, override the return value
-         * (kernel returned ENOSYS for the invalid -1 syscall) with the
-         * actual errno we want the tracee to see. */
-        if ((proc->deny_errno || proc->emulated_syscall) &&
-            el->interceptor->backend == INTERCEPT_PTRACE) {
-            klee_regs_fetch(el->interceptor, proc);
-            klee_regs_set_result(proc, (long)-proc->deny_errno);
-            proc->deny_errno = 0;
-            proc->emulated_syscall = false;
-            /* A handler may have rewritten path arguments before refusing
-             * the call (the second path of a rename, a read-only open):
-             * the tracee keeps its own registers either way. */
-            if (proc->path_modified) {
-                for (int i = 0; i < proc->path_arg_count; i++) {
-                    int idx = proc->path_arg_idx[i];
-                    klee_regs_set_arg(proc, idx, proc->saved_args[idx]);
-                }
-                proc->path_arg_count = 0;
-                proc->path_modified = false;
-            }
-            if (proc->demux_mem && proc->demux_dirty)
-                klee_abi_demux_restore(proc);
-            /* The tracee never executed this syscall. */
-            klee_regs_push(el->interceptor, proc);
-            proc->state = PROC_STATE_RUNNING;
-            el->interceptor->continue_running(el->interceptor, event->pid, 0);
-            break;
+        bool result_changed;
+        if (proc->emulated_syscall) {
+            event->retval = proc->emulated_result;
+            result_changed = true;
+        } else {
+            result_changed = klee_dispatch_exit(proc, ic, event) > 0;
         }
 
-        int exit_rc = klee_dispatch_exit(proc, el->interceptor, event);
-
-        if (exit_rc > 0 && el->interceptor->backend == INTERCEPT_PTRACE) {
-            klee_regs_fetch(el->interceptor, proc);
-            klee_regs_set_result(proc, event->retval);
-            need_reg_push = true;
+        if (result_changed || proc->changed_args || event->repeat_syscall) {
+            int rc = klee_regs_fetch(ic, proc);
+            if (rc < 0)
+                return rc;
+            if (result_changed)
+                klee_regs_set_result(proc, event->retval);
+            klee_regs_restore_args(proc);
+            if (event->repeat_syscall)
+                klee_regs_repeat_syscall(proc);
+            rc = klee_regs_push(ic, proc);
+            if (rc < 0)
+                return rc;
         }
-
-        /* Restore original syscall arg registers if path was rewritten.
-         * On enter, we pointed the arg at a scratch area below the stack;
-         * now restore the original pointer so the tracee's view is unchanged. */
-        if (proc->path_modified && el->interceptor->backend == INTERCEPT_PTRACE) {
-            if (!need_reg_push)
-                klee_regs_fetch(el->interceptor, proc);
-            for (int i = 0; i < proc->path_arg_count; i++) {
-                int idx = proc->path_arg_idx[i];
-                klee_regs_set_arg(proc, idx, proc->saved_args[idx]);
-            }
-            proc->path_arg_count = 0;
-            proc->path_modified = false;
-            need_reg_push = true;
-        }
-
-        /* socketcall: put the original argument pointer back */
-        if (proc->demux_mem && proc->demux_dirty &&
-            el->interceptor->backend == INTERCEPT_PTRACE) {
-            if (!need_reg_push)
-                klee_regs_fetch(el->interceptor, proc);
-            klee_abi_demux_restore(proc);
-            need_reg_push = true;
-        }
-
-        if (need_reg_push)
-            klee_regs_push(el->interceptor, proc);
-
         proc->state = PROC_STATE_RUNNING;
-        if (el->interceptor->backend == INTERCEPT_PTRACE)
-            el->interceptor->continue_running(el->interceptor, event->pid, 0);
-        break;
+        return resume_tracee(el, proc, 0);
     }
 
     case KLEE_EVENT_FORK:
-    case KLEE_EVENT_CLONE:
-        handle_fork(el, proc, event->new_child_pid);
-        /* Resume only the creator.  The child is resumed when its own
-         * initial SIGSTOP is reported (KLEE_EVENT_SIGNAL below).  Resuming
-         * it from here could release a syscall stop klee has not processed
-         * yet, letting e.g. execve or connect run untranslated. */
-        if (el->interceptor->backend == INTERCEPT_PTRACE)
-            el->interceptor->continue_syscall(el->interceptor, event->pid, 0);
-        break;
+    case KLEE_EVENT_CLONE: {
+        int rc = handle_fork(el, proc, event->new_child_pid);
+        if (rc < 0)
+            return rc;
+        if (klee_ht_remove(el->early_child_stops, (uint64_t)event->new_child_pid)) {
+            KleeProcess *child = klee_process_find(el->proctable, event->new_child_pid);
+            child->state = PROC_STATE_RUNNING;
+            rc = resume_tracee(el, child, 0);
+            if (rc < 0 && rc != -ESRCH)
+                return rc;
+        }
+        return resume_tracee(el, proc, 0);
+    }
 
     case KLEE_EVENT_EXEC:
-        klee_process_exec(proc, proc->vexe);
-        /* After successful exec the old process image is gone — there will
-         * be no syscall-exit-stop for the execve.  Reset state so the next
-         * intercepted syscall from the new program isn't misclassified as
-         * a syscall exit for the old execve. */
+        klee_process_exec(proc, proc->next_exe);
         proc->state = PROC_STATE_RUNNING;
-        proc->path_modified = false;
-        proc->path_arg_count = 0;
-        proc->demux_mem = false;
-        proc->arg_shift = 0;
-        proc->seccomp_entered = false;
-        if (el->interceptor->backend == INTERCEPT_PTRACE)
-            el->interceptor->continue_running(el->interceptor, event->pid, 0);
-        break;
+        proc->changed_args = 0;
+        proc->stack_end = 0;
+        return resume_tracee(el, proc, 0);
 
     case KLEE_EVENT_EXIT:
         handle_process_exit(el, proc, event);
-        /* If this was a PTRACE_EVENT_EXIT stop the process hasn't truly
-         * exited yet — continue it so the kernel finishes the exit and
-         * delivers SIGCHLD to the real parent (e.g. bash waiting in
-         * wait4).  Harmless if the process already exited (WIFEXITED). */
-        if (el->interceptor->backend == INTERCEPT_PTRACE)
-            el->interceptor->continue_running(el->interceptor, event->pid, 0);
-        break;
+        return 0;
+
+    case KLEE_EVENT_STOP:
+        if (proc->state == PROC_STATE_NEW) {
+            proc->state = PROC_STATE_RUNNING;
+            return resume_tracee(el, proc, 0);
+        }
+        if (event->signal == SIGTRAP)
+            return resume_tracee(el, proc, 0);
+        if (ptrace(PTRACE_LISTEN, event->pid, NULL, NULL) < 0)
+            return -errno;
+        return 0;
 
     case KLEE_EVENT_SIGNAL:
-        if (el->interceptor->backend == INTERCEPT_PTRACE) {
-            int sig = event->signal;
-            /* Suppress terminal job-control signals. The tracee is
-             * effectively always in a "background" process group from
-             * the kernel's perspective (klee holds the foreground).
-             * Forwarding SIGTTOU/SIGTTIN would stop the tracee when
-             * it tries terminal I/O or tcsetpgrp(); suppressing them
-             * lets the operation proceed (same as SIG_IGN behavior). */
-            if (sig == SIGTTOU || sig == SIGTTIN)
-                sig = 0;
-            /* Suppress the initial SIGSTOP that newly-forked children
-             * receive from PTRACE_O_TRACEFORK.  Without this, a race
-             * between the parent's fork event and the child's SIGSTOP
-             * can cause the SIGSTOP to be delivered, putting the child
-             * into group-stop.  The parent shell then sees it as
-             * "Stopped" even though the user never pressed Ctrl+Z. */
-            if (sig == SIGSTOP && proc->suppress_initial_stop) {
-                KLEE_DEBUG("suppressing initial SIGSTOP for pid=%d", event->pid);
-                sig = 0;
-                proc->suppress_initial_stop = false;
-            }
-            if (sig)
-                rewrite_siginfo_pid(el, proc, sig);
-            el->interceptor->continue_running(el->interceptor,
-                                               event->pid, sig);
+        if (ic->backend == INTERCEPT_PTRACE) {
+            rewrite_siginfo_pid(el, proc, event->signal);
+            return resume_tracee(el, proc, event->signal);
         }
-        break;
+        return 0;
     }
 
-    return 0;
+    return -EINVAL;
 }
 
 int klee_event_loop_run(KleeEventLoop *el)
@@ -533,23 +447,26 @@ int klee_event_loop_run(KleeEventLoop *el)
     KLEE_INFO("entering event loop");
 
     if (el->interceptor->backend == INTERCEPT_PTRACE) {
-        /* ptrace loop: use waitpid */
-        while (el->running) {
+        KleeInterceptor *ic = el->interceptor;
+        int rc = ic->continue_running(ic, el->initial_child_pid, 0);
+        if (rc < 0 && rc != -ESRCH)
+            return 1;
+        while (el->running && !shutdown_signal) {
+            ic->ptrace.batch_wait = el->proctable->count > 1;
             KleeEvent event;
-            int rc = el->interceptor->wait_event(el->interceptor, &event);
-
-            if (rc == -ECHILD) {
-                KLEE_DEBUG("no more children");
-                break;
-            }
-            if (rc == -EINTR)
+            rc = ic->wait_event(ic, &event);
+            if (rc == -ESRCH || rc == -EINTR)
                 continue;
+            if (rc == 0) {
+                rc = klee_event_loop_handle(el, &event);
+                if (rc == -ESRCH)
+                    continue;
+            }
             if (rc < 0) {
-                KLEE_ERROR("wait_event failed: %d", rc);
+                KLEE_ERROR("ptrace event loop failed: %s", strerror(-rc));
+                el->exit_status = 1;
                 break;
             }
-
-            klee_event_loop_handle(el, &event);
         }
     } else {
         /* seccomp_unotify + epoll loop */
@@ -611,9 +528,12 @@ int klee_event_loop_run(KleeEventLoop *el)
     if (el->proctable->count > 0)
         KLEE_DEBUG("%zu traced processes remain; they die with klee",
                    el->proctable->count);
+    klee_event_watch_child(0);
     while (waitpid(-1, NULL, WNOHANG) > 0)
         ;
 
+    if (shutdown_signal)
+        el->exit_status = klee_event_shutdown_status();
     KLEE_INFO("event loop exited with status %d", el->exit_status);
     return el->exit_status;
 }

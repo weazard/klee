@@ -77,28 +77,28 @@ static uint64_t get_reg_arg(const KleeProcess *proc, int n)
     }
 }
 
-static void set_reg_arg(KleeProcess *proc, int n, uint64_t value)
+static unsigned long long *reg_arg(KleeProcess *proc, int n)
 {
     struct user_regs_struct *r = &proc->regs[REG_CURRENT];
     if (proc->abi == KLEE_ABI_I386) {
-        value = (uint32_t)value;
         switch (n) {
-        case 0: r->rbx = value; break;
-        case 1: r->rcx = value; break;
-        case 2: r->rdx = value; break;
-        case 3: r->rsi = value; break;
-        case 4: r->rdi = value; break;
-        case 5: r->rbp = value; break;
+        case 0: return &r->rbx;
+        case 1: return &r->rcx;
+        case 2: return &r->rdx;
+        case 3: return &r->rsi;
+        case 4: return &r->rdi;
+        case 5: return &r->rbp;
+        default: return NULL;
         }
-        return;
     }
     switch (n) {
-    case 0: r->rdi = value; break;
-    case 1: r->rsi = value; break;
-    case 2: r->rdx = value; break;
-    case 3: r->r10 = value; break;
-    case 4: r->r8 = value; break;
-    case 5: r->r9 = value; break;
+    case 0: return &r->rdi;
+    case 1: return &r->rsi;
+    case 2: return &r->rdx;
+    case 3: return &r->r10;
+    case 4: return &r->r8;
+    case 5: return &r->r9;
+    default: return NULL;
     }
 }
 
@@ -130,12 +130,40 @@ void klee_regs_set_arg(KleeProcess *proc, int n, uint64_t value)
         proc->demux_dirty = true;
         return;
     }
-    set_reg_arg(proc, n + proc->arg_shift, value);
+    klee_regs_set_arg_raw(proc, n + proc->arg_shift, value);
 }
 
 void klee_regs_set_arg_raw(KleeProcess *proc, int n, uint64_t value)
 {
-    set_reg_arg(proc, n, value);
+    unsigned long long *reg = reg_arg(proc, n);
+    if (!reg)
+        return;
+    if (proc->abi == KLEE_ABI_I386)
+        value = (*reg & ~(uint64_t)UINT32_MAX) | (uint32_t)value;
+    if (*reg == value)
+        return;
+    unsigned bit = 1u << n;
+    if (!(proc->changed_args & bit))
+        proc->original_regs[n] = *reg;
+    proc->changed_args |= bit;
+    *reg = value;
+}
+
+void klee_regs_restore_args(KleeProcess *proc)
+{
+    for (int n = 0; n < 6; n++) {
+        if (proc->changed_args & (1u << n))
+            *reg_arg(proc, n) = proc->original_regs[n];
+    }
+    proc->changed_args = 0;
+}
+
+void klee_regs_repeat_syscall(KleeProcess *proc)
+{
+    /* x86 syscall restart returns to the two-byte syscall/int80 instruction. */
+    struct user_regs_struct *regs = &proc->regs[REG_CURRENT];
+    regs->rip -= 2;
+    regs->rax = (unsigned long long)proc->raw_nr;
 }
 
 long klee_regs_get_result(const KleeProcess *proc)
@@ -155,7 +183,5 @@ uint64_t klee_regs_get_ip(const KleeProcess *proc)
 
 uint64_t klee_regs_get_sp(const KleeProcess *proc)
 {
-    if (proc->abi == KLEE_ABI_I386)
-        return (uint32_t)proc->regs[REG_CURRENT].rsp;
     return proc->regs[REG_CURRENT].rsp;
 }

@@ -6,10 +6,13 @@
 #define KLEE_USER_NS_H
 
 #include <sys/types.h>
+#include <stddef.h>
 
 typedef struct klee_id_state {
     uid_t ruid, euid, suid, fsuid;
     gid_t rgid, egid, sgid, fsgid;
+    gid_t *groups;
+    size_t group_count;
 } KleeIdState;
 
 /* Create ID state with given initial uid/gid */

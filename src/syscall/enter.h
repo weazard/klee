@@ -72,6 +72,7 @@ int klee_enter_setresuid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_setresgid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_setfsuid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_setfsgid(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
+int klee_enter_getgroups(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_setgroups(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 
 /* UTS / IPC */
@@ -85,12 +86,12 @@ int klee_enter_bind(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_connect(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 
 /* Socket credential translation */
+int klee_enter_sendto(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_sendmsg(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 
 /* Misc */
 int klee_enter_ptrace(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_prctl(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
-int klee_enter_seccomp(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_inotify_add_watch(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_utimensat(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);
 int klee_enter_utimes(KleeProcess *proc, KleeInterceptor *ic, KleeEvent *ev);

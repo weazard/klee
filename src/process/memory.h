@@ -10,6 +10,8 @@
 #include <stddef.h>
 #include <linux/limits.h>
 
+struct klee_process;
+
 /* Read a NUL-terminated string from tracee memory.
  * Returns length read (excluding NUL), or negative errno. */
 int klee_read_string(KleeInterceptor *ic, pid_t pid,
@@ -34,10 +36,14 @@ static inline int klee_write_mem(KleeInterceptor *ic, pid_t pid,
     return ic->write_mem(ic, pid, remote, local, len);
 }
 
-/* Read a path argument from tracee at the given address.
- * Handles dirfd-relative paths (AT_FDCWD, etc.).
- * Returns 0 on success with path in buf. */
+/* Read a path argument. Returns its length excluding NUL or negative errno. */
 int klee_read_path(KleeInterceptor *ic, pid_t pid,
                    char *buf, size_t buf_size, const void *remote_addr);
+
+/* Stage arguments below the tracee's red zone within its stack mapping. */
+int klee_scratch_write(struct klee_process *proc, KleeInterceptor *ic,
+                        const void *data, size_t len, uint64_t *addr);
+int klee_scratch_string(struct klee_process *proc, KleeInterceptor *ic,
+                         const char *str, uint64_t *addr);
 
 #endif /* KLEE_MEMORY_H */

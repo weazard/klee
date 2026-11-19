@@ -1063,6 +1063,15 @@ else
     echo "  SKIP: python3 unavailable (persistent overlay test)"
 fi
 
+echo "--- Process and syscall bookkeeping ---"
+if command -v python3 >/dev/null 2>&1; then
+    if out=$(python3 tests/test_audit_regression.py "$KLEE" 2>&1); then
+        pass "thread lifecycle, exec identity, mount order, syscall arguments and monitoring"
+    else
+        fail "process and syscall bookkeeping (got: $out)"
+    fi
+fi
+
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
 exit $FAIL

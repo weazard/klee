@@ -20,6 +20,8 @@
 #define KLEE_SYS32_OLDSTRUCT 0x1
 /* socketcall / ipc: split into the real call at syscall entry. */
 #define KLEE_SYS32_DEMUX     0x2
+/* Legacy UID/GID scalars and arrays have 16-bit elements. */
+#define KLEE_SYS32_UID16     0x4
 
 typedef struct {
     uint16_t nr32;

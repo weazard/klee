@@ -5,6 +5,8 @@
 #include "syscall/handlers.h"
 #include "syscall/sysnum.h"
 
+#include <errno.h>
+
 int klee_get_intercepted_syscalls(int *out, size_t max_count)
 {
     static const int syscalls[] = {
@@ -47,11 +49,13 @@ int klee_get_intercepted_syscalls(int *out, size_t max_count)
         KLEE_SYS_truncate,
         KLEE_SYS_creat,
         KLEE_SYS_getcwd,
+        KLEE_SYS_getdents,
         KLEE_SYS_getdents64,
         KLEE_SYS_inotify_add_watch,
 
         /* FD tracking */
         KLEE_SYS_close,
+        KLEE_SYS_close_range,
         KLEE_SYS_dup,
         KLEE_SYS_dup2,
         KLEE_SYS_dup3,
@@ -67,8 +71,6 @@ int klee_get_intercepted_syscalls(int *out, size_t max_count)
         KLEE_SYS_clone,
         KLEE_SYS_fork,
         KLEE_SYS_vfork,
-        KLEE_SYS_wait4,
-        KLEE_SYS_waitid,
         KLEE_SYS_setpgid,
         KLEE_SYS_getpgid,
         KLEE_SYS_getpgrp,
@@ -105,6 +107,7 @@ int klee_get_intercepted_syscalls(int *out, size_t max_count)
         /* Socket */
         KLEE_SYS_bind,
         KLEE_SYS_connect,
+        KLEE_SYS_sendto,
         KLEE_SYS_sendmsg,
         KLEE_SYS_recvmsg,
         KLEE_SYS_recvfrom,
@@ -114,9 +117,7 @@ int klee_get_intercepted_syscalls(int *out, size_t max_count)
 
         /* Misc */
         KLEE_SYS_prctl,
-        KLEE_SYS_seccomp,
         KLEE_SYS_getsockopt,
-        KLEE_SYS_memfd_create,
 
 #ifdef KLEE_SYS_newfstatat
         KLEE_SYS_newfstatat,
@@ -137,8 +138,7 @@ int klee_get_intercepted_syscalls(int *out, size_t max_count)
         KLEE_SYS_io_uring_setup,
 #endif
 
-        /* PID-targeting signal/pidfd calls.  Appended last so earlier
-         * entries keep their place in the compat child-filter prefix. */
+        /* PID-targeting signal/pidfd calls. */
         KLEE_SYS_rt_sigqueueinfo,
         KLEE_SYS_rt_tgsigqueueinfo,
 #ifdef KLEE_SYS_pidfd_open
@@ -195,7 +195,7 @@ int klee_get_intercepted_syscalls(int *out, size_t max_count)
 
     size_t count = sizeof(syscalls) / sizeof(syscalls[0]);
     if (count > max_count)
-        count = max_count;
+        return -E2BIG;
 
     for (size_t i = 0; i < count; i++)
         out[i] = syscalls[i];

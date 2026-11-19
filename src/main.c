@@ -13,6 +13,7 @@
 #include "syscall/dispatch.h"
 #include "syscall/exec_shim.h"
 #include "fs/mount_table.h"
+#include "fs/path_resolve.h"
 #include "fs/tmpfs.h"
 #include "ns/pid_ns.h"
 #include "ns/user_ns.h"
@@ -85,7 +86,8 @@ static int write_info_fd(const KleeConfig *cfg, pid_t child_pid)
                        "{\n    \"child-pid\": %d\n}\n", child_pid);
     if (write(cfg->info_fd, buf, (size_t)len) < 0)
         KLEE_WARN("write to info-fd failed: %s", strerror(errno));
-    close(cfg->info_fd);
+    if (cfg->info_fd != cfg->json_status_fd && cfg->info_fd != cfg->sync_fd)
+        close(cfg->info_fd);
     return 0;
 }
 
@@ -112,27 +114,62 @@ static int write_json_exit_status(const KleeConfig *cfg, int exit_code)
                        "{ \"exit-code\": %d }\n", exit_code);
     if (write(cfg->json_status_fd, buf, (size_t)len) < 0)
         KLEE_WARN("write to json-status-fd failed: %s", strerror(errno));
-    close(cfg->json_status_fd);
+    if (cfg->json_status_fd != cfg->sync_fd)
+        close(cfg->json_status_fd);
     return 0;
 }
 
-/* sync_fd is kept open for the sandbox lifetime.
- * The external process watches for EOF when the sandbox exits. */
-
-static void wait_block_fd(const KleeConfig *cfg)
+static int wait_block_fd(const KleeConfig *cfg)
 {
-    if (cfg->block_fd >= 0) {
-        /* Wait until block_fd is closed */
-        char buf;
-        while (read(cfg->block_fd, &buf, 1) > 0)
-            ;
+    if (cfg->block_fd < 0)
+        return 0;
+    char buf;
+    ssize_t n = read(cfg->block_fd, &buf, 1);
+    int rc = n < 0 ? -errno : 0;
+    if (cfg->block_fd != cfg->info_fd && cfg->block_fd != cfg->json_status_fd &&
+        cfg->block_fd != cfg->sync_fd)
         close(cfg->block_fd);
+    return rc;
+}
+
+static int lock_files(const KleeConfig *cfg, KleeMountTable *mt,
+                      const char *cwd, int *fds)
+{
+    KleeResolveCtx ctx = {
+        .mount_table = mt,
+        .vcwd = cfg->chdir_path ? cfg->chdir_path : cwd,
+        .vroot = klee_mount_table_get_root(mt),
+    };
+    for (int i = 0; i < cfg->lock_file_count; i++) {
+        char path[PATH_MAX];
+        int rc = klee_path_guest_to_host(&ctx, cfg->lock_files[i], path, AT_FDCWD);
+        if (rc < 0)
+            return rc;
+        int fd = open(path, O_RDONLY | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0)
+            return -errno;
+        fds[i] = fd;
+        struct flock lock = {.l_type = F_RDLCK, .l_whence = SEEK_SET};
+        if (fcntl(fd, F_SETLK, &lock) < 0)
+            return -errno;
     }
+    return 0;
 }
 
 static void child_process(KleeInterceptor *interceptor, const KleeConfig *cfg,
                           const char *old_cwd)
 {
+    signal(SIGTERM, SIG_DFL);
+    signal(SIGINT, SIG_DFL);
+    signal(SIGHUP, SIG_DFL);
+    if (cfg->info_fd >= 0)
+        close(cfg->info_fd);
+    if (cfg->json_status_fd >= 0 && cfg->json_status_fd != cfg->info_fd)
+        close(cfg->json_status_fd);
+    if (cfg->sync_fd >= 0 && cfg->sync_fd != cfg->info_fd &&
+        cfg->sync_fd != cfg->json_status_fd)
+        close(cfg->sync_fd);
+
     /* Install interception in child */
     int rc = klee_interceptor_install_child(interceptor);
     if (rc < 0) {
@@ -161,10 +198,6 @@ static void child_process(KleeInterceptor *interceptor, const KleeConfig *cfg,
         }
     }
 
-    /* Die with parent if requested */
-    if (cfg->die_with_parent)
-        prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
-
     /* Change directory - bwrap fallback chain:
      * 1. --chdir path (fatal on failure)
      * 2. old working directory
@@ -189,7 +222,8 @@ static void child_process(KleeInterceptor *interceptor, const KleeConfig *cfg,
                 { /* last resort, ignore error */ }
         }
     }
-    setenv("PWD", new_cwd, 1);
+    char cwd[PATH_MAX];
+    setenv("PWD", getcwd(cwd, sizeof(cwd)) ? cwd : new_cwd, 1);
 
     /* Execute child command */
     if (cfg->argc <= 0) {
@@ -210,6 +244,7 @@ static void child_process(KleeInterceptor *interceptor, const KleeConfig *cfg,
 
 int main(int argc, char **argv)
 {
+    pid_t launcher_pid = getppid();
     /* Refuse to run setuid/setgid.  klee performs no privileged setup and
      * gains nothing from elevated ids; running interception machinery with
      * mismatched real/effective ids only creates attack surface.  This
@@ -228,10 +263,6 @@ int main(int argc, char **argv)
     klee_log_init(parse_log_level());
 
     KLEE_INFO("klee starting (pid=%d)", getpid());
-
-    /* Ignore SIGTTOU so klee doesn't stop when the child takes the
-     * terminal foreground process group via tcsetpgrp(). */
-    signal(SIGTTOU, SIG_IGN);
 
     /* Reset SIGCHLD disposition.  If klee was spawned from a process that
      * ignores SIGCHLD (Erlang VMs, volumeicon, some daemons), the SIG_IGN
@@ -262,7 +293,34 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Open session log file (always-on, organized by app/session) */
+    const int monitor_fds[] = {cfg.info_fd, cfg.json_status_fd, cfg.sync_fd, cfg.block_fd};
+    for (size_t i = 0; i < sizeof(monitor_fds) / sizeof(monitor_fds[0]); i++) {
+        if (monitor_fds[i] >= 0 && fcntl(monitor_fds[i], F_GETFD) < 0) {
+            KLEE_ERROR("invalid monitor fd %d: %s", monitor_fds[i], strerror(errno));
+            klee_config_destroy(&cfg);
+            return 1;
+        }
+    }
+
+    rc = klee_event_install_shutdown_handlers();
+    if (rc < 0) {
+        KLEE_ERROR("cannot install signal handlers: %s", strerror(-rc));
+        klee_config_destroy(&cfg);
+        return 1;
+    }
+    if (cfg.die_with_parent) {
+        if (prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0) < 0) {
+            KLEE_ERROR("PR_SET_PDEATHSIG failed: %s", strerror(errno));
+            klee_config_destroy(&cfg);
+            return 1;
+        }
+        if (getppid() != launcher_pid) {
+            klee_config_destroy(&cfg);
+            return 128 + SIGTERM;
+        }
+    }
+
+    /* Open optional session log. */
     klee_log_open_file(cfg.argv[0], getpid());
     if (klee_log_get_path())
         KLEE_INFO("session log: %s", klee_log_get_path());
@@ -327,6 +385,8 @@ int main(int argc, char **argv)
         sandbox->hostname = strdup(cfg.hostname);
 
     /* Create mount table */
+    int *lock_fds = NULL;
+    KleeProcessTable *proctable = NULL;
     KleeMountTable *mount_table = klee_mount_table_create();
     if (!mount_table) {
         KLEE_ERROR("failed to create mount table");
@@ -485,7 +545,26 @@ int main(int argc, char **argv)
         old_cwd[0] = '\0';
 
     /* Wait on block fd if specified (bwrap does this after setup, before exec) */
-    wait_block_fd(&cfg);
+    rc = wait_block_fd(&cfg);
+    if (rc < 0) {
+        KLEE_ERROR("cannot read block fd: %s", strerror(-rc));
+        goto cleanup;
+    }
+    if (klee_event_shutdown_status())
+        goto cleanup;
+
+    if (cfg.lock_file_count) {
+        lock_fds = malloc((size_t)cfg.lock_file_count * sizeof(*lock_fds));
+        if (!lock_fds)
+            goto cleanup;
+        for (int i = 0; i < cfg.lock_file_count; i++)
+            lock_fds[i] = -1;
+        rc = lock_files(&cfg, mount_table, old_cwd[0] ? old_cwd : "/", lock_fds);
+        if (rc < 0) {
+            KLEE_ERROR("cannot acquire lock file: %s", strerror(-rc));
+            goto cleanup;
+        }
+    }
 
     /* Under a simulated PID namespace klee stands in for the namespace's
      * init: orphaned sandbox processes are reparented to klee and reaped by
@@ -509,6 +588,8 @@ int main(int argc, char **argv)
     }
 
     /* Parent: setup interception */
+    klee_event_watch_child(child_pid);
+    signal(SIGPIPE, SIG_IGN);
     KLEE_INFO("child started pid=%d", child_pid);
 
     /* Create network namespace (needs child PID for slirp4netns target) */
@@ -521,13 +602,16 @@ int main(int argc, char **argv)
     rc = klee_interceptor_setup_parent(interceptor, child_pid);
     if (rc < 0) {
         KLEE_ERROR("failed to setup parent interception: %s", strerror(-rc));
-        kill(child_pid, SIGKILL);
-        waitpid(child_pid, NULL, 0);
+        klee_event_watch_child(0);
+        if (rc != -ECHILD) {
+            kill(child_pid, SIGKILL);
+            TEMP_FAILURE_RETRY(waitpid(child_pid, NULL, 0));
+        }
         goto cleanup;
     }
 
     /* Create process table and initial process */
-    KleeProcessTable *proctable = klee_proctable_create();
+    proctable = klee_proctable_create();
     if (!proctable) {
         KLEE_ERROR("failed to create process table");
         kill(child_pid, SIGKILL);
@@ -563,11 +647,8 @@ int main(int argc, char **argv)
     if (cfg.zypak_detected)
         init_proc->skip_uid_virt = true;
 
-    /* Set initial virtual CWD */
-    if (cfg.chdir_path)
-        snprintf(init_proc->vcwd, PATH_MAX, "%s", cfg.chdir_path);
-    else if (!getcwd(init_proc->vcwd, PATH_MAX))
-        snprintf(init_proc->vcwd, PATH_MAX, "/");
+    /* The child still has the inherited cwd until its setup chdir runs. */
+    snprintf(init_proc->vcwd, PATH_MAX, "%s", old_cwd[0] ? old_cwd : "/");
 
     init_proc->state = PROC_STATE_RUNNING;
 
@@ -625,14 +706,16 @@ int main(int argc, char **argv)
     if (cfg.sync_fd >= 0)
         close(cfg.sync_fd);
 
+    /* Record locks are held by the supervisor until it exits. */
+    free(lock_fds);
     /* Cleanup */
     klee_event_loop_destroy(event_loop);
-    klee_proctable_destroy(proctable);
 
     KLEE_INFO("klee exiting with status %d", exit_status);
 
     klee_fuse_proc_destroy(sandbox->fuse_proc);
     sandbox->fuse_proc = NULL;
+    klee_proctable_destroy(proctable);
     klee_net_ns_destroy(sandbox->net_ns);
     sandbox->net_ns = NULL;
     klee_ipc_ns_destroy(sandbox->ipc_ns);
@@ -651,9 +734,17 @@ int main(int argc, char **argv)
     return exit_status;
 
 cleanup:
+    if (lock_fds) {
+        for (int i = 0; i < cfg.lock_file_count; i++) {
+            if (lock_fds[i] >= 0)
+                close(lock_fds[i]);
+        }
+        free(lock_fds);
+    }
     if (sandbox) {
         klee_fuse_proc_destroy(sandbox->fuse_proc);
         sandbox->fuse_proc = NULL;
+        klee_proctable_destroy(proctable);
         klee_net_ns_destroy(sandbox->net_ns);
         sandbox->net_ns = NULL;
         klee_ipc_ns_destroy(sandbox->ipc_ns);
@@ -672,5 +763,6 @@ cleanup:
     klee_exec_shim_cleanup();
     klee_log_close_file();
     klee_config_destroy(&cfg);
-    return 1;
+    int termination_status = klee_event_shutdown_status();
+    return termination_status ? termination_status : 1;
 }

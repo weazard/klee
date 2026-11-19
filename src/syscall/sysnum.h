@@ -53,6 +53,7 @@
 #define KLEE_SYS_truncate        SYS_truncate
 #define KLEE_SYS_creat           SYS_creat
 #define KLEE_SYS_close           SYS_close
+#define KLEE_SYS_close_range     436
 #define KLEE_SYS_dup             SYS_dup
 #define KLEE_SYS_dup2            SYS_dup2
 #define KLEE_SYS_dup3            SYS_dup3
@@ -189,6 +190,7 @@
 #define KLEE_SYS_getsockopt      SYS_getsockopt
 #define KLEE_SYS_connect         SYS_connect
 #define KLEE_SYS_bind            SYS_bind
+#define KLEE_SYS_sendto          SYS_sendto
 #define KLEE_SYS_sendmsg         SYS_sendmsg
 #define KLEE_SYS_recvmsg         SYS_recvmsg
 #define KLEE_SYS_recvfrom        SYS_recvfrom

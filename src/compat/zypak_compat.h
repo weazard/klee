@@ -45,6 +45,6 @@ bool klee_zypak_is_chrome_sandbox(const char *exe_path);
  * writing a NUL byte right after the '='.  This prevents child
  * processes from retrying the SUID sandbox. */
 void klee_zypak_nullify_sandbox_env(KleeInterceptor *ic, pid_t pid,
-                                     uint64_t envp_addr);
+                                     KleeAbi abi, uint64_t envp_addr);
 
 #endif /* KLEE_ZYPAK_COMPAT_H */

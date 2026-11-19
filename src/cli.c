@@ -11,6 +11,8 @@
 #include <stdio.h>
 #include <errno.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <limits.h>
 
 #define MAX_ARGS 4096
 
@@ -26,8 +28,9 @@ static int need_args(int i, int argc, int count, const char *opt)
 static int parse_int(const char *s, int *out)
 {
     char *end;
+    errno = 0;
     long val = strtol(s, &end, 0);
-    if (*end != '\0' || end == s) {
+    if (errno == ERANGE || val < 0 || val > INT_MAX || *end != '\0' || end == s) {
         KLEE_ERROR("invalid integer: %s", s);
         return -EINVAL;
     }
@@ -60,6 +63,12 @@ static int add_env_op(KleeConfig *cfg, EnvOpType type,
     op->type = type;
     op->key = key ? strdup(key) : NULL;
     op->value = value ? strdup(value) : NULL;
+    if ((key && !op->key) || (value && !op->value)) {
+        free(op->key);
+        free(op->value);
+        free(op);
+        return -ENOMEM;
+    }
     op->next = NULL;
     if (cfg->env_ops_tail) {
         cfg->env_ops_tail->next = op;
@@ -87,8 +96,10 @@ static int add_lock_file(KleeConfig *cfg, const char *path)
     char **files = realloc(cfg->lock_files, n * sizeof(char *));
     if (!files)
         return -ENOMEM;
-    files[n - 1] = strdup(path);
     cfg->lock_files = files;
+    files[n - 1] = strdup(path);
+    if (!files[n - 1])
+        return -ENOMEM;
     cfg->lock_file_count = n;
     return 0;
 }
@@ -123,18 +134,29 @@ static int add_overlay_src(KleeConfig *cfg, const char *path)
     char **srcs = realloc(cfg->pending_overlay_srcs, n * sizeof(char *));
     if (!srcs)
         return -ENOMEM;
-    srcs[n - 1] = strdup(path);
     cfg->pending_overlay_srcs = srcs;
+    srcs[n - 1] = strdup(path);
+    if (!srcs[n - 1])
+        return -ENOMEM;
     cfg->pending_overlay_src_count = n;
     return 0;
 }
 
 static int klee_cli_parse_recurse(KleeConfig *cfg, int argc, char **argv,
-                                   bool from_args_fd);
+                                   pid_t tracee, bool from_args_fd);
 
 /* Parse NUL-separated arguments from a file descriptor (--args FD) */
-static int parse_args_fd(KleeConfig *cfg, int fd)
+static int parse_args_fd(KleeConfig *cfg, int fd, pid_t tracee)
 {
+    int input = fd;
+    if (tracee > 0) {
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/%d/fd/%d", tracee, fd);
+        input = open(path, O_RDONLY | O_CLOEXEC);
+        if (input < 0)
+            return -errno;
+    }
+
     /* Read entire content */
     char *buf = NULL;
     size_t buf_size = 0;
@@ -142,10 +164,11 @@ static int parse_args_fd(KleeConfig *cfg, int fd)
     char tmp[4096];
     ssize_t n;
 
-    while ((n = read(fd, tmp, sizeof(tmp))) > 0) {
+    while ((n = TEMP_FAILURE_RETRY(read(input, tmp, sizeof(tmp)))) > 0) {
         char *new_buf = realloc(buf, buf_size + (size_t)n + 1);
         if (!new_buf) {
             free(buf);
+            close(input);
             return -ENOMEM;
         }
         buf = new_buf;
@@ -154,6 +177,12 @@ static int parse_args_fd(KleeConfig *cfg, int fd)
         buf_size = buf_len + 1;
     }
 
+    int read_error = n < 0 ? errno : 0;
+    close(input);
+    if (read_error) {
+        free(buf);
+        return -read_error;
+    }
     if (!buf || buf_len == 0) {
         free(buf);
         return 0;
@@ -189,7 +218,7 @@ static int parse_args_fd(KleeConfig *cfg, int fd)
         KLEE_INFO("--args FD: read %d arguments", new_argc);
         for (int j = 0; j < new_argc; j++)
             KLEE_DEBUG("  args[%d] = %s", j, new_argv[j]);
-        int rc = klee_cli_parse_recurse(cfg, new_argc, new_argv, true);
+        int rc = klee_cli_parse_recurse(cfg, new_argc, new_argv, tracee, true);
         free(new_argv);
         free(buf);
         return rc;
@@ -202,11 +231,16 @@ static int parse_args_fd(KleeConfig *cfg, int fd)
 
 int klee_cli_parse(KleeConfig *cfg, int argc, char **argv)
 {
-    return klee_cli_parse_recurse(cfg, argc, argv, false);
+    return klee_cli_parse_in_tracee(cfg, argc, argv, 0);
+}
+
+int klee_cli_parse_in_tracee(KleeConfig *cfg, int argc, char **argv, pid_t tracee)
+{
+    return klee_cli_parse_recurse(cfg, argc, argv, tracee, false);
 }
 
 static int klee_cli_parse_recurse(KleeConfig *cfg, int argc, char **argv,
-                                   bool from_args_fd)
+                                   pid_t tracee, bool from_args_fd)
 {
     int i = 0;
     int rc;
@@ -228,32 +262,38 @@ static int klee_cli_parse_recurse(KleeConfig *cfg, int argc, char **argv,
         /* ==================== Mount operations ==================== */
         if (strcmp(arg, "--bind") == 0) {
             if ((rc = need_args(i, argc, 2, arg)) < 0) return rc;
-            klee_config_add_mount(cfg, MOUNT_BIND_RW, argv[i+1], argv[i+2]);
+            if (!klee_config_add_mount(cfg, MOUNT_BIND_RW, argv[i+1], argv[i+2]))
+                return -ENOMEM;
             i += 3;
         }
         else if (strcmp(arg, "--bind-try") == 0) {
             if ((rc = need_args(i, argc, 2, arg)) < 0) return rc;
-            klee_config_add_mount(cfg, MOUNT_BIND_TRY, argv[i+1], argv[i+2]);
+            if (!klee_config_add_mount(cfg, MOUNT_BIND_TRY, argv[i+1], argv[i+2]))
+                return -ENOMEM;
             i += 3;
         }
         else if (strcmp(arg, "--ro-bind") == 0) {
             if ((rc = need_args(i, argc, 2, arg)) < 0) return rc;
-            klee_config_add_mount(cfg, MOUNT_BIND_RO, argv[i+1], argv[i+2]);
+            if (!klee_config_add_mount(cfg, MOUNT_BIND_RO, argv[i+1], argv[i+2]))
+                return -ENOMEM;
             i += 3;
         }
         else if (strcmp(arg, "--ro-bind-try") == 0) {
             if ((rc = need_args(i, argc, 2, arg)) < 0) return rc;
-            klee_config_add_mount(cfg, MOUNT_BIND_RO_TRY, argv[i+1], argv[i+2]);
+            if (!klee_config_add_mount(cfg, MOUNT_BIND_RO_TRY, argv[i+1], argv[i+2]))
+                return -ENOMEM;
             i += 3;
         }
         else if (strcmp(arg, "--dev-bind") == 0) {
             if ((rc = need_args(i, argc, 2, arg)) < 0) return rc;
-            klee_config_add_mount(cfg, MOUNT_DEV_BIND, argv[i+1], argv[i+2]);
+            if (!klee_config_add_mount(cfg, MOUNT_DEV_BIND, argv[i+1], argv[i+2]))
+                return -ENOMEM;
             i += 3;
         }
         else if (strcmp(arg, "--dev-bind-try") == 0) {
             if ((rc = need_args(i, argc, 2, arg)) < 0) return rc;
-            klee_config_add_mount(cfg, MOUNT_DEV_BIND_TRY, argv[i+1], argv[i+2]);
+            if (!klee_config_add_mount(cfg, MOUNT_DEV_BIND_TRY, argv[i+1], argv[i+2]))
+                return -ENOMEM;
             i += 3;
         }
         else if (strcmp(arg, "--bind-fd") == 0) {
@@ -261,7 +301,9 @@ static int klee_cli_parse_recurse(KleeConfig *cfg, int argc, char **argv,
             int fd;
             if ((rc = parse_int(argv[i+1], &fd)) < 0) return rc;
             KleeMountOp *op = klee_config_add_mount(cfg, MOUNT_BIND_FD, NULL, argv[i+2]);
-            if (op) op->fd = fd;
+            if (!op)
+                return -ENOMEM;
+            op->fd = fd;
             i += 3;
         }
         else if (strcmp(arg, "--ro-bind-fd") == 0) {
@@ -269,37 +311,45 @@ static int klee_cli_parse_recurse(KleeConfig *cfg, int argc, char **argv,
             int fd;
             if ((rc = parse_int(argv[i+1], &fd)) < 0) return rc;
             KleeMountOp *op = klee_config_add_mount(cfg, MOUNT_RO_BIND_FD, NULL, argv[i+2]);
-            if (op) op->fd = fd;
+            if (!op)
+                return -ENOMEM;
+            op->fd = fd;
             i += 3;
         }
         else if (strcmp(arg, "--tmpfs") == 0) {
             if ((rc = need_args(i, argc, 1, arg)) < 0) return rc;
-            klee_config_add_mount(cfg, MOUNT_TMPFS, NULL, argv[i+1]);
+            if (!klee_config_add_mount(cfg, MOUNT_TMPFS, NULL, argv[i+1]))
+                return -ENOMEM;
             i += 2;
         }
         else if (strcmp(arg, "--proc") == 0) {
             if ((rc = need_args(i, argc, 1, arg)) < 0) return rc;
-            klee_config_add_mount(cfg, MOUNT_PROC, NULL, argv[i+1]);
+            if (!klee_config_add_mount(cfg, MOUNT_PROC, NULL, argv[i+1]))
+                return -ENOMEM;
             i += 2;
         }
         else if (strcmp(arg, "--dev") == 0) {
             if ((rc = need_args(i, argc, 1, arg)) < 0) return rc;
-            klee_config_add_mount(cfg, MOUNT_DEV, NULL, argv[i+1]);
+            if (!klee_config_add_mount(cfg, MOUNT_DEV, NULL, argv[i+1]))
+                return -ENOMEM;
             i += 2;
         }
         else if (strcmp(arg, "--dir") == 0) {
             if ((rc = need_args(i, argc, 1, arg)) < 0) return rc;
-            klee_config_add_mount(cfg, MOUNT_DIR, NULL, argv[i+1]);
+            if (!klee_config_add_mount(cfg, MOUNT_DIR, NULL, argv[i+1]))
+                return -ENOMEM;
             i += 2;
         }
         else if (strcmp(arg, "--mqueue") == 0) {
             if ((rc = need_args(i, argc, 1, arg)) < 0) return rc;
-            klee_config_add_mount(cfg, MOUNT_MQUEUE, NULL, argv[i+1]);
+            if (!klee_config_add_mount(cfg, MOUNT_MQUEUE, NULL, argv[i+1]))
+                return -ENOMEM;
             i += 2;
         }
         else if (strcmp(arg, "--symlink") == 0) {
             if ((rc = need_args(i, argc, 2, arg)) < 0) return rc;
-            klee_config_add_mount(cfg, MOUNT_SYMLINK, argv[i+1], argv[i+2]);
+            if (!klee_config_add_mount(cfg, MOUNT_SYMLINK, argv[i+1], argv[i+2]))
+                return -ENOMEM;
             i += 3;
         }
         else if (strcmp(arg, "--file") == 0) {
@@ -307,7 +357,9 @@ static int klee_cli_parse_recurse(KleeConfig *cfg, int argc, char **argv,
             int fd;
             if ((rc = parse_int(argv[i+1], &fd)) < 0) return rc;
             KleeMountOp *op = klee_config_add_mount(cfg, MOUNT_FILE, NULL, argv[i+2]);
-            if (op) op->fd = fd;
+            if (!op)
+                return -ENOMEM;
+            op->fd = fd;
             i += 3;
         }
         else if (strcmp(arg, "--bind-data") == 0) {
@@ -315,7 +367,9 @@ static int klee_cli_parse_recurse(KleeConfig *cfg, int argc, char **argv,
             int fd;
             if ((rc = parse_int(argv[i+1], &fd)) < 0) return rc;
             KleeMountOp *op = klee_config_add_mount(cfg, MOUNT_BIND_DATA, NULL, argv[i+2]);
-            if (op) op->fd = fd;
+            if (!op)
+                return -ENOMEM;
+            op->fd = fd;
             i += 3;
         }
         else if (strcmp(arg, "--ro-bind-data") == 0) {
@@ -323,12 +377,15 @@ static int klee_cli_parse_recurse(KleeConfig *cfg, int argc, char **argv,
             int fd;
             if ((rc = parse_int(argv[i+1], &fd)) < 0) return rc;
             KleeMountOp *op = klee_config_add_mount(cfg, MOUNT_RO_BIND_DATA, NULL, argv[i+2]);
-            if (op) op->fd = fd;
+            if (!op)
+                return -ENOMEM;
+            op->fd = fd;
             i += 3;
         }
         else if (strcmp(arg, "--remount-ro") == 0) {
             if ((rc = need_args(i, argc, 1, arg)) < 0) return rc;
-            klee_config_add_mount(cfg, MOUNT_REMOUNT_RO, NULL, argv[i+1]);
+            if (!klee_config_add_mount(cfg, MOUNT_REMOUNT_RO, NULL, argv[i+1]))
+                return -ENOMEM;
             i += 2;
         }
         else if (strcmp(arg, "--chmod") == 0) {
@@ -336,13 +393,15 @@ static int klee_cli_parse_recurse(KleeConfig *cfg, int argc, char **argv,
             int mode;
             if ((rc = parse_octal(argv[i+1], &mode)) < 0) return rc;
             KleeMountOp *op = klee_config_add_mount(cfg, MOUNT_CHMOD, NULL, argv[i+2]);
-            if (op) op->perms = mode;
+            if (!op)
+                return -ENOMEM;
+            op->perms = mode;
             i += 3;
         }
         /* ==================== Overlay operations ==================== */
         else if (strcmp(arg, "--overlay-src") == 0) {
             if ((rc = need_args(i, argc, 1, arg)) < 0) return rc;
-            add_overlay_src(cfg, argv[i+1]);
+            if ((rc = add_overlay_src(cfg, argv[i+1])) < 0) return rc;
             i += 2;
         }
         else if (strcmp(arg, "--overlay") == 0) {
@@ -351,11 +410,8 @@ static int klee_cli_parse_recurse(KleeConfig *cfg, int argc, char **argv,
                 KLEE_ERROR("--overlay requires at least one --overlay-src");
                 return -EINVAL;
             }
-            KleeMountOp *op = klee_config_add_mount(cfg, MOUNT_OVERLAY, argv[i+1], argv[i+3]);
-            if (op) {
-                free(op->source);
-                op->source = strdup(argv[i+1]);
-            }
+            if (!klee_config_add_mount(cfg, MOUNT_OVERLAY, argv[i+1], argv[i+3]))
+                return -ENOMEM;
             i += 4;
         }
         else if (strcmp(arg, "--tmp-overlay") == 0) {
@@ -364,7 +420,8 @@ static int klee_cli_parse_recurse(KleeConfig *cfg, int argc, char **argv,
                 KLEE_ERROR("--tmp-overlay requires at least one --overlay-src");
                 return -EINVAL;
             }
-            klee_config_add_mount(cfg, MOUNT_TMP_OVERLAY, NULL, argv[i+1]);
+            if (!klee_config_add_mount(cfg, MOUNT_TMP_OVERLAY, NULL, argv[i+1]))
+                return -ENOMEM;
             i += 2;
         }
         else if (strcmp(arg, "--ro-overlay") == 0) {
@@ -373,7 +430,8 @@ static int klee_cli_parse_recurse(KleeConfig *cfg, int argc, char **argv,
                 KLEE_ERROR("--ro-overlay requires at least two --overlay-src");
                 return -EINVAL;
             }
-            klee_config_add_mount(cfg, MOUNT_RO_OVERLAY, NULL, argv[i+1]);
+            if (!klee_config_add_mount(cfg, MOUNT_RO_OVERLAY, NULL, argv[i+1]))
+                return -ENOMEM;
             i += 2;
         }
         /* ==================== Modifier flags (apply to next op) ==================== */
@@ -480,23 +538,23 @@ static int klee_cli_parse_recurse(KleeConfig *cfg, int argc, char **argv,
         /* ==================== Environment ==================== */
         else if (strcmp(arg, "--setenv") == 0) {
             if ((rc = need_args(i, argc, 2, arg)) < 0) return rc;
-            add_setenv(cfg, argv[i+1], argv[i+2]);
+            if ((rc = add_setenv(cfg, argv[i+1], argv[i+2])) < 0) return rc;
             i += 3;
         }
         else if (strcmp(arg, "--unsetenv") == 0) {
             if ((rc = need_args(i, argc, 1, arg)) < 0) return rc;
-            add_unsetenv(cfg, argv[i+1]);
+            if ((rc = add_unsetenv(cfg, argv[i+1])) < 0) return rc;
             i += 2;
         }
         else if (strcmp(arg, "--clearenv") == 0) {
             cfg->clearenv = true;
-            add_env_op(cfg, ENV_OP_CLEAR, NULL, NULL);
+            if ((rc = add_env_op(cfg, ENV_OP_CLEAR, NULL, NULL)) < 0) return rc;
             i++;
         }
         /* ==================== FD-based options ==================== */
         else if (strcmp(arg, "--lock-file") == 0) {
             if ((rc = need_args(i, argc, 1, arg)) < 0) return rc;
-            add_lock_file(cfg, argv[i+1]);
+            if ((rc = add_lock_file(cfg, argv[i+1])) < 0) return rc;
             i += 2;
         }
         else if (strcmp(arg, "--sync-fd") == 0) {
@@ -528,7 +586,7 @@ static int klee_cli_parse_recurse(KleeConfig *cfg, int argc, char **argv,
             if ((rc = need_args(i, argc, 1, arg)) < 0) return rc;
             int fd;
             if ((rc = parse_int(argv[i+1], &fd)) < 0) return rc;
-            add_seccomp_fd(cfg, fd);
+            if ((rc = add_seccomp_fd(cfg, fd)) < 0) return rc;
             i += 2;
         }
         else if (strcmp(arg, "--userns") == 0 || strcmp(arg, "--userns-fd") == 0) {
@@ -602,8 +660,11 @@ static int klee_cli_parse_recurse(KleeConfig *cfg, int argc, char **argv,
             if ((rc = need_args(i, argc, 1, arg)) < 0) return rc;
             int fd;
             if ((rc = parse_int(argv[i+1], &fd)) < 0) return rc;
-            rc = parse_args_fd(cfg, fd);
-            if (rc < 0) return rc;
+            rc = parse_args_fd(cfg, fd, tracee);
+            if (rc < 0)
+                KLEE_ERROR("--args %d: %s", fd, strerror(-rc));
+            if (rc != 0)
+                return rc;
             i += 2;
         }
         else if (strcmp(arg, "--argv0") == 0) {
@@ -645,6 +706,10 @@ static int klee_cli_parse_recurse(KleeConfig *cfg, int argc, char **argv,
     /* Handle --share-net overriding --unshare-net */
     if (cfg->share_net)
         cfg->unshare_net = false;
+
+    /* The caller's command comes from the outer argument vector. */
+    if (from_args_fd)
+        return i < argc ? -EINVAL : 0;
 
     /* Everything remaining is the child command */
     if (i < argc) {

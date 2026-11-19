@@ -9,6 +9,7 @@
  */
 #include "compat/nested.h"
 #include "process/memory.h"
+#include "syscall/abi.h"
 #include "process/regs.h"
 #include "fs/path_resolve.h"
 #include "fs/mount_table.h"
@@ -25,7 +26,6 @@
 #include <sys/stat.h>
 #include <linux/limits.h>
 
-#define MAX_NESTED_ARGV 4096
 #define DEFAULT_PATH "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 bool klee_nested_is_bwrap(const char *exe_path)
@@ -42,192 +42,30 @@ bool klee_nested_is_bwrap(const char *exe_path)
            strcmp(basename, "klee") == 0;
 }
 
-static void free_argv(char **argv, int argc)
-{
-    if (!argv)
-        return;
-    for (int i = 0; i < argc; i++)
-        free(argv[i]);
-    free(argv);
-}
-
-/*
- * Read the tracee's argv pointer array and strings from memory.
- * On x86_64 each pointer is 8 bytes; read until a NULL pointer.
- * Returns heap-allocated string array in *out_argv.
- */
-static int read_tracee_argv(KleeInterceptor *ic, pid_t pid,
-                            uint64_t argv_addr,
-                            char ***out_argv, int *out_argc)
-{
-    char **argv = NULL;
-    int argc = 0;
-    int cap = 0;
-
-    for (int i = 0; i < MAX_NESTED_ARGV; i++) {
-        uint64_t ptr = 0;
-        int rc = klee_read_mem(ic, pid, &ptr,
-                               (const void *)(uintptr_t)(argv_addr + (uint64_t)i * 8),
-                               sizeof(ptr));
-        if (rc < 0) {
-            free_argv(argv, argc);
-            return rc;
-        }
-        if (ptr == 0)
-            break;
-
-        char buf[PATH_MAX];
-        rc = klee_read_string(ic, pid, buf, sizeof(buf),
-                              (const void *)(uintptr_t)ptr);
-        if (rc < 0) {
-            free_argv(argv, argc);
-            return rc;
-        }
-
-        if (argc >= cap) {
-            cap = cap ? cap * 2 : 32;
-            char **tmp = realloc(argv, (size_t)cap * sizeof(char *));
-            if (!tmp) {
-                free_argv(argv, argc);
-                return -ENOMEM;
-            }
-            argv = tmp;
-        }
-        argv[argc] = strdup(buf);
-        if (!argv[argc]) {
-            free_argv(argv, argc);
-            return -ENOMEM;
-        }
-        argc++;
-    }
-
-    *out_argv = argv;
-    *out_argc = argc;
-    return 0;
-}
-
-/*
- * Expand --args FD entries in argv by reading NUL-separated arguments
- * from the tracee's file descriptors via /proc/<pid>/fd/<FD>.
- * Returns a new heap-allocated argv with --args FD pairs replaced by
- * their expanded content.
- */
-static int expand_args_fds(pid_t pid, int argc, char **argv,
-                           int *out_argc, char ***out_argv)
-{
-    char **result = NULL;
-    int count = 0;
-    int cap = 0;
-
-    for (int i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "--args") == 0 && i + 1 < argc) {
-            int fd = atoi(argv[i + 1]);
-            char fd_path[64];
-            snprintf(fd_path, sizeof(fd_path), "/proc/%d/fd/%d",
-                     (int)pid, fd);
-
-            int local_fd = open(fd_path, O_RDONLY);
-            if (local_fd < 0) {
-                KLEE_WARN("nested: cannot open tracee fd %d via %s: %s",
-                          fd, fd_path, strerror(errno));
-                i++; /* skip FD argument */
-                continue;
-            }
-
-            /* Read entire content */
-            char *buf = NULL;
-            size_t buf_len = 0;
-            char tmp[4096];
-            ssize_t n;
-            while ((n = read(local_fd, tmp, sizeof(tmp))) > 0) {
-                char *new_buf = realloc(buf, buf_len + (size_t)n);
-                if (!new_buf) {
-                    free(buf);
-                    close(local_fd);
-                    free_argv(result, count);
-                    return -ENOMEM;
-                }
-                buf = new_buf;
-                memcpy(buf + buf_len, tmp, (size_t)n);
-                buf_len += (size_t)n;
-            }
-            close(local_fd);
-
-            /* Split on NUL bytes */
-            if (buf && buf_len > 0) {
-                for (size_t pos = 0; pos < buf_len; ) {
-                    size_t slen = strlen(buf + pos);
-                    if (slen == 0 && pos + 1 >= buf_len)
-                        break;
-                    if (count >= cap) {
-                        cap = cap ? cap * 2 : 64;
-                        char **tmp_r = realloc(result,
-                                               (size_t)cap * sizeof(char *));
-                        if (!tmp_r) {
-                            free(buf);
-                            free_argv(result, count);
-                            return -ENOMEM;
-                        }
-                        result = tmp_r;
-                    }
-                    result[count] = strdup(buf + pos);
-                    if (!result[count]) {
-                        free(buf);
-                        free_argv(result, count);
-                        return -ENOMEM;
-                    }
-                    count++;
-                    pos += slen + 1;
-                }
-            }
-            free(buf);
-            i++; /* skip FD argument */
-        } else {
-            if (count >= cap) {
-                cap = cap ? cap * 2 : 64;
-                char **tmp_r = realloc(result,
-                                       (size_t)cap * sizeof(char *));
-                if (!tmp_r) {
-                    free_argv(result, count);
-                    return -ENOMEM;
-                }
-                result = tmp_r;
-            }
-            result[count] = strdup(argv[i]);
-            if (!result[count]) {
-                free_argv(result, count);
-                return -ENOMEM;
-            }
-            count++;
-        }
-    }
-
-    *out_argv = result;
-    *out_argc = count;
-    return 0;
-}
-
 /*
  * Translate a guest source path to a host path using the standard
  * klee_path_guest_to_host pattern (resolve + mount table translate).
- * Returns a strdup'd host path, or strdup(original) on failure.
  */
-static char *translate_nested_source(KleeProcess *proc, const char *guest_src)
+static int translate_nested_source(KleeProcess *proc, char **source)
 {
     KleeResolveCtx ctx = {
         .mount_table = proc->sandbox->mount_table,
         .fd_table = proc->fd_table,
+        .tracee_pid = proc->real_pid,
         .vcwd = proc->vcwd,
         .vroot = klee_mount_table_get_root(proc->sandbox->mount_table),
         .flags = 0,
     };
     char host_path[PATH_MAX];
-    int rc = klee_path_guest_to_host(&ctx, guest_src, host_path, AT_FDCWD);
-    if (rc == 0 && strcmp(host_path, guest_src) != 0) {
-        KLEE_DEBUG("nested: translate source %s -> %s", guest_src, host_path);
-        return strdup(host_path);
-    }
-    return strdup(guest_src);
+    int rc = klee_path_guest_to_host(&ctx, *source, host_path, AT_FDCWD);
+    if (rc < 0)
+        return rc;
+    char *translated = strdup(host_path);
+    if (!translated)
+        return -ENOMEM;
+    free(*source);
+    *source = translated;
+    return 0;
 }
 
 /* Preserve the guest layer view when taking a bind from an overlay. */
@@ -237,6 +75,7 @@ static int bind_overlay_source(KleeProcess *proc, KleeMountOp *op)
     KleeResolveCtx ctx = {
         .mount_table = mt,
         .fd_table = proc->fd_table,
+        .tracee_pid = proc->real_pid,
         .vcwd = proc->vcwd,
         .vroot = klee_mount_table_get_root(mt),
     };
@@ -279,11 +118,11 @@ static int bind_overlay_source(KleeProcess *proc, KleeMountOp *op)
  */
 static int apply_nested_mounts(KleeProcess *proc, KleeMountTable *mt, KleeConfig *cfg, pid_t pid)
 {
-    int local_fds[256];
-    int local_fd_count = 0;
+    size_t count = 0;
 
     /* Translate bind mount source paths from guest to host */
     for (KleeMountOp *op = cfg->mount_ops; op; op = op->next) {
+        count++;
         bool needs_source_translate = false;
 
         switch (op->type) {
@@ -306,14 +145,9 @@ static int apply_nested_mounts(KleeProcess *proc, KleeMountTable *mt, KleeConfig
             needs_source_translate = true;
             /* Also translate overlay_srcs */
             for (int i = 0; i < op->overlay_src_count; i++) {
-                if (op->overlay_srcs[i]) {
-                    char *translated = translate_nested_source(
-                        proc, op->overlay_srcs[i]);
-                    if (translated) {
-                        free(op->overlay_srcs[i]);
-                        op->overlay_srcs[i] = translated;
-                    }
-                }
+                int rc = translate_nested_source(proc, &op->overlay_srcs[i]);
+                if (rc < 0)
+                    return rc;
             }
             break;
         default:
@@ -321,13 +155,17 @@ static int apply_nested_mounts(KleeProcess *proc, KleeMountTable *mt, KleeConfig
         }
 
         if (needs_source_translate && op->source) {
-            char *translated = translate_nested_source(proc, op->source);
-            if (translated) {
-                free(op->source);
-                op->source = translated;
-            }
+            int rc = translate_nested_source(proc, &op->source);
+            if (rc < 0)
+                return rc;
         }
     }
+
+    int *local_fds = malloc(count * sizeof(*local_fds));
+    if (!local_fds)
+        return -ENOMEM;
+    size_t local_fd_count = 0;
+    int rc;
 
     /* Replace tracee FD references with local FDs */
     for (KleeMountOp *op = cfg->mount_ops; op; op = op->next) {
@@ -341,15 +179,13 @@ static int apply_nested_mounts(KleeProcess *proc, KleeMountTable *mt, KleeConfig
             char fd_path[64];
             snprintf(fd_path, sizeof(fd_path), "/proc/%d/fd/%d",
                      (int)pid, op->fd);
-            int local_fd = open(fd_path, O_RDONLY);
-            if (local_fd >= 0) {
-                op->fd = local_fd;
-                if (local_fd_count < 256)
-                    local_fds[local_fd_count++] = local_fd;
-            } else {
-                KLEE_WARN("nested: cannot open tracee fd %d for mount: %s",
-                          op->fd, strerror(errno));
+            int local_fd = open(fd_path, O_RDONLY | O_CLOEXEC);
+            if (local_fd < 0) {
+                rc = -errno;
+                goto out;
             }
+            op->fd = local_fd;
+            local_fds[local_fd_count++] = local_fd;
             break;
         }
         default:
@@ -357,12 +193,11 @@ static int apply_nested_mounts(KleeProcess *proc, KleeMountTable *mt, KleeConfig
         }
     }
 
-    int rc = klee_mount_table_populate(mt, cfg);
-
-    /* Close local FDs we opened for the tracee */
-    for (int i = 0; i < local_fd_count; i++)
+    rc = klee_mount_table_populate(mt, cfg);
+out:
+    for (size_t i = 0; i < local_fd_count; i++)
         close(local_fds[i]);
-
+    free(local_fds);
     return rc;
 }
 
@@ -385,7 +220,7 @@ static int apply_env_ops(const KleeConfig *cfg,
     for (int i = 0; i < envc; i++) {
         env[i] = strdup(envp[i]);
         if (!env[i]) {
-            free_argv(env, i);
+            klee_abi_free_strv(env, i);
             return -ENOMEM;
         }
     }
@@ -403,7 +238,7 @@ static int apply_env_ops(const KleeConfig *cfg,
             size_t vlen = strlen(op->value);
             char *entry = malloc(klen + 1 + vlen + 1);
             if (!entry) {
-                free_argv(env, count);
+                klee_abi_free_strv(env, count);
                 return -ENOMEM;
             }
             memcpy(entry, op->key, klen);
@@ -427,7 +262,7 @@ static int apply_env_ops(const KleeConfig *cfg,
                                          (size_t)cap * sizeof(char *));
                     if (!tmp) {
                         free(entry);
-                        free_argv(env, count);
+                        klee_abi_free_strv(env, count);
                         return -ENOMEM;
                     }
                     env = tmp;
@@ -464,8 +299,6 @@ int klee_nested_handle_exec(KleeProcess *proc, KleeInterceptor *ic,
     int rc;
     char **raw_argv = NULL;
     int raw_argc = 0;
-    char **exp_argv = NULL;
-    int exp_argc = 0;
     char **new_envp = NULL;
     int new_envc = 0;
     bool env_modified = false;
@@ -476,7 +309,7 @@ int klee_nested_handle_exec(KleeProcess *proc, KleeInterceptor *ic,
     KLEE_INFO("nested: intercepting bwrap execve from pid=%d", pid);
 
     /* 1. Read tracee argv from memory */
-    rc = read_tracee_argv(ic, pid, ev->args[1], &raw_argv, &raw_argc);
+    rc = klee_abi_read_strv(proc, ic, ev->args[1], &raw_argv, &raw_argc);
     if (rc < 0 || raw_argc < 2) {
         KLEE_WARN("nested: failed to read tracee argv (rc=%d argc=%d)",
                   rc, raw_argc);
@@ -486,26 +319,9 @@ int klee_nested_handle_exec(KleeProcess *proc, KleeInterceptor *ic,
 
     KLEE_DEBUG("nested: bwrap invocation with %d args", raw_argc);
 
-    /* 2. Skip argv[0] (bwrap executable name) — CLI parser doesn't expect it */
-    char **bwrap_args = raw_argv + 1;
-    int bwrap_argc = raw_argc - 1;
-
-    /* 3. Expand --args FD entries by reading from /proc/<pid>/fd/<FD> */
-    rc = expand_args_fds(pid, bwrap_argc, bwrap_args, &exp_argc, &exp_argv);
-    if (rc < 0) {
-        KLEE_WARN("nested: failed to expand --args FDs: %d", rc);
-        ret = rc;
-        goto out;
-    }
-
-    KLEE_DEBUG("nested: expanded argv: %d -> %d entries",
-               bwrap_argc, exp_argc);
-
-    /* 4. Parse expanded argv into a temporary KleeConfig */
     klee_config_init(&nested_cfg);
     cfg_inited = true;
-
-    rc = klee_cli_parse(&nested_cfg, exp_argc, exp_argv);
+    rc = klee_cli_parse_in_tracee(&nested_cfg, raw_argc - 1, raw_argv + 1, pid);
     if (rc != 0) {
         KLEE_WARN("nested: failed to parse bwrap args: %d", rc);
         ret = rc < 0 ? rc : -EINVAL;
@@ -525,20 +341,14 @@ int klee_nested_handle_exec(KleeProcess *proc, KleeInterceptor *ic,
     if (nested_cfg.env_ops) {
         char **cur_envp = NULL;
         int cur_envc = 0;
-        rc = read_tracee_argv(ic, pid, ev->args[2],
-                              &cur_envp, &cur_envc);
-        if (rc == 0 && cur_envc >= 0) {
-            rc = apply_env_ops(&nested_cfg, cur_envp, cur_envc,
-                               &new_envp, &new_envc);
-            if (rc == 0) {
-                env_modified = true;
-                KLEE_DEBUG("nested: env modified (%d -> %d vars)",
-                           cur_envc, new_envc);
-            }
-            free_argv(cur_envp, cur_envc);
-        } else {
-            KLEE_WARN("nested: failed to read tracee envp: %d", rc);
-        }
+        ret = klee_abi_read_strv(proc, ic, ev->args[2], &cur_envp, &cur_envc);
+        if (ret < 0)
+            goto out;
+        ret = apply_env_ops(&nested_cfg, cur_envp, cur_envc, &new_envp, &new_envc);
+        klee_abi_free_strv(cur_envp, cur_envc);
+        if (ret < 0)
+            goto out;
+        env_modified = true;
     }
 
     /* 5b. Install a separate mount view for the nested command. */
@@ -610,6 +420,7 @@ int klee_nested_handle_exec(KleeProcess *proc, KleeInterceptor *ic,
                 KleeResolveCtx ctx = {
                     .mount_table = proc->sandbox->mount_table,
                     .fd_table = proc->fd_table,
+                    .tracee_pid = proc->real_pid,
                     .vcwd = proc->vcwd,
                     .vroot = klee_mount_table_get_root(
                                  proc->sandbox->mount_table),
@@ -654,6 +465,7 @@ int klee_nested_handle_exec(KleeProcess *proc, KleeInterceptor *ic,
             KleeResolveCtx ctx = {
                 .mount_table = proc->sandbox->mount_table,
                 .fd_table = proc->fd_table,
+                .tracee_pid = proc->real_pid,
                 .vcwd = proc->vcwd,
                 .vroot = klee_mount_table_get_root(
                              proc->sandbox->mount_table),
@@ -673,176 +485,41 @@ int klee_nested_handle_exec(KleeProcess *proc, KleeInterceptor *ic,
 
     KLEE_INFO("nested: resolved %s -> %s", target_guest, target_host);
 
-    /* 8-11. Write new exec path and argv to tracee scratch memory,
-     *       update registers */
     if (ic->backend == INTERCEPT_PTRACE) {
-        int target_argc = nested_cfg.argc;
-
-        /* Allocate tracking array for string addresses */
-        uint64_t *str_addrs = calloc((size_t)target_argc,
-                                     sizeof(uint64_t));
-        if (!str_addrs) {
-            ret = -ENOMEM;
+        uint64_t filename, argv, envp;
+        ret = klee_scratch_string(proc, ic, target_host, &filename);
+        if (ret < 0)
             goto out;
-        }
-
-        klee_regs_fetch(ic, proc);
-        uint64_t rsp = klee_regs_get_sp(proc);
-
-        /* Save original arg values for exit-time restore */
-        proc->saved_args[0] = ev->args[0];
-        proc->saved_args[1] = ev->args[1];
-
-        /*
-         * Scratch layout below tracee RSP:
-         *   RSP - 128 (red zone) - PATH_MAX : exec path (arg0)
-         *   below that                       : argv strings
-         *   below that (8-byte aligned)      : argv pointer array
-         */
-        uint64_t exec_addr = rsp - 128 - PATH_MAX;
-
-        /* Write exec host path */
-        rc = klee_write_string(ic, pid,
-                               (void *)(uintptr_t)exec_addr,
-                               target_host);
-        if (rc < 0) {
-            KLEE_WARN("nested: failed to write exec path: %d", rc);
-            free(str_addrs);
+        char *original_argv0 = nested_cfg.argv[0];
+        if (nested_cfg.argv0)
+            nested_cfg.argv[0] = nested_cfg.argv0;
+        ret = klee_abi_stage_strv(proc, ic, nested_cfg.argv, nested_cfg.argc, &argv);
+        nested_cfg.argv[0] = original_argv0;
+        if (ret < 0)
             goto out;
-        }
-
-        /* Write argv strings below the exec path */
-        const char *argv0_str = nested_cfg.argv0
-                                    ? nested_cfg.argv0
-                                    : nested_cfg.argv[0];
-        uint64_t cursor = exec_addr;
-
-        for (int i = 0; i < target_argc; i++) {
-            const char *s = (i == 0) ? argv0_str : nested_cfg.argv[i];
-            size_t slen = strlen(s) + 1; /* include NUL */
-            cursor -= slen;
-            str_addrs[i] = cursor;
-
-            rc = klee_write_string(ic, pid,
-                                   (void *)(uintptr_t)cursor, s);
-            if (rc < 0) {
-                KLEE_WARN("nested: failed to write argv[%d]: %d",
-                          i, rc);
-                free(str_addrs);
+        if (env_modified) {
+            ret = klee_abi_stage_strv(proc, ic, new_envp, new_envc, &envp);
+            if (ret < 0)
                 goto out;
-            }
+            klee_regs_set_arg(proc, 2, envp);
         }
-
-        /* Align cursor down to 8 bytes for pointer array */
-        cursor &= ~(uint64_t)7;
-
-        /* Write argv pointer array + NULL terminator */
-        uint64_t argv_array = cursor
-                              - (uint64_t)(target_argc + 1) * 8;
-
-        for (int i = 0; i < target_argc; i++) {
-            rc = klee_write_mem(ic, pid,
-                    (const void *)(uintptr_t)(argv_array
-                                              + (uint64_t)i * 8),
-                    &str_addrs[i], 8);
-            if (rc < 0) {
-                KLEE_WARN("nested: failed to write argv ptr[%d]: %d",
-                          i, rc);
-                free(str_addrs);
-                goto out;
-            }
-        }
-        /* NULL terminator */
-        uint64_t null_val = 0;
-        rc = klee_write_mem(ic, pid,
-                (const void *)(uintptr_t)(argv_array
-                                          + (uint64_t)target_argc * 8),
-                &null_val, 8);
-        if (rc < 0) {
-            KLEE_WARN("nested: failed to write argv NULL: %d", rc);
-            free(str_addrs);
+        klee_regs_set_arg(proc, 0, filename);
+        klee_regs_set_arg(proc, 1, argv);
+        ret = klee_regs_push(ic, proc);
+        if (ret < 0)
             goto out;
-        }
-
-        free(str_addrs);
-
-        /* Write envp strings and pointer array below argv array */
-        uint64_t envp_array = 0;
-        if (env_modified && new_envp && new_envc > 0) {
-            uint64_t *env_addrs = calloc((size_t)new_envc,
-                                         sizeof(uint64_t));
-            if (!env_addrs) {
-                ret = -ENOMEM;
-                goto out;
-            }
-
-            uint64_t ecursor = argv_array;
-            for (int i = 0; i < new_envc; i++) {
-                size_t slen = strlen(new_envp[i]) + 1;
-                ecursor -= slen;
-                env_addrs[i] = ecursor;
-                rc = klee_write_string(ic, pid,
-                        (void *)(uintptr_t)ecursor, new_envp[i]);
-                if (rc < 0) {
-                    KLEE_WARN("nested: failed to write env[%d]: %d",
-                              i, rc);
-                    free(env_addrs);
-                    goto out;
-                }
-            }
-
-            ecursor &= ~(uint64_t)7;
-            envp_array = ecursor
-                         - (uint64_t)(new_envc + 1) * 8;
-
-            for (int i = 0; i < new_envc; i++) {
-                rc = klee_write_mem(ic, pid,
-                        (const void *)(uintptr_t)(envp_array
-                                                  + (uint64_t)i * 8),
-                        &env_addrs[i], 8);
-                if (rc < 0) {
-                    free(env_addrs);
-                    goto out;
-                }
-            }
-            uint64_t env_null = 0;
-            klee_write_mem(ic, pid,
-                    (const void *)(uintptr_t)(envp_array
-                                              + (uint64_t)new_envc * 8),
-                    &env_null, 8);
-            free(env_addrs);
-        }
-
-        /* Update registers: arg0 = exec path, arg1 = argv array */
-        klee_regs_set_arg(proc, 0, exec_addr);
-        klee_regs_set_arg(proc, 1, argv_array);
-        if (env_modified && envp_array) {
-            proc->saved_args[2] = ev->args[2];
-            klee_regs_set_arg(proc, 2, envp_array);
-        }
-        klee_regs_push(ic, proc);
-
-        /* Track modified args for exit-time restore (if exec fails) */
-        proc->path_arg_idx[0] = 0;
-        proc->path_arg_idx[1] = 1;
-        proc->path_arg_count = 2;
-        if (env_modified && envp_array) {
-            proc->path_arg_idx[2] = 2;
-            proc->path_arg_count = 3;
-        }
-        proc->path_modified = true;
     }
 
-    /* 13. Set vexe to the target command's resolved guest path */
-    snprintf(proc->vexe, PATH_MAX, "%s", target_abs);
+    snprintf(proc->saved_path, PATH_MAX, "%s", target_abs);
+    snprintf(proc->resolved_guest, PATH_MAX, "%s", target_abs);
+    snprintf(proc->translated_path, PATH_MAX, "%s", target_host);
 
 out:
     if (ret < 0)
         klee_process_finish_mount_exec(proc, false);
     if (cfg_inited)
         klee_config_destroy(&nested_cfg);
-    free_argv(new_envp, new_envc);
-    free_argv(exp_argv, exp_argc);
-    free_argv(raw_argv, raw_argc);
+    klee_abi_free_strv(new_envp, new_envc);
+    klee_abi_free_strv(raw_argv, raw_argc);
     return ret;
 }

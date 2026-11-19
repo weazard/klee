@@ -19,6 +19,7 @@ typedef struct klee_event_loop {
     int exit_status;
     bool running;
     pid_t initial_child_pid;    /* direct child of klee — exit terminates loop */
+    KleeHashTable *early_child_stops;
 } KleeEventLoop;
 
 /* Create and initialize the event loop */
@@ -36,5 +37,10 @@ int klee_event_loop_run(KleeEventLoop *el);
 
 /* Handle a single event */
 int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event);
+
+/* Install supervisor termination handlers and wake the wait loop on shutdown. */
+int klee_event_install_shutdown_handlers(void);
+void klee_event_watch_child(pid_t pid);
+int klee_event_shutdown_status(void);
 
 #endif /* KLEE_EVENT_H */

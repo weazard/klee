@@ -9,96 +9,61 @@
 #include <string.h>
 #include <stdio.h>
 #include <dirent.h>
-#include <sys/stat.h>
-#include <errno.h>
+#include <unistd.h>
 
-/* Steam-related paths to auto-expose */
-static const char *steam_paths[] = {
-    "/dev/shm",
-    NULL
-};
-
-static int expose_xdg_runtime_steam(KleeMountTable *mt)
+static void expose_path(KleeMountTable *mt, const char *path, bool allow_dev_shm)
 {
-    const char *xdg_runtime = getenv("XDG_RUNTIME_DIR");
-    if (!xdg_runtime)
-        return 0;
+    KleeMount *mount = klee_mount_table_resolve(mt, path);
+    if (mount && !(allow_dev_shm && mount->type == MOUNT_DEV))
+        return;
+    if (access(path, F_OK) == 0 &&
+        klee_mount_table_add(mt, MOUNT_BIND_RW, path, path, false, 0755) == 0)
+        KLEE_DEBUG("steam: auto-exposed %s", path);
+}
 
-    /* Expose steam-overlay-* directories */
-    DIR *dir = opendir(xdg_runtime);
+static void expose_runtime_sockets(KleeMountTable *mt)
+{
+    const char *runtime = getenv("XDG_RUNTIME_DIR");
+    if (!runtime || !*runtime)
+        return;
+
+    DIR *dir = opendir(runtime);
     if (!dir)
-        return 0;
-
+        return;
     struct dirent *de;
     while ((de = readdir(dir)) != NULL) {
-        if (strncmp(de->d_name, "steam-overlay-", 14) == 0) {
-            char src[PATH_MAX], dest[PATH_MAX];
-            snprintf(src, sizeof(src), "%s/%s", xdg_runtime, de->d_name);
-            snprintf(dest, sizeof(dest), "%s/%s", xdg_runtime, de->d_name);
-
-            struct stat st;
-            if (stat(src, &st) == 0) {
-                klee_mount_table_add(mt, MOUNT_BIND_RW, src, dest, false, 0755);
-                KLEE_DEBUG("steam: auto-exposed %s", src);
-            }
+        if (strncmp(de->d_name, "steam-overlay-", 14) == 0 ||
+            strcmp(de->d_name, "steam-ipc") == 0) {
+            char path[PATH_MAX];
+            int n = snprintf(path, sizeof(path), "%s/%s", runtime, de->d_name);
+            if (n > 0 && (size_t)n < sizeof(path))
+                expose_path(mt, path, false);
         }
     }
     closedir(dir);
-
-    /* Expose Steam Unix domain sockets */
-    char socket_path[PATH_MAX];
-    snprintf(socket_path, sizeof(socket_path), "%s/steam-ipc", xdg_runtime);
-    struct stat st;
-    if (stat(socket_path, &st) == 0) {
-        klee_mount_table_add(mt, MOUNT_BIND_RW, socket_path, socket_path,
-                              false, 0755);
-        KLEE_DEBUG("steam: auto-exposed %s", socket_path);
-    }
-
-    return 0;
 }
 
-static int expose_gameoverlayrenderer(KleeMountTable *mt)
+static void expose_gameoverlayrenderer(KleeMountTable *mt)
 {
-    /* Common paths for Steam overlay library */
-    const char *lib_paths[] = {
+    static const char *const libs[] = {
         "/usr/lib/gameoverlayrenderer.so",
         "/usr/lib64/gameoverlayrenderer.so",
         "/usr/lib32/gameoverlayrenderer.so",
         NULL
     };
+    for (const char *const *p = libs; *p; p++)
+        expose_path(mt, *p, false);
 
-    /* Also check $HOME/.steam */
     const char *home = getenv("HOME");
-    char steam_lib[PATH_MAX];
-
-    for (const char **p = lib_paths; *p; p++) {
-        struct stat st;
-        if (stat(*p, &st) == 0) {
-            klee_mount_table_add(mt, MOUNT_BIND_RW, *p, *p, false, 0755);
-            KLEE_DEBUG("steam: auto-exposed %s", *p);
-        }
+    if (!home || !*home)
+        return;
+    for (int bits = 32; bits <= 64; bits += 32) {
+        char path[PATH_MAX];
+        int n = snprintf(path, sizeof(path), "%s/.steam/ubuntu12_%d/gameoverlayrenderer.so",
+                         home, bits);
+        if (n > 0 && (size_t)n < sizeof(path))
+            expose_path(mt, path, false);
     }
-
-    if (home) {
-        snprintf(steam_lib, sizeof(steam_lib),
-                 "%s/.steam/ubuntu12_32/gameoverlayrenderer.so", home);
-        struct stat st;
-        if (stat(steam_lib, &st) == 0) {
-            klee_mount_table_add(mt, MOUNT_BIND_RW, steam_lib, steam_lib,
-                                  false, 0755);
-            KLEE_DEBUG("steam: auto-exposed %s", steam_lib);
-        }
-
-        snprintf(steam_lib, sizeof(steam_lib),
-                 "%s/.steam/ubuntu12_64/gameoverlayrenderer.so", home);
-        if (stat(steam_lib, &st) == 0) {
-            klee_mount_table_add(mt, MOUNT_BIND_RW, steam_lib, steam_lib,
-                                  false, 0755);
-        }
-    }
-
-    return 0;
 }
 
 int klee_steam_auto_expose(KleeMountTable *mt)
@@ -106,19 +71,13 @@ int klee_steam_auto_expose(KleeMountTable *mt)
     if (!mt)
         return -1;
 
-    KLEE_INFO("auto-exposing Steam IPC paths");
-
-    for (const char **p = steam_paths; *p; p++) {
-        struct stat st;
-        if (stat(*p, &st) == 0) {
-            klee_mount_table_add(mt, MOUNT_BIND_RW, *p, *p, false, 0755);
-            KLEE_DEBUG("steam: auto-exposed %s", *p);
-        }
+    bool steam = getenv("SteamAppId") || getenv("STEAM_RUNTIME") ||
+                 getenv("STEAM_COMPAT_DATA_PATH") || getenv("PRESSURE_VESSEL_RUNTIME");
+    if (steam) {
+        expose_path(mt, "/dev/shm", true);
+        expose_runtime_sockets(mt);
+        expose_gameoverlayrenderer(mt);
     }
-
-    expose_xdg_runtime_steam(mt);
-    expose_gameoverlayrenderer(mt);
-
     return 0;
 }
 

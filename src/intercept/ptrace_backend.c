@@ -16,9 +16,10 @@
 #include <sys/user.h>
 #include <sys/uio.h>
 #include <linux/elf.h>
+#include <linux/audit.h>
 #include <linux/ptrace.h>
 #include <sys/syscall.h>
-#include <fcntl.h>
+#include <sys/socket.h>
 
 #ifndef PTRACE_EVENT_SECCOMP
 #define PTRACE_EVENT_SECCOMP 7
@@ -27,36 +28,37 @@
 #define PTRACE_O_TRACESECCOMP (1 << PTRACE_EVENT_SECCOMP)
 #endif
 
-/* Code segment selector of a tracee running 32-bit code (__USER32_CS).
- * It tells a compat syscall (i386 numbers, ebx/ecx/... arguments) from a
- * native one; the same check strace uses. */
-#define USER32_CS 0x23
+#ifndef PTRACE_SYSCALL_INFO_ENTRY
+#define PTRACE_SYSCALL_INFO_ENTRY   1
+#define PTRACE_SYSCALL_INFO_EXIT    2
+#define PTRACE_SYSCALL_INFO_SECCOMP 3
+struct ptrace_syscall_info {
+    uint8_t op, pad[3];
+    uint32_t arch;
+    uint64_t instruction_pointer, stack_pointer;
+    union {
+        struct { uint64_t nr, args[6]; } entry;
+        struct { int64_t rval; uint8_t is_error; } exit;
+        struct { uint64_t nr, args[6]; uint32_t ret_data; } seccomp;
+    };
+};
+#endif
+#ifndef PTRACE_GET_SYSCALL_INFO
+#define PTRACE_GET_SYSCALL_INFO 0x420e
+#endif
 
-/* Decode the syscall number and arguments at a syscall stop.  Arguments
- * of a 32-bit tracee are the low halves of the registers; its number is
- * mapped onto the x86_64 one klee's handlers are registered under. */
-static void decode_syscall_regs(const struct user_regs_struct *r, KleeEvent *out)
+static void decode_syscall(KleeEvent *out, bool i386, int nr, const uint64_t args[6])
 {
-    out->raw_nr = (int)r->orig_rax;
-    if (r->cs == USER32_CS) {
+    out->raw_nr = nr;
+    if (i386) {
         out->abi = KLEE_ABI_I386;
-        out->syscall_nr = klee_sysnum_i386_to_x64(out->raw_nr, &out->abi_flags);
-        out->args[0] = (uint32_t)r->rbx;
-        out->args[1] = (uint32_t)r->rcx;
-        out->args[2] = (uint32_t)r->rdx;
-        out->args[3] = (uint32_t)r->rsi;
-        out->args[4] = (uint32_t)r->rdi;
-        out->args[5] = (uint32_t)r->rbp;
+        out->syscall_nr = klee_sysnum_i386_to_x64(nr, &out->abi_flags);
+        for (size_t i = 0; i < 6; i++)
+            out->args[i] = (uint32_t)args[i];
     } else {
         out->abi = KLEE_ABI_X86_64;
-        out->abi_flags = 0;
-        out->syscall_nr = out->raw_nr;
-        out->args[0] = r->rdi;
-        out->args[1] = r->rsi;
-        out->args[2] = r->rdx;
-        out->args[3] = r->r10;
-        out->args[4] = r->r8;
-        out->args[5] = r->r9;
+        out->syscall_nr = nr;
+        memcpy(out->args, args, sizeof(out->args));
     }
 }
 
@@ -65,7 +67,6 @@ static void decode_syscall_regs(const struct user_regs_struct *r, KleeEvent *out
                         PTRACE_O_TRACEVFORK   | \
                         PTRACE_O_TRACECLONE   | \
                         PTRACE_O_TRACEEXEC    | \
-                        PTRACE_O_TRACEEXIT    | \
                         PTRACE_O_TRACESECCOMP | \
                         PTRACE_O_EXITKILL)
 
@@ -80,32 +81,26 @@ static int ptrace_read_mem(KleeInterceptor *self, pid_t pid,
     ssize_t n = process_vm_readv(pid, &local_iov, 1, &remote_iov, 1, 0);
     if (n == (ssize_t)len)
         return 0;
-    /* Fall through to ptrace on failure or partial read (the latter
-     * happens when the requested range spans a mapped/unmapped page
-     * boundary — common during string reads near the end of a region). */
-    KLEE_TRACE("process_vm_readv %s for pid %d, falling back to ptrace",
-               n < 0 ? "failed" : "partial", pid);
+    if (n >= 0 || errno == EFAULT)
+        return -EFAULT;
 #endif
 
     /* Fallback: PTRACE_PEEKDATA, word by word */
     size_t off = 0;
     unsigned char *dst = local;
-    const unsigned char *src = remote;
-
     while (off < len) {
+        uintptr_t addr = (uintptr_t)remote + off;
+        size_t start = addr % sizeof(long);
         errno = 0;
-        long word = ptrace(PTRACE_PEEKDATA, pid, src + off, NULL);
-        if (errno != 0) {
-            KLEE_TRACE("PEEKDATA failed: pid=%d addr=%p errno=%d",
-                        pid, (void *)(src + off), errno);
+        long word = ptrace(PTRACE_PEEKDATA, pid, (void *)(addr - start), NULL);
+        if (errno != 0)
             return -errno;
-        }
 
         size_t chunk = len - off;
-        if (chunk > sizeof(long))
-            chunk = sizeof(long);
-        memcpy(dst + off, &word, chunk);
-        off += sizeof(long);
+        if (chunk > sizeof(long) - start)
+            chunk = sizeof(long) - start;
+        memcpy(dst + off, (unsigned char *)&word + start, chunk);
+        off += chunk;
     }
     return 0;
 }
@@ -122,52 +117,141 @@ static int ptrace_write_mem(KleeInterceptor *self, pid_t pid,
     ssize_t n = process_vm_writev(pid, &local_iov, 1, &remote_iov, 1, 0);
     if (n == (ssize_t)len)
         return 0;
-    if (n >= 0)
-        return -EIO;
-    KLEE_TRACE("process_vm_writev failed for pid %d, falling back to ptrace", pid);
+    if (n >= 0 || errno == EFAULT)
+        return -EFAULT;
 #endif
 
     size_t off = 0;
     const unsigned char *src = local;
-    const unsigned char *dst = remote;
-
     while (off < len) {
+        uintptr_t addr = (uintptr_t)remote + off;
+        size_t start = addr % sizeof(long);
+        void *word_addr = (void *)(addr - start);
         long word = 0;
         size_t chunk = len - off;
+        if (chunk > sizeof(long) - start)
+            chunk = sizeof(long) - start;
         if (chunk < sizeof(long)) {
             /* Partial word: read-modify-write */
             errno = 0;
-            word = ptrace(PTRACE_PEEKDATA, pid, dst + off, NULL);
+            word = ptrace(PTRACE_PEEKDATA, pid, word_addr, NULL);
             if (errno != 0)
                 return -errno;
         }
-        if (chunk > sizeof(long))
-            chunk = sizeof(long);
-        memcpy(&word, src + off, chunk);
+        memcpy((unsigned char *)&word + start, src + off, chunk);
 
-        if (ptrace(PTRACE_POKEDATA, pid, dst + off, (void *)word) < 0)
+        if (ptrace(PTRACE_POKEDATA, pid, word_addr, (void *)word) < 0)
             return -errno;
-        off += sizeof(long);
+        off += chunk;
     }
     return 0;
 }
 
-/* Wait for next ptrace event */
-static int ptrace_wait_event(KleeInterceptor *self, KleeEvent *out)
-{
-    (void)self;
-    int status;
+struct klee_wait_status {
     pid_t pid;
+    int status;
+};
 
-    memset(out, 0, sizeof(*out));
+/* Capture the ready stops before resuming any tracee. A hot thread cannot
+ * fill the front of the queue again while its peers are waiting. */
+static int next_wait_status(KleeInterceptor *self, struct klee_wait_status *out)
+{
+    if (self->ptrace.wait_next < self->ptrace.wait_count) {
+        *out = self->ptrace.wait_statuses[self->ptrace.wait_next++];
+        return 0;
+    }
+    self->ptrace.wait_next = 0;
+    self->ptrace.wait_count = 0;
 
-    pid = waitpid(-1, &status, __WALL);
-    if (pid < 0) {
-        if (errno == ECHILD)
-            return -ECHILD;
+    out->pid = waitpid(-1, &out->status, __WALL);
+    if (out->pid < 0)
         return -errno;
+
+    if (self->ptrace.batch_wait) {
+        struct klee_wait_status ready;
+        while ((ready.pid = waitpid(-1, &ready.status, __WALL | WNOHANG)) > 0) {
+            if (self->ptrace.wait_count == self->ptrace.wait_capacity) {
+                size_t capacity = self->ptrace.wait_capacity ?
+                                  self->ptrace.wait_capacity * 2 : 16;
+                void *statuses = realloc(self->ptrace.wait_statuses,
+                                         capacity * sizeof(ready));
+                if (!statuses)
+                    return -ENOMEM;
+                self->ptrace.wait_statuses = statuses;
+                self->ptrace.wait_capacity = capacity;
+            }
+            self->ptrace.wait_statuses[self->ptrace.wait_count++] = ready;
+        }
+    }
+    return 0;
+}
+
+static int decode_syscall_stop(KleeInterceptor *self, KleeEvent *out,
+                               bool seccomp)
+{
+    if (!self->ptrace.no_syscall_info) {
+        struct ptrace_syscall_info info;
+        if (ptrace(PTRACE_GET_SYSCALL_INFO, out->pid, sizeof(info), &info) >= 0) {
+            if (info.op == PTRACE_SYSCALL_INFO_EXIT) {
+                out->type = KLEE_EVENT_SYSCALL_EXIT;
+                out->retval = info.exit.rval;
+            } else if (info.op == PTRACE_SYSCALL_INFO_ENTRY ||
+                       info.op == PTRACE_SYSCALL_INFO_SECCOMP) {
+                uint64_t args[6];
+                bool is_seccomp = info.op == PTRACE_SYSCALL_INFO_SECCOMP;
+                memcpy(args, is_seccomp ? info.seccomp.args : info.entry.args,
+                       sizeof(args));
+                out->type = KLEE_EVENT_SYSCALL_ENTER;
+                decode_syscall(out, info.arch == AUDIT_ARCH_I386,
+                               (int)(is_seccomp ? info.seccomp.nr : info.entry.nr),
+                               args);
+            } else {
+                return -EIO;
+            }
+            return 0;
+        }
+        if (errno != EINVAL && errno != EIO && errno != ENOSYS)
+            return -errno;
+        self->ptrace.no_syscall_info = true;
     }
 
+    /* Older kernels lack syscall info. The pending entry in the event
+     * loop disambiguates an exit whose result happens to be -ENOSYS. */
+    struct user_regs_struct r;
+    if (ptrace(PTRACE_GETREGS, out->pid, NULL, &r) < 0)
+        return -errno;
+    out->retval = (long)r.rax;
+    out->unclassified_stop = !seccomp;
+    if (!seccomp && out->retval != -ENOSYS) {
+        out->type = KLEE_EVENT_SYSCALL_EXIT;
+        return 0;
+    }
+
+    /* The interrupt instruction can also be issued from 64-bit code. */
+    bool i386 = r.cs == 0x23;
+    if (!i386 && r.rip >= 2) {
+        unsigned char op[2];
+        if (ptrace_read_mem(self, out->pid, op, (void *)(uintptr_t)(r.rip - 2),
+                            sizeof(op)) == 0)
+            i386 = op[0] == 0xcd && op[1] == 0x80;
+    }
+    uint64_t args64[] = {r.rdi, r.rsi, r.rdx, r.r10, r.r8, r.r9};
+    uint64_t args32[] = {r.rbx, r.rcx, r.rdx, r.rsi, r.rdi, r.rbp};
+    out->type = KLEE_EVENT_SYSCALL_ENTER;
+    decode_syscall(out, i386, (int)r.orig_rax, i386 ? args32 : args64);
+    return 0;
+}
+
+static int ptrace_wait_event(KleeInterceptor *self, KleeEvent *out)
+{
+    struct klee_wait_status ready;
+    int rc = next_wait_status(self, &ready);
+    if (rc < 0)
+        return rc;
+    pid_t pid = ready.pid;
+    int status = ready.status;
+
+    memset(out, 0, sizeof(*out));
     out->pid = pid;
 
     if (WIFEXITED(status)) {
@@ -189,72 +273,29 @@ static int ptrace_wait_event(KleeInterceptor *self, KleeEvent *out)
     int sig = WSTOPSIG(status);
     int event = (status >> 16) & 0xffff;
 
-    /* Syscall stop: SIGTRAP | 0x80 */
-    if (sig == (SIGTRAP | 0x80)) {
-        /* Read registers to determine syscall number and args.
-         * PTRACE_GETREGS always fills the 64-bit user_regs_struct, also
-         * for a 32-bit tracee (GETREGSET would hand back the 68-byte i386
-         * layout instead). */
-        struct user_regs_struct regs;
-        if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) < 0)
-            return -errno;
+    if (sig == (SIGTRAP | 0x80) || event == PTRACE_EVENT_SECCOMP)
+        return decode_syscall_stop(self, out, event == PTRACE_EVENT_SECCOMP);
 
-        decode_syscall_regs(&regs, out);
-
-        /* Determine if this is enter or exit by checking rax.
-         * On enter, rax == -ENOSYS. On exit, rax has the return value. */
-        if ((long)regs.rax == -ENOSYS)
-            out->type = KLEE_EVENT_SYSCALL_ENTER;
-        else {
-            out->type = KLEE_EVENT_SYSCALL_EXIT;
-            out->retval = (long)regs.rax;
-        }
-        return 0;
-    }
-
-    /* ptrace events */
+    unsigned long event_msg;
     switch (event) {
     case PTRACE_EVENT_FORK:
     case PTRACE_EVENT_VFORK:
-        out->type = KLEE_EVENT_FORK;
-        ptrace(PTRACE_GETEVENTMSG, pid, 0, &out->new_child_pid);
-        break;
     case PTRACE_EVENT_CLONE:
-        out->type = KLEE_EVENT_CLONE;
-        ptrace(PTRACE_GETEVENTMSG, pid, 0, &out->new_child_pid);
+        if (ptrace(PTRACE_GETEVENTMSG, pid, NULL, &event_msg) < 0)
+            return -errno;
+        out->type = event == PTRACE_EVENT_CLONE ? KLEE_EVENT_CLONE : KLEE_EVENT_FORK;
+        out->new_child_pid = (pid_t)event_msg;
         break;
     case PTRACE_EVENT_EXEC:
-        out->type = KLEE_EVENT_EXEC;
-        break;
-    case PTRACE_EVENT_EXIT: {
-        /* GETEVENTMSG yields the raw wait(2) status word, not the exit
-         * code.  Decode it the same way the WIFEXITED/WIFSIGNALED paths
-         * above do — otherwise exit(N) stored raw as (N<<8) truncates to
-         * 0 in the process exit code and klee always reports success. */
-        unsigned long msg = 0;
-        ptrace(PTRACE_GETEVENTMSG, pid, 0, &msg);
-        int wstatus = (int)msg;
-        out->type = KLEE_EVENT_EXIT;
-        if (WIFEXITED(wstatus)) {
-            out->retval = WEXITSTATUS(wstatus);
-        } else if (WIFSIGNALED(wstatus)) {
-            out->signal = WTERMSIG(wstatus);
-            out->retval = 128 + out->signal;
-        } else {
-            out->retval = wstatus;
-        }
-        break;
-    }
-    case PTRACE_EVENT_SECCOMP: {
-        /* Seccomp pre-filter fired SECCOMP_RET_TRACE — this is a
-         * syscall-enter stop for a syscall klee needs to intercept. */
-        struct user_regs_struct seccomp_regs;
-        if (ptrace(PTRACE_GETREGS, pid, NULL, &seccomp_regs) < 0)
+        if (ptrace(PTRACE_GETEVENTMSG, pid, NULL, &event_msg) < 0)
             return -errno;
-        out->type = KLEE_EVENT_SYSCALL_ENTER;
-        decode_syscall_regs(&seccomp_regs, out);
+        out->type = KLEE_EVENT_EXEC;
+        out->former_tid = (pid_t)event_msg;
         break;
-    }
+    case PTRACE_EVENT_STOP:
+        out->type = KLEE_EVENT_STOP;
+        out->signal = sig;
+        break;
     default:
         /* Regular signal delivery */
         out->type = KLEE_EVENT_SIGNAL;
@@ -321,10 +362,11 @@ static int ptrace_respond(KleeInterceptor *self, KleeEvent *event,
 
 static void ptrace_destroy(KleeInterceptor *self)
 {
-    if (self->ptrace.status_pipe[0] >= 0)
-        close(self->ptrace.status_pipe[0]);
-    if (self->ptrace.status_pipe[1] >= 0)
-        close(self->ptrace.status_pipe[1]);
+    if (self->ptrace.startup_fd[0] >= 0)
+        close(self->ptrace.startup_fd[0]);
+    if (self->ptrace.startup_fd[1] >= 0)
+        close(self->ptrace.startup_fd[1]);
+    free(self->ptrace.wait_statuses);
     free(self);
 }
 
@@ -337,17 +379,11 @@ KleeInterceptor *klee_ptrace_create(void)
     ic->backend = INTERCEPT_PTRACE;
     ic->ptrace.options = PTRACE_OPTIONS;
     ic->ptrace.seccomp_filter = false;
-    ic->ptrace.status_pipe[0] = -1;
-    ic->ptrace.status_pipe[1] = -1;
-
-    /* Create pipe for child→parent seccomp filter status notification */
-    int pfd[2];
-    if (pipe2(pfd, O_CLOEXEC | O_NONBLOCK) == 0) {
-        ic->ptrace.status_pipe[0] = pfd[0];
-        ic->ptrace.status_pipe[1] = pfd[1];
-    } else {
-        KLEE_WARN("pipe2 for seccomp status failed: %s (seccomp pre-filter disabled)",
-                   strerror(errno));
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0,
+                   ic->ptrace.startup_fd) < 0) {
+        KLEE_ERROR("cannot create ptrace startup socket: %s", strerror(errno));
+        free(ic);
+        return NULL;
     }
 
     ic->wait_event = ptrace_wait_event;

@@ -32,6 +32,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 #include <linux/limits.h>
 
@@ -300,8 +301,96 @@ static int make_upper_dirs(const KleeOverlayMount *ov, const char *rel, bool inc
     return rc;
 }
 
-/* Copy a file into the private staging directory. A partial copy is never
- * addressable through the overlay and is discarded after an interruption. */
+static int copy_bytes(int in, int out, off_t length)
+{
+    char buf[65536];
+    while (length > 0) {
+        size_t want = length < (off_t)sizeof(buf) ? (size_t)length : sizeof(buf);
+        ssize_t count = TEMP_FAILURE_RETRY(read(in, buf, want));
+        if (count <= 0)
+            return count < 0 ? -errno : -ESTALE;
+        for (ssize_t offset = 0; offset < count;) {
+            ssize_t written = TEMP_FAILURE_RETRY(write(out, buf + offset,
+                                                        (size_t)(count - offset)));
+            if (written <= 0)
+                return written < 0 ? -errno : -EIO;
+            offset += written;
+        }
+        length -= count;
+    }
+    return 0;
+}
+
+static int copy_file_data(int in, int out, off_t size)
+{
+    for (off_t pos = 0; pos < size;) {
+        off_t data = lseek(in, pos, SEEK_DATA);
+        if (data < 0) {
+            if (errno == ENXIO)
+                break;
+            if (pos == 0 && (errno == EINVAL || errno == EOPNOTSUPP))
+                return copy_bytes(in, out, size);
+            return -errno;
+        }
+        if (data >= size)
+            break;
+        off_t hole = lseek(in, data, SEEK_HOLE);
+        if (hole < 0)
+            return -errno;
+        if (hole <= data)
+            return -EIO;
+        if (hole > size)
+            hole = size;
+        if (lseek(in, data, SEEK_SET) < 0 || lseek(out, data, SEEK_SET) < 0)
+            return -errno;
+        int rc = copy_bytes(in, out, hole - data);
+        if (rc < 0)
+            return rc;
+        pos = hole;
+    }
+    return ftruncate(out, size) < 0 ? -errno : 0;
+}
+
+static int copy_user_xattrs(int in, int out)
+{
+    ssize_t length = flistxattr(in, NULL, 0);
+    if (length <= 0)
+        return length == 0 || errno == EOPNOTSUPP ? 0 : -errno;
+    char *names = malloc((size_t)length);
+    if (!names)
+        return -ENOMEM;
+    length = flistxattr(in, names, (size_t)length);
+    int rc = length < 0 ? -errno : 0;
+    for (ssize_t i = 0; rc == 0 && i < length;) {
+        const char *name = names + i;
+        i += (ssize_t)strlen(name) + 1;
+        if (strncmp(name, "user.", 5) != 0)
+            continue;
+
+        ssize_t size = fgetxattr(in, name, NULL, 0);
+        if (size < 0) {
+            rc = -errno;
+            break;
+        }
+        void *value = malloc(size > 0 ? (size_t)size : 1);
+        if (!value) {
+            rc = -ENOMEM;
+            break;
+        }
+        ssize_t got = fgetxattr(in, name, value, (size_t)size);
+        if (got < 0 || (got == 0 && size != 0))
+            rc = got < 0 ? -errno : -ESTALE;
+        else if (got > size)
+            rc = -ESTALE;
+        else if (fsetxattr(out, name, value, (size_t)got, 0) < 0)
+            rc = -errno;
+        free(value);
+    }
+    free(names);
+    return rc;
+}
+
+/* Copy a file into private staging. A partial copy is discarded. */
 static int copy_file(const OvEntry *entry, int dirfd, const char *name, bool durable)
 {
     int in = open(entry->path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
@@ -325,35 +414,20 @@ static int copy_file(const OvEntry *entry, int dirfd, const char *name, bool dur
         close(in);
         return rc;
     }
-    int rc = 0;
-    char buf[65536];
-    while (rc == 0) {
-        ssize_t got = read(in, buf, sizeof(buf));
-        if (got < 0 && errno == EINTR)
-            continue;
-        if (got <= 0) {
-            if (got < 0)
-                rc = -errno;
-            break;
-        }
-        for (ssize_t offset = 0; offset < got;) {
-            ssize_t written = write(out, buf + offset, (size_t)(got - offset));
-            if (written < 0 && errno == EINTR)
-                continue;
-            if (written <= 0) {
-                rc = written < 0 ? -errno : -EIO;
-                break;
-            }
-            offset += written;
-        }
-    }
+    off_t blocks = current.st_size / 512 + (current.st_size % 512 != 0);
+    int rc = current.st_blocks >= blocks ?
+             copy_bytes(in, out, current.st_size) :
+             copy_file_data(in, out, current.st_size);
+    if (rc == 0)
+        rc = copy_user_xattrs(in, out);
     if (rc == 0) {
         mode_t mode = current.st_mode & 07777;
         if (fchown(out, current.st_uid, current.st_gid) < 0)
             mode &= ~(S_ISUID | S_ISGID);
         struct timespec times[2] = { current.st_atim, current.st_mtim };
-        if (fchmod(out, mode) < 0 || futimens(out, times) < 0 ||
-            (durable && fsync(out) < 0))
+        if (fchmod(out, mode) < 0 || futimens(out, times) < 0)
+            rc = -errno;
+        if (rc == 0 && durable && fsync(out) < 0)
             rc = -errno;
     }
     if (close(out) < 0 && rc == 0)

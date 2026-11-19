@@ -13,6 +13,9 @@
  */
 int klee_cli_parse(KleeConfig *cfg, int argc, char **argv);
 
+/* Resolve option FDs against a traced caller when tracee is positive. */
+int klee_cli_parse_in_tracee(KleeConfig *cfg, int argc, char **argv, pid_t tracee);
+
 /* Print usage information */
 void klee_cli_usage(const char *progname);
 

@@ -34,6 +34,8 @@ void klee_regs_set_arg(KleeProcess *proc, int n, uint64_t value);
 /* Set the register that carries argument n of the syscall actually being
  * executed, ignoring any demultiplexing. */
 void klee_regs_set_arg_raw(KleeProcess *proc, int n, uint64_t value);
+void klee_regs_restore_args(KleeProcess *proc);
+void klee_regs_repeat_syscall(KleeProcess *proc);
 
 /* Get/set syscall return value */
 long klee_regs_get_result(const KleeProcess *proc);

@@ -71,6 +71,7 @@ typedef struct klee_fs_state {
 
 typedef struct klee_process {
     pid_t real_pid;
+    pid_t real_tgid;
     pid_t virtual_pid;
     pid_t virtual_ppid;
 
@@ -84,6 +85,7 @@ typedef struct klee_process {
     unsigned long pending_clone_flags; /* flags of the clone() in flight */
 
     KleeIdState *id_state;
+    struct klee_process_table *table;
     KleeSandbox *sandbox;
     KleeSandbox *exec_previous_sandbox;
 
@@ -108,22 +110,24 @@ typedef struct klee_process {
     bool demux_dirty;           /* a handler changed a demultiplexed arg */
     int demux_nargs;
     uint64_t demux_args[6];
-    uint64_t demux_saved_ptr;   /* socketcall's original argument pointer */
-    int deny_errno;             /* non-zero when syscall was denied on enter */
-    bool emulated_syscall;       /* inject a successful result at the exit stop */
-    bool seccomp_entered;       /* waiting for extra enter-stop after SECCOMP event */
-    bool suppress_initial_stop; /* suppress first SIGSTOP after fork (ptrace artifact) */
+    bool emulated_syscall;
+    long emulated_result;
     bool skip_uid_virt;         /* skip UID/GID virtualization for this process
                                  * (returns real uid from getuid/geteuid instead of
                                  * virtual — used for Chrome main process so D-Bus
                                  * AUTH EXTERNAL matches SO_PEERCRED) */
-    uint64_t saved_args[6];
+    uint64_t syscall_args[6];      /* canonical arguments, saved at entry */
+    uint64_t original_regs[6];    /* full register values overwritten by Klee */
+    unsigned changed_args;        /* bits for the physical argument registers */
+    uint64_t scratch_top;
+    uint64_t scratch_cursor;
+    uint64_t stack_start;
+    uint64_t stack_end;
+    char next_exe[PATH_MAX];       /* committed only by an exec event */
+    bool next_skip_uid_virt;
     char saved_path[PATH_MAX];      /* original guest path */
     char resolved_guest[PATH_MAX];  /* absolute guest path after resolution */
     char translated_path[PATH_MAX]; /* translated host path */
-    bool path_modified;
-    int path_arg_count;             /* number of path args rewritten via scratch */
-    int path_arg_idx[3];            /* which arg indices were rewritten */
 } KleeProcess;
 
 /* Process table (hash table real_pid → KleeProcess) */
@@ -142,6 +146,13 @@ KleeProcess *klee_process_create(KleeProcessTable *pt, pid_t real_pid,
 
 /* Look up process by real PID */
 KleeProcess *klee_process_find(KleeProcessTable *pt, pid_t real_pid);
+
+/* Tracked executable for a resolved /proc/<pid>[/task/<tid>]/exe path. */
+const char *klee_process_exe_at(const KleeProcess *proc, const char *path);
+
+/* Move a non-leader's state to its group leader's PID after exec. */
+KleeProcess *klee_process_exec_rekey(KleeProcessTable *pt, pid_t former_tid,
+                                     pid_t leader_pid);
 
 /* Remove and free process */
 void klee_process_remove(KleeProcessTable *pt, pid_t real_pid);

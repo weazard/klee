@@ -228,3 +228,26 @@ void klee_fd_table_exec(KleeFdTable *ft)
         }
     }
 }
+
+void klee_fd_table_close_range(KleeFdTable *ft, unsigned first, unsigned last,
+                                bool cloexec)
+{
+    if (!ft)
+        return;
+    for (int i = 0; i < KLEE_FD_TABLE_BUCKETS; i++) {
+        KleeFdEntry **entry = &ft->buckets[i];
+        while (*entry) {
+            KleeFdEntry *fd = *entry;
+            if ((unsigned)fd->fd >= first && (unsigned)fd->fd <= last) {
+                if (!cloexec) {
+                    *entry = fd->next;
+                    free(fd);
+                    ft->count--;
+                    continue;
+                }
+                fd->cloexec = true;
+            }
+            entry = &fd->next;
+        }
+    }
+}

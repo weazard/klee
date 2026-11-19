@@ -11,10 +11,13 @@ PREFIX   ?= /usr/local
 BINDIR   ?= $(PREFIX)/bin
 
 # Feature detection
-HAVE_SECCOMP_UNOTIFY := $(shell echo '\#include <linux/seccomp.h>' | \
+HAVE_SECCOMP_UNOTIFY := $(shell printf '%b\n' '\043include <linux/seccomp.h>' \
+	'int main(void) { return SECCOMP_GET_NOTIF_SIZES; }' | \
 	$(CC) -xc -c - -o /dev/null 2>/dev/null && echo 1 || echo 0)
-HAVE_PROCESS_VM := $(shell echo '\#include <sys/uio.h>\nint main(){process_vm_readv(0,0,0,0,0,0);}' | \
-	$(CC) -xc - -o /dev/null 2>/dev/null && echo 1 || echo 0)
+HAVE_PROCESS_VM := $(shell printf '%b\n' '\043include <sys/uio.h>' \
+	'int main(void) { return process_vm_readv(0,0,0,0,0,0); }' | \
+	$(CC) -D_GNU_SOURCE -Werror=implicit-function-declaration -xc - -o /dev/null \
+	2>/dev/null && echo 1 || echo 0)
 
 # Optional FUSE3
 HAVE_FUSE3 := $(shell pkg-config --exists fuse3 2>/dev/null && echo 1 || echo 0)
@@ -49,7 +52,7 @@ SYSCALL_SRCS   = src/syscall/dispatch.c src/syscall/enter.c \
                  src/syscall/exit.c src/syscall/handlers.c \
                  src/syscall/exec_shim.c src/syscall/sysnum32.c \
                  src/syscall/abi.c
-COMPAT_SRCS    = src/compat/seccomp_filter.c src/compat/io_uring_block.c \
+COMPAT_SRCS    = src/compat/io_uring_block.c \
                  src/compat/edge_cases.c src/compat/nested.c \
                  src/compat/zypak_compat.c
 STEAM_SRCS     = src/steam/steam_compat.c
@@ -137,7 +140,7 @@ tests/test_fd_table: tests/test_fd_table.c src/fs/fd_table.o $(COMMON_TEST_OBJS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 # --wrap lets the test make malloc/calloc fail
-tests/test_process: tests/test_process.c src/process/process.o $(FS_TEST_OBJS) src/fuse/fuse_mountinfo.o src/config.o $(COMMON_TEST_OBJS)
+tests/test_process: tests/test_process.c src/process/process.o src/ns/user_ns.o $(FS_TEST_OBJS) src/fuse/fuse_mountinfo.o src/config.o $(COMMON_TEST_OBJS)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDFLAGS) -Wl,--wrap=malloc -Wl,--wrap=calloc
 
 tests/test_filter32: tests/test_filter32.c src/intercept/filter.o src/syscall/sysnum32.o src/syscall/handlers.o $(COMMON_TEST_OBJS)
